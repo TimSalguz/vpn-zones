@@ -38,9 +38,14 @@ M5), имеют преимущество перед удобствами.
 
 ## M1 — Rust-ядро (паритет с bash-версией)
 
-- [ ] один бинарь `vpn-zone`: конфиги (CRLF, пустые `I1`–`I5`, wg/awg-автодетект),
-      жизненный цикл зоны (unshare/newuidmap, netlink, pasta), `run`/nsenter,
-      реестр запусков с блокировками, overlay-профили (поглощает `vpn-profile-run.py`)
+- [x] заведён крейт `rust/`; разбор конфигов WG/AWG вынесен в него: CRLF, пустые
+      `I1`–`I5`, `Address`/`DNS`/`MTU`/`Endpoint` (все три формы), текст для
+      `setconf`, автодетект обфускации — с юнит-тестами на каждую граблю из
+      `docs/GOTCHAS.md` §4. Зоны им ещё не пользуются: конфиги по-прежнему
+      разбирает bash
+- [ ] один бинарь `vpn-zone`: жизненный цикл зоны (unshare/newuidmap, netlink,
+      pasta), `run`/nsenter, реестр запусков с блокировками, overlay-профили
+      (поглощает `vpn-profile-run.py`) — поверх уже готового разбора конфигов
 - [ ] внутренняя архитектура — сразу двухнеймспейсная по `docs/LEAK-MODEL.md`:
       сокет WireGuard в uplink-ns, в app-ns только lo + туннель (паритет —
       о CLI и поведении, не о внутренностях)
@@ -53,8 +58,12 @@ M5), имеют преимущество перед удобствами.
 ## M2 — Песочница в ядре
 
 - [ ] поглотить `wl-sandbox.c` (wayland-rs, security-context) и `vpn-fs-sandbox`
-- [ ] seccomp-фильтр по образцу flatpak (libseccomp → fd в `bwrap --seccomp`):
-      TIOCSTI/TIOCLINUX, ptrace, вложенные user namespaces и т.д.
+- [x] seccomp-фильтр по образцу flatpak (libseccomp → fd в `bwrap --seccomp`):
+      TIOCSTI/TIOCLINUX, ptrace, keyring, `perf_event_open`, `personality`,
+      новый mount-API и `clone3` (ENOSYS — чтобы libc уходила на старый путь).
+      Вложенные user namespace по умолчанию НЕ запрещены: в NixOS нет zypak и
+      setuid chrome-sandbox, поэтому Chromium и Electron строят свой userns и
+      без него не стартуют вовсе — запрет есть отдельным флагом `--deny-userns`
 
 ## M3 — Сетевое ядро
 

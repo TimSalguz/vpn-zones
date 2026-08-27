@@ -34,7 +34,15 @@
    по собранным `bin/*` (бинарь `wl-sandbox` пропускается по отсутствию
    шебанга) и `python3 -m py_compile module/*.py`. Список исключений
    shellcheck с обоснованием — прямо в шаге workflow.
-3. **integration** — подготовка раннера (снять AppArmor-запрет на userns,
+3. **rust** — крейт `rust/` (парсер конфигов WG/AWG и генератор
+   seccomp-фильтра) в `nix-shell -p cargo rustc clippy rustfmt pkg-config
+   libseccomp`: `cargo fmt --check`, `cargo clippy --all-targets -- -D
+   warnings`, `cargo test`. Тесты включают `vpn-zone-seccomp selftest` —
+   фильтр грузится в отдельный процесс и проверяется, что `keyctl` отвечает
+   EPERM (прав для этого не нужно: seccomp с NO_NEW_PRIVS доступен
+   непривилегированно). В деривации модуля тесты выключены (`doCheck = false`):
+   там их гонять негде.
+4. **integration** — подготовка раннера (снять AppArmor-запрет на userns,
    `modprobe wireguard`, `uidmap` + диапазоны в `/etc/subuid`/`subgid`) и
    запуск `tests/integration/smoke.sh`.
 

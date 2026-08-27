@@ -72,6 +72,35 @@ jobs:
           shellcheck --severity=warning --exclude=SC2088,SC2064 "${files[@]}"
           echo "shellcheck: ok (${#files[@]} файлов)"
 
+  # Rust-ядро (ROADMAP M1/M2): формат, линт и тесты крейта rust/ — парсер
+  # конфигов WG/AWG и генератор seccomp-фильтра. В job scripts крейт тоже
+  # собирается (vpn-fs-sandbox на него ссылается), но без clippy и без тестов:
+  # компилятор и линтер живут здесь.
+  #
+  # cargo test включает selftest фильтра: он грузит seccomp в собственный
+  # процесс и проверяет, что keyctl отвечает EPERM. Прав для этого не нужно —
+  # непривилегированный seccomp работает с NO_NEW_PRIVS, который libseccomp
+  # ставит сам.
+  rust:
+    name: rust (fmt + clippy + test)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: cargo fmt --check
+        run: nix-shell -p cargo rustfmt --run 'cargo fmt --check'
+      - name: cargo clippy (предупреждения = ошибки)
+        run: |
+          nix-shell -p cargo rustc clippy pkg-config libseccomp \
+            --run 'cargo clippy --all-targets -- -D warnings'
+      - name: cargo test
+        run: |
+          nix-shell -p cargo rustc pkg-config libseccomp \
+            --run 'cargo test'
+
   # Смоук: поднять настоящую зону в непривилегированном userns и проверить её
   # изнутри. Требует fallback на ядерный wireguard (amneziawg-модуля на
   # раннере нет) — см. tests/integration/smoke.sh.

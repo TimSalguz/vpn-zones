@@ -82,6 +82,10 @@
 
 - **NVIDIA: одного /dev/dri мало.** Драйверу нужны ещё узлы /dev/nvidia*: без них EGL внутри падает («failed to create dri2 screen»), а Electron намертво виснет на заставке — проверено на Discord. (`module/default.nix`, vpn-fs-sandbox)
 
+- **seccomp: вложенные user namespace запрещать НЕЛЬЗЯ.** У flatpak в базовом наборе такой запрет есть, но там же есть zypak, переводящий песочницу Chromium на порталы. В NixOS нет ни zypak, ни setuid chrome-sandbox, поэтому Chromium и все Electron-программы строят СВОЙ вложенный userns: запретишь `clone`/`unshare` с `CLONE_NEWUSER` — и они не стартуют вовсе («No usable sandbox! Update your kernel»). Наружу такой userns не выводит: права он даёт только над своими новыми пустыми namespace. Запрет остаётся отдельным флагом (`vpn-zone-seccomp export --deny-userns`) для программ, которые сами себя не изолируют. (`rust/src/seccomp.rs`, `module/default.nix` vpn-fs-sandbox)
+
+- **Фильтр передаётся дескриптором, а редирект нельзя положить в массив.** `bwrap --seccomp` принимает только номер fd (не путь), поэтому файл открывается заранее (`exec 34< …`), а в массив аргументов уходит лишь `--seccomp 34`. Не собрался фильтр — предупреждение в stderr и запуск без него: мягкая деградация, как в остальных слоях. (`module/default.nix`, vpn-fs-sandbox)
+
 - **bwrap запускать НЕ через exec; вывод dbus-прокси — в /dev/null.** После exec обработчик выхода (trap) уже не сработает, и xdg-dbus-proxy остался бы висеть. А открытый stdout прокси делает вызов «зависшим», хотя программа давно закончила. (`module/default.nix`, vpn-fs-sandbox)
 
 - **XDG_RUNTIME_DIR — tmpfs, сокеты поимённо.** Пробрасываются только wayland-сокет (уже ограниченный wl-sandbox, если был), pipewire/pulse и прокси шины; всё остальное из runtime-каталога программе не видно. DBUS_SYSTEM_BUS_ADDRESS снимается, FLATPAK_ID выставляется. (`module/default.nix`, vpn-fs-sandbox)

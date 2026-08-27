@@ -20,6 +20,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   via the tunnel, with a note in the zone log.
 
 ### Added
+- Seccomp filter in the filesystem sandbox. `vpn-fs-sandbox` now compiles a BPF
+  program with libseccomp and hands it to `bwrap --seccomp`: terminal injection
+  (`ioctl` `TIOCSTI`/`TIOCLINUX`), `ptrace`, the keyring calls, `syslog`,
+  `perf_event_open`, `acct`, `quotactl`, `uselib`, the NUMA calls and any
+  `personality` other than `PER_LINUX` are refused with `EPERM`, while the new
+  mount API and `clone3` answer `ENOSYS` so that libc takes its older path.
+  Nested user namespaces are deliberately *not* blocked: without zypak or a
+  setuid `chrome-sandbox`, Chromium and Electron applications build their own
+  and refuse to start otherwise (`vpn-zone-seccomp export --deny-userns` for
+  programs that do not need theirs). If the filter cannot be built the sandbox
+  starts without it and says so on stderr.
+- A Rust crate in `rust/` — the first piece of the Rust core (ROADMAP M1/M2):
+  the filter generator `vpn-zone-seccomp` (`export`, `selftest`) and a
+  WireGuard/AmneziaWG config parser with unit tests for every quirk in
+  `docs/GOTCHAS.md` §4 (CRLF, empty `I1`–`I5`, the three endpoint shapes,
+  address families, `setconf` stripping). Zones still run on the bash version.
 - Fallback to the in-tree `wireguard` kernel module and `wg(8)` when
   `amneziawg` is unavailable and the config has no obfuscation parameters
   (Jc/Jmin/Jmax/S1/S2/H1–H4/I1–I5). Configs *with* obfuscation fail loudly

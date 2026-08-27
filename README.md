@@ -114,16 +114,19 @@ vpn-zone mode picker|per-zone|both|off         # how launcher entries behave
 
 ## What this does not replace
 
-Flatpak. It has seccomp filters that cut off dangerous system calls at the
-kernel level, its own runtime, and ready-made rules for thousands of
-applications. Here packages come from nixpkgs (no duplication and no runtime),
+Flatpak. Its syscall filter is what the one here is modelled on, and it also
+has its own runtime and ready-made rules for thousands of applications.
+Here packages come from nixpkgs (no duplication and no runtime),
 but the rules for each program have to be worked out on your own — though you
 can peek at the same program's manifest on Flathub, in the `finish-args`
 section.
 
 What is missing here and what you should know:
 
-- no seccomp filter (`bwrap --seccomp` is not used);
+- the sandbox does carry a seccomp filter now, modelled on flatpak's base set
+  (terminal injection via `TIOCSTI`, `ptrace`, keyrings, `perf_event_open`, the
+  new mount API); nested user namespaces are left allowed on purpose, otherwise
+  Chromium and Electron applications would not start;
 - the filesystem sandbox is enabled explicitly and needs tuning for each
   specific program;
 - a zone isolates the network, not the files: without a sandbox the program
