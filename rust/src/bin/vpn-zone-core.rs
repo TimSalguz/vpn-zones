@@ -11,12 +11,19 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
 
-use vpn_zone::{desktop, profile, wl_sandbox};
+use vpn_zone::{desktop, profile, wl_sandbox, zone};
 
 const USAGE: &str = "\
 vpn-zone-core — helper commands of vpn-zones
 
 Usage:
+  vpn-zone-core zone-holder [--ip P] [--awg P] [--wg P] [--pasta P] <name>
+        Bring the zone up and hold it: a user namespace with the double id
+        mapping, a net+mount namespace with the tunnel in it, and pasta as the
+        way out. Runs until killed, and the zone dies with it — that is the
+        kill switch. This is the ExecStart of vpn-zone@<name>.service; the tool
+        paths are substituted by Nix and default to a PATH lookup.
+
   vpn-zone-core profile-run <profiledir> <zone> <ephemeral 0|1> <regdir> -- cmd...
         Stack the container's overlay layers over the XDG directories, drop the
         ambient capabilities and run the command. Called from `vpn-zone run`,
@@ -63,6 +70,14 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }
+        Some("zone-holder") => match zone::Args::parse(&args[1..]) {
+            Ok(parsed) => ExitCode::from(zone::run(parsed)),
+            Err(e) => {
+                eprintln!("vpn-zone-core zone-holder: {e}");
+                eprint!("{USAGE}");
+                ExitCode::from(EXIT_USAGE)
+            }
+        },
         Some("profile-run") => match profile::Args::parse(&args[1..]) {
             Ok(parsed) => ExitCode::from(profile::run(parsed)),
             Err(e) => {

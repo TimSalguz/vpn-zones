@@ -43,7 +43,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+use std::os::fd::AsFd;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
@@ -56,6 +56,7 @@ use wayland_protocols::wp::security_context::v1::client::{
 };
 
 use crate::profile::{exec_command, exit_code_of, EXIT_NOT_STARTED};
+use crate::sys;
 
 /// Sandbox engine name reported to the compositor. It is what a compositor
 /// shows when it names the sandbox a window came from, so it names the project,
@@ -177,19 +178,6 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
 delegate_noop!(State: WpSecurityContextManagerV1);
 delegate_noop!(State: WpSecurityContextV1);
 
-/// `pipe2(O_CLOEXEC)` as an owning pair (read end, write end).
-fn make_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds: [libc::c_int; 2] = [0; 2];
-    // SAFETY: `fds` is a valid array of two ints for the duration of the call.
-    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: pipe2 has just handed us these two descriptors and nothing else
-    // owns them.
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
-}
-
 /// Register a sandboxed socket with the compositor, then run the program on it.
 ///
 /// Returns the program's exit code, or falls back to [`run_plain`] (which never
@@ -261,7 +249,7 @@ pub fn run(args: Args) -> u8 {
     // close_fd is the "switch". The compositor stops accepting connections on
     // the socket once this end of the pipe is closed; we hold it open for as
     // long as the program runs and let go after it exits.
-    let (close_read, close_write) = match make_pipe() {
+    let (close_read, close_write) = match sys::pipe() {
         Ok(pipe) => pipe,
         Err(e) => {
             eprintln!("wl-sandbox: cannot create the close-fd pipe ({e}) — running unrestricted");

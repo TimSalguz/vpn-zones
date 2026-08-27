@@ -174,26 +174,7 @@ fn mount_overlay(lower: &Path, upper: &Path, work: &Path, target: &Path) -> io::
     );
     // Source and filesystem type are both the literal "overlay" — the source
     // of an overlay mount is a name, not a device.
-    let overlay = CString::new("overlay").expect("literal has no NUL");
-    let target = CString::new(target.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
-    let data = CString::new(opts)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
-    // SAFETY: all four pointers are valid NUL-terminated C strings that outlive
-    // the call.
-    let rc = unsafe {
-        libc::mount(
-            overlay.as_ptr(),
-            target.as_ptr(),
-            overlay.as_ptr(),
-            0,
-            data.as_ptr().cast(),
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    crate::sys::mount(OsStr::new("overlay"), target, "overlay", 0, &opts)
 }
 
 /// Stack the profile over every XDG directory that exists.

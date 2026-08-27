@@ -6,6 +6,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
 ## [Unreleased]
 
 ### Changed
+- The life cycle of a zone is Rust now. The two shell scripts of
+  `module/default.nix` — `zoneHolder` (the user namespace with its double id
+  mapping, and pasta) and `zoneInit` (tunnel, routes, IPv6, DNS, the state
+  mirror) — are gone; the unit starts `vpn-zone-core zone-holder <name>`
+  instead, with the tool paths substituted by Nix
+  (`--ip/--awg/--wg/--pasta`). Parity is deliberate and the architecture is
+  unchanged: the same one-namespace model, the same pasta arguments, the same
+  files in the zone directory (`zone.pid`, `ready`, `status`, `resolv.conf`),
+  the same `KillMode=control-group` kill switch. What changed underneath is
+  that the config is now read by the tested parser of `rust/src/config.rs`
+  instead of a `sed`/`grep` pipeline, that `ip`/`awg`/`wg`/`pasta` are exec'd
+  directly instead of being interpolated into a shell, that the id mapping is
+  done with an explicit fork plus `newuidmap`/`newgidmap` instead of
+  `unshare(1)`, and that the holder passes TERM/INT on to the zone so a zone
+  cannot outlive its holder even without systemd. Two small deliberate
+  differences: an empty `wg show latest-handshakes` is now reported as "no
+  handshake" (the old `awk` pipeline reported success on empty input), and the
+  stripped config handed to `setconf` is written with mode 0600 because it
+  carries the private key. The bash `vpn-zone` CLI, the picker and the GUI
+  wrappers are untouched.
 - C is gone: `wl-sandbox` is now a subcommand of `vpn-zone-core`
   (`vpn-zone-core wl-sandbox <app-id> -- cmd...`) instead of a C program built
   from `module/wl-sandbox.c` with `wayland-scanner`. The behaviour it
@@ -57,7 +77,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   the filter generator `vpn-zone-seccomp` (`export`, `selftest`) and a
   WireGuard/AmneziaWG config parser with unit tests for every quirk in
   `docs/GOTCHAS.md` §4 (CRLF, empty `I1`–`I5`, the three endpoint shapes,
-  address families, `setconf` stripping). Zones still run on the bash version.
+  address families, `setconf` stripping) — the parser the zones now run on
+  (see the zone life cycle above).
 - Fallback to the in-tree `wireguard` kernel module and `wg(8)` when
   `amneziawg` is unavailable and the config has no obfuscation parameters
   (Jc/Jmin/Jmax/S1/S2/H1–H4/I1–I5). Configs *with* obfuscation fail loudly

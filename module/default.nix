@@ -19,8 +19,9 @@
 #   • выход зоны наружу даёт pasta (passt) — пользовательский сетевой стек,
 #     тот же, на котором работает rootless-podman.
 #
-# УСТРОЙСТВО (ключевой момент — двойной маппинг uid):
-#   unshare --map-users=0:<subuid>:1 --map-users=<uid>:<uid>:1 --setuid 0
+# УСТРОЙСТВО (ключевой момент — двойной маппинг uid). Всё это делает
+# `vpn-zone-core zone-holder <имя>` (rust/src/zone.rs), его запускает юнит:
+#   user namespace: 0→<subuid> и <uid>→<uid>, внутри setuid 0
 #     ├── дочерний net+mount namespace ─ ЗОНА: здесь awg0, маршруты, свой resolv.conf
 #     └── pasta --netns <зона> ─ выход в интернет
 # Внутри мы uid 0 — иначе ядро не даст создать интерфейс (capabilities теряются
@@ -87,18 +88,21 @@ let
   # в bash нет в принципе: BPF-фильтр системных вызовов для песочницы —
   # программу для ядра умеет собрать только код (libseccomp). Следом переехали
   # оба бывших python-скрипта: наложение слоёв профиля при запуске программы и
-  # генератор .desktop-ярлыков. Последним — ограничитель доступа к композитору,
+  # генератор .desktop-ярлыков. Затем — ограничитель доступа к композитору,
   # он же бывшая программа на C (module/wl-sandbox.c): создаёт помеченный
   # wayland-сокет, после чего композитор перестаёт выдавать клиенту протоколы
   # слежки. Ни Python, ни C в проекте больше нет.
   #
-  # В крейте лежит ещё парсер конфигов WG/AWG с тестами на все грабли из
-  # docs/GOTCHAS.md §4, но зоны его пока не используют: bash-версия остаётся
-  # рабочей до подтверждённого паритета.
+  # Последним переехал ЖИЗНЕННЫЙ ЦИКЛ ЗОНЫ — то, что раньше было скриптами
+  # zoneHolder и zoneInit прямо в этом файле: user namespace с двойным
+  # маппингом, net+mount namespace, pasta, туннель, DNS и зеркало состояния
+  # (`vpn-zone-core zone-holder`, rust/src/zone.rs). Заодно конфиги теперь
+  # разбирает парсер крейта с тестами на все грабли docs/GOTCHAS.md §4, а не
+  # конвейер sed+grep. На bash остались CLI, пикер и GUI-обвязка.
   #
   # Два бинаря: vpn-zone-seccomp (фильтр) и vpn-zone-core (подкоманды
-  # profile-run, sync и wl-sandbox). Со скриптом vpn-zone имена не сталкиваются —
-  # всё спокойно лежит в home.packages.
+  # zone-holder, profile-run, sync и wl-sandbox). Со скриптом vpn-zone имена не
+  # сталкиваются — всё спокойно лежит в home.packages.
   vpn-zone-rust = pkgs.rustPlatform.buildRustPackage {
     pname = "vpn-zone-rust";
     version = "0.1.0";
@@ -395,315 +399,24 @@ let
     exit $rc
   '';
 
-  # --- ЧАСТЬ 1: то, что исполняется ВНУТРИ зоны ---
-  # Настраивает туннель. Запускается уже в новом net+mount namespace под uid 0.
-  zoneInit = pkgs.writeShellScript "vpn-zone-init" ''
-    set -eu
-    name="$1"
-    dir="${stateDir}/$name"
-    conf="$dir/config.conf"
-
-    echo $$ > "$dir/zone.pid"
-
-    # --- ЗОНА БЕЗ СЕТИ ---
-    # Особый случай: ни туннеля, ни выхода наружу — только loopback. Именно она
-    # делает возможной политику «по умолчанию интернета нет»: программа
-    # запускается и работает, но в сеть не ходит вообще, причём не потому, что
-    # ей запретили правилом, а потому, что маршрута физически не существует.
-    if [ -f "$dir/offline" ]; then
-      ${iproute} link set lo up
-      touch "$dir/ready"
-      echo "зона $name: без сети (только loopback)"
-      exec ${pkgs.coreutils}/bin/sleep infinity
-    fi
-
-    # Ждём, пока pasta настроит выходной интерфейс: до этого маршрута наружу нет
-    # и добавлять маршрут до endpoint'а некуда.
-    for _ in $(seq 1 50); do
-      ${iproute} -4 route show default | grep -q . && break
-      sleep 0.1
-    done
-
-    # Разбираем по ключевым словам, а не по номерам полей: у pasta маршрут имеет
-    # вид «default dev hostif scope link» (без via), у обычной сети —
-    # «default via 192.168.1.1 dev enp4s0 …». Позиционный разбор ловил во втором
-    # случае слово «link» вместо имени интерфейса — проверено, маршрут до
-    # VPN-сервера тогда не добавлялся вовсе.
-    defroute=$(${iproute} -o -4 route show default | head -1)
-    outif=$(echo "$defroute" | ${pkgs.gawk}/bin/awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-    outgw=$(echo "$defroute" | ${pkgs.gawk}/bin/awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
-    if [ -z "''${outif:-}" ]; then
-      echo "зона $name: pasta не дала маршрут наружу" >&2
-      exit 1
-    fi
-
-    # awg setconf понимает только ключи протокола. Address/DNS/MTU — это указания
-    # для wg-quick, и их надо применить руками (см. ниже), а из файла убрать,
-    # иначе setconf упадёт на первой же такой строке.
-    # \r чистим и здесь, а не только при `vpn-zone add`: конфиг могли положить в
-    # каталог зоны руками, а диагностика этой ошибки крайне неприятна — в
-    # сообщении ip возврат каретки не виден (см. подробности в vpn-zone add).
-    #
-    # Второй фильтр — строки с ПУСТЫМ значением. Свежая Amnezia кладёт в конфиг
-    # параметры пакетов-приманок I1…I5 и заполняет не все: получается «I2 = ».
-    # awg setconf на такой строке падает целиком — «Line unrecognized: `I2='»,
-    # и зона не поднимается вовсе. Проверено на двух твоих конфигах: со старым
-    # набором (Jc/S/H) они работали, с новым (плюс I1…I5) — падали.
-    # Выбрасываем только пустые: заполненные параметры обфускации нужны, без них
-    # сервер не ответит.
-    stripped="$dir/.stripped.conf"
-    ${pkgs.gnused}/bin/sed 's/\r$//' "$conf" \
-      | ${pkgs.gnugrep}/bin/grep -vE '^[[:space:]]*(Address|DNS|MTU|Table|PreUp|PostUp|PreDown|PostDown|SaveConfig)' \
-      | ${pkgs.gnugrep}/bin/grep -vE '^[[:space:]]*[A-Za-z0-9]+[[:space:]]*=[[:space:]]*$' \
-      > "$stripped"
-
-    field() {
-      ${pkgs.gnugrep}/bin/grep -iE "^[[:space:]]*$1[[:space:]]*=" "$conf" \
-        | ${pkgs.gnused}/bin/sed 's/.*=//' | tr -d " \r\t" | head -1
-    }
-    # Address бывает списком через запятую и смешивает семейства
-    # («10.8.1.10/32, fd00::2/128») — берём ВСЕ, а не только первый: раньше
-    # v6-адрес молча выбрасывался, а конфиг только с v6 валил зону на
-    # `ip -4 addr add`.
-    addresses=$(field Address | tr ',' ' ')
-    mtu=$(field MTU)
-    endpoint=$(field Endpoint)
-    dnslist=$(field DNS)
-
-    # --- МАРШРУТ ДО САМОГО VPN-СЕРВЕРА ---
-    # Он обязан идти МИМО туннеля, иначе получится петля: пакеты туннеля
-    # заворачивались бы в туннель. Резолвим имя, пока DNS ещё хостовый.
-    #
-    # Endpoint бывает трёх видов: host:port, v4:port и [v6]:port. Прежний
-    # разбор ''${endpoint%:*} резал v6-литерал по последнему двоеточию и
-    # получал мусор, а имя хоста резолвил только в v4. Заодно: «содержит
-    # букву — значит имя» ловило и hex-цифры v6 — сначала различаем по
-    # двоеточию, буквы проверяем только после.
-    epaddr=''${endpoint%:*}
-    ep6=0
-    case "$epaddr" in
-      \[*\]) epaddr=''${epaddr#\[}; epaddr=''${epaddr%\]}; ep6=1 ;;
-      *:*) ep6=1 ;;
-      *[a-zA-Z]*)
-        r=$(${pkgs.getent}/bin/getent ahostsv4 "$epaddr" \
-          | ${pkgs.gawk}/bin/awk 'NR==1{print $1}')
-        if [ -z "''${r:-}" ]; then
-          r=$(${pkgs.getent}/bin/getent ahostsv6 "$epaddr" \
-            | ${pkgs.gawk}/bin/awk 'NR==1{print $1}')
-          [ -n "''${r:-}" ] && ep6=1
-        fi
-        epaddr=''${r:-} ;;
-    esac
-    # Ошибку здесь НЕ глушим: без этого маршрута пакеты самого туннеля пойдут
-    # в туннель, и зона просто не заработает — молчать об этом нельзя.
-    if [ -z "''${epaddr:-}" ]; then
-      echo "зона $name: в конфиге нет Endpoint — маршрут до сервера не задан" >&2
-    elif [ "$ep6" = 1 ]; then
-      # v6-endpoint: маршрут по v6-умолчанию от pasta (есть, только если v6
-      # есть у самого хоста).
-      d6=$(${iproute} -o -6 route show default 2>/dev/null | head -1)
-      out6if=$(echo "$d6" | ${pkgs.gawk}/bin/awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-      out6gw=$(echo "$d6" | ${pkgs.gawk}/bin/awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
-      if [ -z "''${out6if:-}" ]; then
-        echo "зона $name: endpoint IPv6, а v6-маршрута наружу нет — туннель не заработает" >&2
-      else
-        if [ -n "''${out6gw:-}" ]; then
-          ${iproute} -6 route add "$epaddr/128" via "$out6gw" dev "$out6if"
-        else
-          ${iproute} -6 route add "$epaddr/128" dev "$out6if"
-        fi || echo "зона $name: не удалось добавить v6-маршрут до $epaddr" >&2
-      fi
-    else
-      if [ -n "''${outgw:-}" ]; then
-        ${iproute} route add "$epaddr/32" via "$outgw" dev "$outif"
-      else
-        ${iproute} route add "$epaddr/32" dev "$outif" scope link
-      fi || echo "зона $name: не удалось добавить маршрут до $epaddr через $outif" >&2
-    fi
-
-    # --- ТУННЕЛЬ ---
-    # Обычный путь — ядерный amneziawg (он понимает и чистые WG-конфиги).
-    # Модуля нет (система без Amnezia, CI): конфиг без параметров обфускации
-    # поднимаем ядерным wireguard и утилитой wg; с обфускацией — честно
-    # падаем, без модуля такой туннель не собрать.
-    wgtool=${awg}
-    if ! ${iproute} link add awg0 type amneziawg 2>/dev/null; then
-      if ${pkgs.gnugrep}/bin/grep -qiE '^[[:space:]]*(Jc|Jmin|Jmax|S1|S2|H[1-4]|I[1-5])[[:space:]]*=' "$stripped"; then
-        echo "зона $name: модуль amneziawg недоступен, а конфиг с обфускацией — не поднять" >&2
-        exit 1
-      fi
-      ${iproute} link add awg0 type wireguard
-      wgtool=${wg}
-      echo "зона $name: модуля amneziawg нет — использую ядерный wireguard"
-    fi
-    "$wgtool" setconf awg0 "$stripped"
-    has6=0
-    for a in ''${addresses:-}; do
-      case "$a" in
-        *:*) if ${iproute} -6 addr add "$a" dev awg0 2>/dev/null; then has6=1
-             else echo "зона $name: v6-адрес $a не назначился — IPv6 в зоне будет закрыт" >&2; fi ;;
-        *) ${iproute} -4 addr add "$a" dev awg0 ;;
-      esac
-    done
-    ${iproute} link set awg0 mtu "''${mtu:-1420}" up
-    ${iproute} route replace default dev awg0
-    # --- IPv6: ЛИБО В ТУННЕЛЬ, ЛИБО ВЫКЛЮЧЕН ---
-    # Принцип: у пакета ЛЮБОГО семейства не должно быть пути мимо туннеля
-    # (docs/LEAK-MODEL.md). pasta даёт зоне и v6-связность с хостом, а в
-    # туннель до сих пор заворачивался только v4 default — весь IPv6-трафик
-    # приложений шёл В ОБХОД VPN. Теперь: есть v6-адрес туннеля — v6 default
-    # тоже в туннель; нет — IPv6 в зоне выключается целиком (sysctl своей
-    # netns, хоста не касается), а если выключить не вышло — запрещающий
-    # маршрут. Fail-closed. Вернуть v6 приложения не могут: они входят в зону
-    # без capabilities.
-    if [ ! -e /proc/net/if_inet6 ]; then
-      : # ядро вообще без IPv6 — закрывать нечего
-    elif [ "$has6" = 1 ]; then
-      ${iproute} -6 route replace default dev awg0
-    elif [ "$ep6" = 1 ]; then
-      # Транспорт туннеля сам ходит по v6 — выключать семейство нельзя.
-      # Закрываем только default: точный /128 до сервера остаётся (он
-      # специфичнее), а всему остальному v6-трафику идти некуда.
-      ${iproute} -6 route replace default unreachable \
-        || echo "зона $name: не удалось закрыть v6 default — возможна утечка v6" >&2
-    elif ! echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null; then
-      ${iproute} -6 route replace default unreachable 2>/dev/null \
-        || echo "зона $name: не удалось закрыть IPv6 — возможна утечка v6 мимо туннеля" >&2
-    fi
-
-    # --- ЗАКРЫВАЕМ КЭШИРУЮЩИЙ РЕЗОЛВЕР ХОСТА ---
-    # Это НЕ теория: в NixOS работает nsncd (сокет /run/nscd/socket), и glibc
-    # ходит за именами к нему, а не к DNS из resolv.conf. Демон живёт в сети
-    # ХОСТА, поэтому имена внутри зоны резолвились мимо туннеля — проверено на
-    # живой зоне: `getent` отвечал при RX=0 на awg0, то есть запрос уходил
-    # наружу помимо VPN. Классическая утечка DNS, и подмена resolv.conf её не
-    # лечит.
-    #
-    # tmpfs поверх каталога прячет сокет только внутри зоны: glibc его не
-    # находит и идёт напрямую к серверам из resolv.conf, то есть через туннель.
-    # У остальной системы nsncd продолжает работать как раньше.
-    for nscd in /run/nscd /var/run/nscd; do
-      if [ -d "$nscd" ]; then
-        ${pkgs.util-linux}/bin/mount -t tmpfs -o mode=0755,size=64k tmpfs "$nscd" \
-          || echo "зона $name: не удалось спрятать $nscd — возможна утечка DNS" >&2
-        break
-      fi
-    done
-
-    # --- DNS ЗОНЫ ---
-    # Без этого запросы уходили бы к резолверу хоста в обход туннеля — самая
-    # частая утечка. mount --bind виден только внутри зоны: у остальной системы
-    # /etc/resolv.conf остаётся прежним.
-    if [ -n "''${dnslist:-}" ]; then
-      : > "$dir/resolv.conf"
-      echo "$dnslist" | tr ',' '\n' | while read -r ns; do
-        [ -n "$ns" ] && echo "nameserver $ns" >> "$dir/resolv.conf"
-      done
-    else
-      # Конфиг без DNS= — раньше зона молча оставалась с resolv.conf хоста, а
-      # там локальный резолвер (192.168.1.1 или стаб 127.0.0.53), который
-      # изнутри зоны недостижим: имена просто переставали резолвиться, и
-      # выглядело это как «интернет есть, но ничего не открывается».
-      # Публичные резолверы через туннель — рабочий и не утекающий дефолт.
-      { echo "nameserver 1.1.1.1"; echo "nameserver 9.9.9.9"; } > "$dir/resolv.conf"
-      echo "зона $name: в конфиге нет DNS= — беру 1.1.1.1 и 9.9.9.9 (через туннель)"
-    fi
-    ${pkgs.util-linux}/bin/mount --bind "$dir/resolv.conf" /etc/resolv.conf
-
-    # ПРОФИЛЬ ЗДЕСЬ НЕ МОНТИРУЕТСЯ, И ЭТО ВАЖНО. Первым заходом слой данных
-    # накладывался прямо тут, на всю зону — и профиль оказывался намертво
-    # привязан к VPN: настроил браузер в зоне «nl», заблокировали сервер — и
-    # настроенное окружение уезжает вместе с ним. Теперь профиль — отдельная
-    # сущность, монтируется при запуске программы (см. крейт rust/, модуль
-    # profile — `vpn-zone-core profile-run`), поэтому один и тот же профиль
-    # можно поднять хоть в другой зоне, хоть без VPN вовсе.
-    touch "$dir/ready"
-    echo "зона $name поднята: $(${iproute} -br -4 addr show awg0)"
-
-    # --- ЗЕРКАЛО СОСТОЯНИЯ ТУННЕЛЯ ---
-    # `awg show` требует прав на netlink, а программы (и `vpn-zone status`)
-    # заходят в зону под обычным uid и видят пустоту — состояние туннеля было
-    # недоступно вообще. Поэтому пишем его отсюда, изнутри, где права есть.
-    # Пять секунд — компромисс: рукопожатие видно почти сразу, а нагрузки нет.
-    (
-      while :; do
-        "$wgtool" show awg0 > "$dir/status.tmp" 2>/dev/null \
-          && ${pkgs.coreutils}/bin/mv "$dir/status.tmp" "$dir/status"
-        ${pkgs.coreutils}/bin/sleep 5
-      done
-    ) &
-
-    # Первое рукопожатие — главный признак «конфиг живой». Печатаем в журнал:
-    # по нему сразу видно, стоит ли возиться с этой зоной дальше.
-    ${pkgs.coreutils}/bin/sleep 4
-    if "$wgtool" show awg0 latest-handshakes 2>/dev/null | ${pkgs.gawk}/bin/awk '{exit ($2>0)?0:1}'; then
-      echo "зона $name: рукопожатие прошло — туннель живой"
-    else
-      echo "зона $name: рукопожатия нет. Либо конфиг нерабочий, либо сервер недоступен" >&2
-    fi
-
-    # Держим namespace живым. Умрёт этот процесс — исчезнет зона, а вместе с ней
-    # и сеть у всего, что в ней работало (это и есть kill switch).
-    exec ${pkgs.coreutils}/bin/sleep infinity
-  '';
-
-  # --- ЧАСТЬ 2: то, что создаёт зону снаружи ---
-  # Запускается юнитом vpn-zone@<имя>.service.
-  zoneHolder = pkgs.writeShellScript "vpn-zone-holder" ''
-    set -eu
-    name="$1"
-    dir="${stateDir}/$name"
-    if [ ! -f "$dir/config.conf" ] && [ ! -f "$dir/offline" ]; then
-      echo "нет ни конфига $dir/config.conf, ни отметки offline" >&2
-      exit 1
-    fi
-    rm -f "$dir/zone.pid" "$dir/ready"
-
-    uid=$(${pkgs.coreutils}/bin/id -u)
-    gid=$(${pkgs.coreutils}/bin/id -g)
-    # Первый диапазон из /etc/subuid — из него берётся uid 0 внутри зоны.
-    subuid=$(${pkgs.gawk}/bin/awk -F: -v u="$(${pkgs.coreutils}/bin/id -un)" \
-      '$1==u {print $2; exit}' /etc/subuid)
-    subgid=$(${pkgs.gawk}/bin/awk -F: -v u="$(${pkgs.coreutils}/bin/id -un)" \
-      '$1==u {print $2; exit}' /etc/subgid)
-    if [ -z "''${subuid:-}" ] || [ -z "''${subgid:-}" ]; then
-      echo "в /etc/subuid нет диапазона для тебя — без него rootless-зона невозможна" >&2
-      exit 1
-    fi
-
-    # ДВОЙНОЙ МАППИНГ, объяснение — в шапке файла.
-    exec ${pkgs.util-linux}/bin/unshare \
-      --user \
-      --map-users=0:"$subuid":1 --map-users="$uid":"$uid":1 \
-      --map-groups=0:"$subgid":1 --map-groups="$gid":"$gid":1 \
-      --setuid 0 --setgid 0 \
-      -- ${pkgs.bash}/bin/bash -c '
-        set -eu
-        name="$1"; dir="$2"
-        # Зона (net+mount namespace) — отдельным процессом, чтобы pasta,
-        # оставшаяся в сети хоста, могла к ней подключиться снаружи.
-        ${pkgs.util-linux}/bin/unshare --net --mount --propagation private --fork \
-          ${zoneInit} "$name" &
-        zonewatch=$!
-
-        for _ in $(seq 1 50); do [ -f "$dir/zone.pid" ] && break; sleep 0.1; done
-        zonepid=$(cat "$dir/zone.pid" 2>/dev/null || true)
-        [ -n "''${zonepid:-}" ] || { echo "зона не запустилась" >&2; exit 1; }
-
-        # Зоне без сети pasta не нужна — в этом весь её смысл.
-        pastapid=""
-        if [ ! -f "$dir/offline" ]; then
-          # -I hostif: имя выходного интерфейса задаём явно. По умолчанию pasta
-          # копирует имя интерфейса хоста, и если он вдруг называется awg0
-          # (когда сам хост под VPN), внутри зоны случилось бы столкновение имён.
-          ${pasta} --netns /proc/"$zonepid"/ns/net --config-net -q -I hostif -f &
-          pastapid=$!
-        fi
-
-        trap "kill $pastapid $zonewatch 2>/dev/null || true" TERM INT
-        wait $zonewatch
-      ' -- "$name" "$dir"
-  '';
+  # --- ЧАСТЬ 1-2: ЖИЗНЕННЫЙ ЦИКЛ ЗОНЫ — В RUST ---
+  # Здесь были два shell-скрипта: zoneHolder (создавал user namespace двойным
+  # маппингом и запускал pasta) и zoneInit (настраивал внутри туннель, маршруты
+  # и DNS). Оба переехали в крейт целиком — `vpn-zone-core zone-holder <имя>`,
+  # модуль rust/src/zone.rs. Архитектура та же: один процесс держит
+  # net+mount namespace, pasta цепляется к нему снаружи, всё держится на
+  # непривилегированном userns; изменилось только то, чем это написано.
+  #
+  # Что дал переезд:
+  #   • конфиг разбирает оттестированный парсер (rust/src/config.rs) вместо
+  #     конвейера sed+grep — CRLF, пустые I1…I5, три формы Endpoint и оба
+  #     семейства адресов закрыты юнит-тестами (docs/GOTCHAS.md §4);
+  #   • ни одной подстановки в shell: ip/awg/wg/pasta исполняются exec'ом
+  #     напрямую, аргументами-массивами;
+  #   • маппинг uid делается своим fork+newuidmap, а не через unshare(1).
+  # Пути инструментов подставляет Nix флагами в ExecStart юнита vpn-zone@ (см.
+  # ниже): часть кода работает внутри namespace, где PATH может быть каким
+  # угодно.
 
   # --- ЧАСТЬ 3: пользовательский CLI ---
   vpn-zone = pkgs.writeShellScriptBin "vpn-zone" ''
@@ -1083,11 +796,12 @@ let
         fi
         [ -n "''${p:-}" ] || { echo "зона $name не поднимается" >&2; exit 1; }
 
-        # Разделение профилей делает САМА ЗОНА, накладывая overlayfs на
-        # XDG-каталоги (см. zone-init). Поэтому здесь ничего к команде
-        # дописывать не нужно: работает для любой программы, независимо от того,
-        # какие флаги она понимает. Прежняя таблица флагов (--user-data-dir и
-        # компания) убрана — она требовала знать каждую программу поимённо.
+        # Разделение профилей делает overlayfs поверх XDG-каталогов, который
+        # накладывается уже при запуске программы (vpn-zone-core profile-run,
+        # см. exec ниже). Поэтому здесь ничего к команде дописывать не нужно:
+        # работает для любой программы, независимо от того, какие флаги она
+        # понимает. Прежняя таблица флагов (--user-data-dir и компания) убрана —
+        # она требовала знать каждую программу поимённо.
 
         # Отладочный выхлоп: показать итоговую команду, ничего не запуская.
         if [ -n "''${VPN_ZONE_DRYRUN:-}" ]; then
@@ -2217,7 +1931,15 @@ in
     };
     Service = {
       Type = "simple";
-      ExecStart = "${zoneHolder} %i";
+      # Держатель зоны — подкоманда rust-ядра (rust/src/zone.rs). Пути
+      # инструментов подставляются здесь, а не ищутся в PATH: часть кода
+      # исполняется внутри namespace, где PATH может быть каким угодно.
+      # Исключение — newuidmap/newgidmap: их держатель ищет ИМЕННО в PATH, как
+      # это делал unshare(1), потому что setuid-обёртки лежат в /run/wrappers/bin
+      # и в store их нет.
+      ExecStart =
+        "${vpn-zone-rust}/bin/vpn-zone-core zone-holder"
+        + " --ip ${iproute} --awg ${awg} --wg ${wg} --pasta ${pasta} %i";
       Restart = "no";
       # KillMode=control-group по умолчанию: гасим зону — гаснет и pasta, и всё,
       # что в зоне работало, теряет сеть. Это и есть kill switch.

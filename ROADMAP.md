@@ -45,21 +45,28 @@ python-скрипта и программа на C поглощены крейт
 - [x] заведён крейт `rust/`; разбор конфигов WG/AWG вынесен в него: CRLF, пустые
       `I1`–`I5`, `Address`/`DNS`/`MTU`/`Endpoint` (все три формы), текст для
       `setconf`, автодетект обфускации — с юнит-тестами на каждую граблю из
-      `docs/GOTCHAS.md` §4. Зоны им ещё не пользуются: конфиги по-прежнему
-      разбирает bash
+      `docs/GOTCHAS.md` §4. С переездом жизненного цикла зоны им пользуются и
+      сами зоны
 - [x] оба python-скрипта поглощены крейтом и удалены — Python в проекте больше
       нет: `vpn-profile-run.py` → `vpn-zone-core profile-run` (overlay-слои
       контейнера данных, сброс ambient capabilities, жизненный цикл одноразового
       контейнера), `vpn-zone-sync.py` → `vpn-zone-core sync` (генератор
       `.desktop`), с юнит-тестами на грабли §5 и §10. Обоих зовёт bash-скрипт
-      `vpn-zone`: жизненный цикл зоны, `run`/nsenter и реестр запусков всё ещё
-      на нём
-- [ ] один бинарь `vpn-zone`: жизненный цикл зоны (unshare/newuidmap, netlink,
-      pasta), `run`/nsenter, реестр запусков с блокировками — поверх уже готовых
-      разбора конфигов и слоёв контейнера
-- [ ] внутренняя архитектура — сразу двухнеймспейсная по `docs/LEAK-MODEL.md`:
-      сокет WireGuard в uplink-ns, в app-ns только lo + туннель (паритет —
-      о CLI и поведении, не о внутренностях)
+      `vpn-zone`: `run`/nsenter и реестр запусков всё ещё на нём
+- [x] жизненный цикл зоны переехал в крейт: `vpn-zone-core zone-holder <имя>`
+      (`rust/src/zone.rs`) — user namespace с двойным маппингом через
+      fork+newuidmap, net+mount namespace, pasta, туннель (amneziawg с
+      fallback на ядерный wireguard), маршрут до endpoint мимо туннеля,
+      IPv6-политика, сокрытие nsncd, resolv.conf зоны и зеркало состояния.
+      Скрипты `zoneHolder`/`zoneInit` из `module/default.nix` удалены,
+      архитектура прежняя (одно-namespace), паритет проверяется смоуком
+- [ ] остаток bash: CLI `vpn-zone` (`run`/nsenter, реестр запусков с
+      блокировками, add/rm/list/status/check/gc), пикер сети и GUI-обвязка
+- [ ] перевести внутреннюю архитектуру на двухнеймспейсную по
+      `docs/LEAK-MODEL.md`: сокет WireGuard в uplink-ns, в app-ns только lo +
+      туннель. Переезд на Rust сознательно сохранил прежнюю одно-namespace
+      модель — сначала паритет, потом смена архитектуры (паритет — о CLI и
+      поведении, не о внутренностях)
 - [ ] живость процессов в реестре — по PID + starttime из `/proc/<pid>/stat`
       (в bash-версии PID-reuse решено не чинить)
 - [ ] GUI пока остаётся kdialog-обвязкой над новым CLI
