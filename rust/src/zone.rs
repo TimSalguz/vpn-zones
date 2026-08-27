@@ -629,6 +629,21 @@ fn supervise(zone: &Zone) -> Result<u8, String> {
         {
             Ok(child) => {
                 println!("zone {}: pasta started (pid {})", zone.name(), child.id());
+                // Diagnostics: two seconds in, is pasta alive and in OUR zone's
+                // netns? passt logs to syslog off a terminal, so this is the
+                // only way to hear it.
+                let (zone_pid, pasta_pid) = (pid, child.id() as i32);
+                thread::sleep(Duration::from_secs(2));
+                let ns = |p: i32| match fs::read_link(format!("/proc/{p}/ns/net")) {
+                    Ok(l) => l.to_string_lossy().into_owned(),
+                    Err(e) => format!("<{e}>"),
+                };
+                eprintln!(
+                    "diag: zone pid {zone_pid} netns {}; pasta pid {pasta_pid} netns {}; pasta alive: {}",
+                    ns(zone_pid),
+                    ns(pasta_pid),
+                    Path::new(&format!("/proc/{pasta_pid}")).exists()
+                );
                 PASTA_CHILD.store(child.id() as i32, Ordering::SeqCst);
                 pasta = Some(child);
             }
