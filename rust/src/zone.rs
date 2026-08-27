@@ -624,7 +624,7 @@ fn supervise(zone: &Zone) -> Result<u8, String> {
         match Command::new(&zone.tools.pasta)
             .arg("--netns")
             .arg(&netns)
-            .args(["--config-net", "-q", "-I", PASTA_IFACE, "-f"])
+            .args(["--config-net", "-I", PASTA_IFACE, "-f"])
             .spawn()
         {
             Ok(child) => {
