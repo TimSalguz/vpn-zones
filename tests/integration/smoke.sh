@@ -12,7 +12,8 @@
 # нужно, проверяется сама механика зоны, а не живость сервера.
 #
 # Тест использует зоны с именами smoke, smoke-crlf, offsmoke в
-# ~/.local/state/vpn-zones и удаляет их же в начале.
+# ~/.local/state/vpn-zones и профиль smoketest-prof в ~/.local/state/vpn-profiles
+# — и удаляет их же в начале.
 set -euo pipefail
 
 step() { printf '\n==> %s\n' "$*"; }
@@ -22,7 +23,10 @@ REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 HARNESS="$REPO_ROOT/tests/harness.nix"
 WORK=$(mktemp -d)
 STATE="$HOME/.local/state/vpn-zones"
+PROFILES="$HOME/.local/state/vpn-profiles"
 TEST_ZONES=(smoke smoke-crlf offsmoke)
+TEST_PROFILE=smoketest-prof
+MARKER="$HOME/.config/vpn-smoke-marker"
 HOLDER_PIDS=()
 
 cleanup() {
@@ -40,6 +44,11 @@ cleanup() {
   for z in "${TEST_ZONES[@]}"; do
     pkill -TERM -f "vpn-zone-init $z\$" 2>/dev/null
   done
+  # Контейнер данных и его записи в реестре запусков. Маркер в настоящем
+  # ~/.config появляется только при провале теста (слой не наложился), но
+  # убрать его всё равно надо — чужого файла с таким именем не бывает.
+  rm -rf "${PROFILES:?}/$TEST_PROFILE" "${STATE:?}/.running/$TEST_PROFILE"
+  rm -f "$MARKER"
   if [ "$rc" -ne 0 ]; then
     for z in smoke offsmoke; do
       if [ -s "$WORK/holder-$z.log" ]; then
@@ -89,6 +98,8 @@ for z in "${TEST_ZONES[@]}"; do
   fi
   rm -rf "${STATE:?}/$z"
 done
+rm -rf "${PROFILES:?}/$TEST_PROFILE" "${STATE:?}/.running/$TEST_PROFILE"
+rm -f "$MARKER"
 
 # --- 2. Синтетический конфиг -------------------------------------------------
 step "Генерирую синтетический конфиг WireGuard (без DNS=, без обфускации)"
@@ -183,7 +194,36 @@ if echo "$epr" | grep -q 'dev awg0'; then
   fail "маршрут до endpoint завёрнут в туннель — петля"
 fi
 
-# --- 6. Offline-зона ---------------------------------------------------------
+# --- 6. Контейнер данных (профиль) через vpn-zone run ------------------------
+# Проверяется весь путь запуска: nsenter в зону с --keep-caps, свой mount
+# namespace, overlay поверх XDG-каталогов и сброс ambient capabilities — то, что
+# делает `vpn-zone-core profile-run` (крейт rust/, модуль profile).
+step "vpn-zone profile create $TEST_PROFILE"
+"$VPN_ZONE" profile create "$TEST_PROFILE"
+[ -d "$PROFILES/$TEST_PROFILE" ] || fail "каталог профиля не создан"
+
+# Нижний слой должен существовать: несуществующий каталог профиль пропускает, и
+# запись ушла бы в настоящий дом — то есть тест проверял бы не то.
+mkdir -p "$HOME/.config"
+
+step "vpn-zone run smoke --profile $TEST_PROFILE — запись в слой профиля"
+# Зона smoke сейчас поднята держателем, поэтому zone_pid её находит и systemctl
+# не понадобится. Графики на раннере нет: kdialog-ветки (предупреждение «уже
+# запущена в другой сети») не срабатывают, а wl-sandbox без композитора пишет
+# предупреждение и запускает команду как есть — оба пути чистые.
+"$VPN_ZONE" run smoke --profile "$TEST_PROFILE" -- \
+  sh -c 'echo marker > "$HOME/.config/vpn-smoke-marker"'
+
+UPPER="$PROFILES/$TEST_PROFILE/.config/upper/vpn-smoke-marker"
+[ -f "$UPPER" ] || fail "маркера нет в верхнем слое ($UPPER) — overlay профиля не наложился"
+[ ! -e "$MARKER" ] || fail "маркер попал в настоящий ~/.config — слой профиля не изолировал запись"
+echo "ok: запись ушла в слой профиля, настоящий ~/.config не тронут"
+
+step "vpn-zone profile rm $TEST_PROFILE"
+"$VPN_ZONE" profile rm "$TEST_PROFILE"
+[ ! -d "$PROFILES/$TEST_PROFILE" ] || fail "профиль не удалился"
+
+# --- 7. Offline-зона ---------------------------------------------------------
 step "Создаю offline-зону offsmoke (как это делает пикер: mkdir + touch offline)"
 mkdir -p "$STATE/offsmoke"
 : > "$STATE/offsmoke/offline"
@@ -206,7 +246,7 @@ offdef=$(in_off "$IP" -4 route show default)
 [ -z "$offdef" ] || fail "в offline-зоне есть default route: $offdef"
 echo "ok: сети нет физически"
 
-# --- 7. Гасим и проверяем уборку ---------------------------------------------
+# --- 8. Гасим и проверяем уборку ---------------------------------------------
 step "Гашу держателей (TERM) и добиваю процессы зон"
 for p in "${HOLDER_PIDS[@]}"; do
   kill -TERM "$p" 2>/dev/null || true

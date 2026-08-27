@@ -31,13 +31,11 @@ jobs:
 
   # Адресная сборка каждой script-деривации + shellcheck по собранным bin/*.
   scripts:
-    name: scripts (build + shellcheck + py_compile)
+    name: scripts (build + shellcheck)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
-      - name: python3 -m py_compile module/*.py
-        run: python3 -m py_compile module/*.py
       - name: Собрать script-деривации адресно
         run: |
           set -euo pipefail
@@ -73,9 +71,10 @@ jobs:
           echo "shellcheck: ok (${#files[@]} файлов)"
 
   # Rust-ядро (ROADMAP M1/M2): формат, линт и тесты крейта rust/ — парсер
-  # конфигов WG/AWG и генератор seccomp-фильтра. В job scripts крейт тоже
-  # собирается (vpn-fs-sandbox на него ссылается), но без clippy и без тестов:
-  # компилятор и линтер живут здесь.
+  # конфигов WG/AWG, генератор seccomp-фильтра, слои профилей и генератор
+  # .desktop-ярлыков. В job scripts крейт тоже собирается (vpn-fs-sandbox и
+  # vpn-zone-sync на него ссылаются), но без clippy и без тестов: компилятор и
+  # линтер живут здесь.
   #
   # cargo test включает selftest фильтра: он грузит seccomp в собственный
   # процесс и проверяет, что keyctl отвечает EPERM. Прав для этого не нужно —

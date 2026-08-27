@@ -5,6 +5,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
 
 ## [Unreleased]
 
+### Changed
+- Python is gone: both helper scripts are now subcommands of the Rust
+  `vpn-zone-core` binary — `profile-run` (the overlayfs layers of a data
+  container, the ambient-capability drop and the life cycle of a throwaway
+  one) and `sync` (the `.desktop` generator). Behaviour is unchanged, every
+  quirk of `docs/GOTCHAS.md` §5 and §10 is now covered by unit tests, and the
+  bash side keeps calling them with the same arguments. The project no longer
+  depends on `python3` at all.
+
 ### Security
 - IPv6 no longer bypasses the tunnel. Previously only the IPv4 default route
   went into the tunnel while pasta still provided the zone with full IPv6

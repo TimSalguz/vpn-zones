@@ -32,12 +32,15 @@
    полный eval модуля, падает на любой ошибке вычисления.
 2. **scripts** — адресная сборка каждой `scripts.<имя>`, затем `shellcheck`
    по собранным `bin/*` (бинарь `wl-sandbox` пропускается по отсутствию
-   шебанга) и `python3 -m py_compile module/*.py`. Список исключений
-   shellcheck с обоснованием — прямо в шаге workflow.
-3. **rust** — крейт `rust/` (парсер конфигов WG/AWG и генератор
-   seccomp-фильтра) в `nix-shell -p cargo rustc clippy rustfmt pkg-config
-   libseccomp`: `cargo fmt --check`, `cargo clippy --all-targets -- -D
-   warnings`, `cargo test`. Тесты включают `vpn-zone-seccomp selftest` —
+   шебанга). Список исключений shellcheck с обоснованием — прямо в шаге
+   workflow.
+3. **rust** — крейт `rust/` (парсер конфигов WG/AWG, генератор
+   seccomp-фильтра, слои профилей и генератор `.desktop`-ярлыков) в
+   `nix-shell tests/harness.nix -A rustShell`: `cargo fmt --check`,
+   `cargo clippy --all-targets -- -D warnings`, `cargo test`. Юниты крейта
+   покрывают грабли §4, §5 и §10 из `docs/GOTCHAS.md` (разбор `.desktop`,
+   отсутствие кавычек в `Exec`, битые симлинки, идемпотентная запись,
+   уборка чужого не трогает). Тесты включают и `vpn-zone-seccomp selftest` —
    фильтр грузится в отдельный процесс и проверяется, что `keyctl` отвечает
    EPERM (прав для этого не нужно: seccomp с NO_NEW_PRIVS доступен
    непривилегированно). В деривации модуля тесты выключены (`doCheck = false`):
@@ -55,6 +58,11 @@
   `awg0` существует и UP, v4 default через `awg0`, IPv6 выключен (или v6
   default = unreachable), `/etc/resolv.conf` содержит `nameserver 1.1.1.1`
   (дефолт при отсутствии `DNS=`), маршрут до endpoint идёт мимо туннеля;
+- контейнер данных: `vpn-zone profile create`, затем `vpn-zone run smoke
+  --profile …` с записью файла — маркер обязан оказаться в верхнем слое
+  профиля (`~/.local/state/vpn-profiles/<имя>/.config/upper/`) и НЕ появиться
+  в настоящем `~/.config`. Это проверка всего пути запуска: `nsenter
+  --keep-caps`, свой mount namespace и `vpn-zone-core profile-run`;
 - offline-зона: только `lo`, default route нет;
 - после `TERM` держателям процессы `pasta` умирают.
 
@@ -78,9 +86,11 @@ tests/integration/smoke.sh
 Скрипт сам собирает нужное из `harness.nix` под твои `$USER`/`$HOME`
 (первый запуск скачает замыкание kdialog и прочего — это долго, но это
 загрузка из кэша, не компиляция). Использует зоны с именами `smoke`,
-`smoke-crlf`, `offsmoke` в `~/.local/state/vpn-zones` — в начале удаляет их
-остатки, чужие зоны не трогает (шаблоны `pkill`/`pgrep` сужены до тестовых
-имён). Если зона с таким именем уже поднята — откажется и попросит опустить.
+`smoke-crlf`, `offsmoke` в `~/.local/state/vpn-zones` и профиль
+`smoketest-prof` в `~/.local/state/vpn-profiles` — в начале удаляет их
+остатки, чужие зоны и профили не трогает (шаблоны `pkill`/`pgrep` сужены до
+тестовых имён). Если зона с таким именем уже поднята — откажется и попросит
+опустить.
 
 ## Обновить пины
 
