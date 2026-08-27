@@ -581,6 +581,16 @@ fn holder(zone: &Zone, unshared_w: OwnedFd, mapped_r: OwnedFd) -> u8 {
         );
         return 1;
     }
+    // setuid() cleared the dumpable flag, and the zone process forked below
+    // inherits it. A non-dumpable process hides its /proc/<pid>/ns/* behind a
+    // CAP_SYS_PTRACE check that pasta then fails: it has to open the zone's
+    // netns through /proc, gets EACCES and dies on the spot — silently, since
+    // passt logs to syslog when stderr is not a terminal. util-linux's
+    // `unshare --setuid` (what this dance replaces) sets dumpable back for
+    // exactly this reason, so parity requires it. The exposure is unchanged
+    // from the bash version: same-user processes may ptrace the zone.
+    // SAFETY: prctl with these arguments takes no pointers.
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
 
     match supervise(zone) {
         Ok(code) => code,
