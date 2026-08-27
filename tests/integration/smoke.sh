@@ -62,16 +62,14 @@ build() {
 }
 build scripts.vpn-zone vpn-zone
 build zoneHolder zone-holder
-build deps.wireguard-tools wireguard-tools
-build deps.iproute2 iproute2
-build deps.util-linux util-linux
+build smokeTools tools
 
 VPN_ZONE="$WORK/vpn-zone/bin/vpn-zone"
 ZONE_HOLDER="$WORK/zone-holder/bin/zone-holder"
-WG="$WORK/wireguard-tools/bin/wg"
-IP="$WORK/iproute2/bin/ip"
-NSENTER="$WORK/util-linux/bin/nsenter"
-UNSHARE="$WORK/util-linux/bin/unshare"
+WG="$WORK/tools/bin/wg"
+IP="$WORK/tools/bin/ip"
+NSENTER="$WORK/tools/bin/nsenter"
+UNSHARE="$WORK/tools/bin/unshare"
 
 # --- 1. Предусловия ----------------------------------------------------------
 step "Проверяю предусловия раннера"

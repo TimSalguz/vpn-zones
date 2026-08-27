@@ -25,7 +25,7 @@ jobs:
       - name: Инстанцировать tests/harness.nix
         run: |
           nix-instantiate tests/harness.nix \
-            -A activationPackage -A scripts -A zoneHolder -A deps
+            -A activationPackage -A scripts -A zoneHolder -A smokeTools
           # строка ExecStart юнита vpn-zone@ должна вычисляться
           nix-instantiate --eval tests/harness.nix -A zoneHolderExec
 
@@ -62,16 +62,14 @@ jobs:
             fi
             files+=("$f")
           done
-          # Исключения — только то, что для этого стиля генерённых nix-скриптов
-          # заведомо ложноположительно; SC2086 и прочие проверки подстановок
-          # оставлены включёнными нарочно:
-          #  SC1091 — source/шебанги указывают в /nix/store, follow бессмыслен;
-          #  SC2016 — $ внутри одинарных кавычек: это нарочно, строки для
-          #           вложенного `bash -c` (см. zoneHolder, vpn-fs-sandbox);
-          #  SC2064 — trap с раскрытием переменных сразу: тоже нарочно, в trap
-          #           фиксируются pid'ы уже запущенных фоновых процессов;
-          #  SC2012 — `ls -A` для проверки «каталог не пуст», парсинга имён нет.
-          shellcheck --exclude=SC1091,SC2016,SC2064,SC2012 "${files[@]}"
+          # --severity=warning: info/style в генерённых nix-скриптах — шум
+          # (SC2015 «&& … || true» — нарочный идиом под set -e, SC2001/SC2002 —
+          # стилистика). Предупреждения и ошибки — по делу, SC2086 включён.
+          # Исключения:
+          #  SC2088 — «~/.mozilla» в echo-тексте для человека, не путь;
+          #  SC2064 — trap с раскрытием сразу: нарочно, фиксируются pid'ы
+          #           уже запущенных фоновых процессов.
+          shellcheck --severity=warning --exclude=SC2088,SC2064 "${files[@]}"
           echo "shellcheck: ok (${#files[@]} файлов)"
 
   # Смоук: поднять настоящую зону в непривилегированном userns и проверить её

@@ -14,7 +14,7 @@
     (`zone-holder <имя>` = то, что делает юнит `vpn-zone@<имя>`, но без
     systemd);
   - `zoneHolderExec` — строка ExecStart юнита (для диагностики);
-  - `deps.*` — `wireguard-tools`, `iproute2`, `util-linux`, `passt` тех же
+  - `smokeTools` — buildEnv c `wireguard-tools`, `iproute2`, `util-linux`, `passt` тех же
     версий, что у модуля.
 
   Username и домашний каталог параметризуются:

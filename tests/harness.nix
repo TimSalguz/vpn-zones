@@ -116,13 +116,18 @@ in
   '';
 
   # Инструменты для смоук-теста — теми же версиями, что использует модуль.
-  deps = {
-    inherit (pkgs)
+  # Именно buildEnv, а не отдельные пакеты: util-linux и iproute2 многовыходные,
+  # и `nix-build -o link` даёт ссылку на дефолтный output, в котором bin/ может
+  # не быть — смоук на раннере так и упал («util-linux/bin/unshare: No such
+  # file»). buildEnv собирает bin/ всех инструментов в один выход.
+  smokeTools = pkgs.buildEnv {
+    name = "vpn-zones-smoke-tools";
+    paths = with pkgs; [
       wireguard-tools
       iproute2
       util-linux
       passt
-      ;
-    recurseForDerivations = true;
+    ];
+    pathsToLink = [ "/bin" ];
   };
 }
