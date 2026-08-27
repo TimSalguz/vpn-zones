@@ -5,6 +5,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
 
 ## [Unreleased]
 
+### Fixed (launch-flow audit of the picker and `run`)
+- Pinned sandboxes ("… — always" with a named or per-app sandbox) were erased
+  by pin validation on the very next launch.
+- Choosing a throwaway container via "Change container…" was silently lost on
+  the re-exec: the program opened in the previous persistent container.
+- After "Ask for the network again", a separately pinned container was ignored
+  for that launch.
+- A locked (no-escape) zone dropped `--profile` but not the sandbox flags, so
+  opening a link from inside such a zone failed silently.
+- Launching through the picker with no graphical session silently did nothing;
+  it now falls back to the remembered/default choice with a note on stderr.
+- The conflict warning named the wrapper (`wl-sandbox`) instead of the program,
+  shared one "don't ask again" key across all sandboxed apps, and the
+  delegated launch from inside a zone lost `VPN_ZONE_APPID` (separate
+  permission sets and registry entries for the same app).
+- A failed `systemctl --user start` or a failed profile/sandbox creation
+  killed the whole launch under `set -e` after all dialogs had been answered;
+  both now degrade with a message instead.
+- Cosmetics: "Change container (now: …)" showed the last choice instead of the
+  pinned one; the reset dialog's notification showed the entry key instead of
+  the program's name.
+
 ### Changed
 - A zone is now **two** network namespaces instead of one, the gateway layout of
   `docs/LEAK-MODEL.md`. Connectivity lives in the uplink namespace — pasta
