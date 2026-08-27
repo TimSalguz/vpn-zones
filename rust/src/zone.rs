@@ -628,6 +628,7 @@ fn supervise(zone: &Zone) -> Result<u8, String> {
             .spawn()
         {
             Ok(child) => {
+                println!("zone {}: pasta started (pid {})", zone.name(), child.id());
                 PASTA_CHILD.store(child.id() as i32, Ordering::SeqCst);
                 pasta = Some(child);
             }
@@ -714,6 +715,20 @@ fn zone_setup(zone: &Zone) -> Result<(), String> {
     wait_for_default_route(zone);
     let out = default_route(zone, Family::V4);
     let Some(outif) = out.dev else {
+        // The dump tells apart "pasta never attached" (lo only) from "attached
+        // but configured differently" (a tap exists, the routes do not).
+        for what in [
+            ["-o", "link", "show"],
+            ["-4", "addr", "show"],
+            ["-4", "route", "show"],
+        ] {
+            eprintln!(
+                "zone {}: ip {}:\n{}",
+                zone.name(),
+                what.join(" "),
+                zone.ip_line(&what)
+            );
+        }
         return Err("pasta gave us no route out".to_string());
     };
 
