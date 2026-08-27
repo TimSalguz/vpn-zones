@@ -6,6 +6,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
 ## [Unreleased]
 
 ### Changed
+- A zone is now **two** network namespaces instead of one, the gateway layout of
+  `docs/LEAK-MODEL.md`. Connectivity lives in the uplink namespace — pasta
+  attaches there, and the tunnel's UDP socket stays there — while programs run in
+  an app namespace that has loopback and the tunnel and nothing else. The
+  interface is created in the uplink (a WireGuard socket stays in the namespace
+  the interface was *born* in, whatever namespace it is later moved to), handed
+  down with `ip link set awg0 netns <pid>` and configured there, because netlink
+  works on the current namespace. The contract towards the outside is unchanged:
+  `zone.pid` still names the app namespace, which is what `vpn-zone run`/`status`
+  `nsenter` into, and `ready`, `status`, `resolv.conf`, `config.conf` and the
+  offline marker keep their meaning. New file in the zone directory:
+  `uplink.pid`. `vpn-zone gc` needs no change — it recognises a stray pasta by
+  the `/proc/<pid>/ns/net` in its command line, and that pid is now the uplink's.
+  An offline zone is unaffected: still one namespace with loopback and no pasta.
+- Endpoints are resolved before either namespace exists, and the text handed to
+  `setconf` carries literal addresses. `wg setconf` resolves `Endpoint` itself
+  and retries DNS for about ninety seconds before failing — in a namespace that
+  has no network until the tunnel it is configuring is up, a hostname would hang
+  the zone and then fail anyway. A name that cannot be resolved is now a loud
+  error instead of a zone that comes up without a route. `WgConfig` grew
+  `resolve_endpoints` for this (v6 gets brackets only when a port follows), with
+  unit tests; the rest of the parser API is untouched.
 - The life cycle of a zone is Rust now. The two shell scripts of
   `module/default.nix` — `zoneHolder` (the user namespace with its double id
   mapping, and pasta) and `zoneInit` (tunnel, routes, IPv6, DNS, the state
@@ -48,6 +70,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   depends on `python3` at all.
 
 ### Security
+- A leak out of a zone is now impossible by construction rather than forbidden
+  by a rule. The namespace programs run in has exactly two interfaces, loopback
+  and the tunnel, so:
+  - the host's LAN is not reachable from a zone at all — there is no interface
+    to reach it through, and no rule to get wrong;
+  - any protocol family is fail-closed for the same reason, including families
+    nobody has invented yet. The IPv6 patch of M0 is gone with the hole it
+    plugged: the family is no longer switched off through a sysctl, v6 either
+    goes into the tunnel or is left without a default route;
+  - the /32 (or /128) route to the VPN server has disappeared from the zone
+    together with the interface it pointed through. The encrypted packets are
+    born in the uplink namespace and leave by *its* default route, so the
+    programs never see the endpoint, and the smoke test now asserts the opposite
+    of what it used to: inside the zone, the route to the endpoint must go
+    through the tunnel;
+  - the kill switch is topology now. Programs keep the app namespace alive after
+    the holder is gone, but nothing keeps the *uplink* namespace alive; the
+    kernel destroys it, and WireGuard reacts to its creating namespace going
+    away by turning the carrier off and closing the sockets. The interface stays
+    and drops every packet.
+  Unchanged, and worth repeating: this closes the network. Unix sockets of the
+  compositor, the bus and X11 are not affected by topology and stay the business
+  of the wl-sandbox / fs-sandbox / dbus-proxy layers, and the nsncd leak is still
+  closed by hiding its socket under a tmpfs — a socket has no route to remove.
 - IPv6 no longer bypasses the tunnel. Previously only the IPv4 default route
   went into the tunnel while pasta still provided the zone with full IPv6
   connectivity to the host — all IPv6 traffic of zone apps went around the
@@ -91,6 +137,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   first one; a v6-only `Address` used to kill the zone on `ip -4 addr add`.
 
 ### Fixed
+- The IPv6 fallback route was a syntax error and had never worked:
+  `ip -6 route replace default unreachable` puts the route type after the
+  prefix, which iproute2 rejects with "Command line is not complete" (exit 255).
+  The type goes first — `replace unreachable default`. It went unnoticed because
+  the `disable_ipv6` sysctl branch above it usually won; the sysctl is gone now
+  and this is the branch that runs.
 - Launch-registry updates are serialized with `flock`: two concurrent launches
   of the same app could lose each other's records (read → rewrite → rename
   without locking), and `gc` could erase a record of an app that had just

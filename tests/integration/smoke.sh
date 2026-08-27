@@ -12,6 +12,12 @@
 # Endpoint — 192.0.2.1 (TEST-NET-1, недостижим): рукопожатие для смоука не
 # нужно, проверяется сама механика зоны, а не живость сервера.
 #
+# АРХИТЕКТУРА, КОТОРУЮ ЭТО ПРОВЕРЯЕТ (docs/LEAK-MODEL.md): у зоны ДВА сетевых
+# namespace. В uplink-ns (uplink.pid) живут pasta и UDP-сокет туннеля; в app-ns
+# (zone.pid — туда же ходит nsenter из vpn-zone run/status) нет ничего, кроме lo
+# и awg0. Главный ассерт теста — именно это «ничего, кроме»: пока других
+# интерфейсов нет, утечка невозможна не по правилу, а по отсутствию пути.
+#
 # Тест использует зоны с именами smoke, smoke-crlf, offsmoke в
 # ~/.local/state/vpn-zones и профиль smoketest-prof в ~/.local/state/vpn-profiles
 # — и удаляет их же в начале.
@@ -34,9 +40,13 @@ cleanup() {
   rc=$?
   set +e
   for p in "${HOLDER_PIDS[@]}"; do kill -TERM "$p" 2>/dev/null; done
+  # Оба namespace зоны: держатель гасит их вместе, но если он сам уже убит,
+  # аплинк остался бы висеть с pasta на шее.
   for z in "${TEST_ZONES[@]}"; do
-    zp=$(cat "$STATE/$z/zone.pid" 2>/dev/null)
-    [ -n "$zp" ] && kill -TERM "$zp" 2>/dev/null
+    for f in zone.pid uplink.pid; do
+      zp=$(cat "$STATE/$z/$f" 2>/dev/null)
+      [ -n "$zp" ] && kill -TERM "$zp" 2>/dev/null
+    done
   done
   # Подстраховка для зон, поднятых ДОРУСТОВОЙ версией модуля: там процесс зоны
   # назывался vpn-zone-init и юниту тут не подчинялся. У нынешнего держателя
@@ -152,13 +162,35 @@ wait_file() { # <файл> <попыток по 0.1с>
 wait_file "$STATE/smoke/ready" 200 || fail "зона smoke не поднялась за 20 секунд"
 ZPID=$(cat "$STATE/smoke/zone.pid")
 [ -d "/proc/$ZPID" ] || fail "ready есть, а процесса зоны (pid $ZPID) нет"
-echo "ok: зона smoke поднята, pid $ZPID"
+# Второй namespace шлюзовой архитектуры: связность и UDP-сокет туннеля живут в
+# нём, приложения его не видят. Файл появляется РАНЬШЕ ready (uplink стартует
+# первым), но ждём явно — на случай гонки при медленном раннере.
+wait_file "$STATE/smoke/uplink.pid" 200 || fail "uplink.pid не появился"
+UPID=$(cat "$STATE/smoke/uplink.pid")
+[ -d "/proc/$UPID" ] || fail "uplink.pid есть, а процесса аплинка (pid $UPID) нет"
+[ "$UPID" != "$ZPID" ] || fail "uplink.pid и zone.pid совпали — namespace один, а должно быть два"
+echo "ok: зона smoke поднята, app-ns pid $ZPID, uplink pid $UPID"
 
 in_zone() {
   "$NSENTER" --preserve-credentials -U -n -m -t "$ZPID" -- "$@"
 }
+in_uplink() {
+  "$NSENTER" --preserve-credentials -U -n -m -t "$UPID" -- "$@"
+}
 
 # --- 5. Проверки внутри зоны -------------------------------------------------
+# ГЛАВНЫЙ АССЕРТ ГЕРМЕТИЧНОСТИ (docs/LEAK-MODEL.md). Всё остальное — маршруты,
+# IPv6, DNS — производные от него: если в namespace приложений нет ничего, кроме
+# lo и туннеля, то утечь некуда физически, каким бы ни было семейство протоколов
+# и что бы ни напутали в маршрутах.
+step "Внутри зоны: РОВНО два линка — lo и awg0, больше ничего"
+links=$(in_zone "$IP" -o link show)
+echo "$links"
+n=$(echo "$links" | wc -l)
+[ "$n" -eq 2 ] || fail "в app-ns $n интерфейсов вместо двух — герметичность нарушена"
+echo "$links" | grep -q ': lo:' || fail "в app-ns нет lo"
+echo "$links" | grep -q ': awg0[:@]' || fail "в app-ns нет awg0"
+
 step "Внутри зоны: интерфейс awg0 существует и UP"
 linkline=$(in_zone "$IP" -o link show awg0) || fail "внутри зоны нет интерфейса awg0"
 echo "$linkline"
@@ -169,18 +201,20 @@ def4=$(in_zone "$IP" -4 route show default)
 echo "${def4:-<пусто>}"
 echo "$def4" | grep -q 'dev awg0' || fail "default route не через awg0"
 
-step "Внутри зоны: IPv6 закрыт (конфиг без v6)"
+step "Внутри зоны: IPv6 без пути наружу (конфиг без v6)"
+# Проверки disable_ipv6 больше нет: семейство не выключается, потому что и не
+# нужно — других интерфейсов в app-ns не существует. Достаточно, чтобы v6
+# default либо отсутствовал, либо был unreachable (пояс с подтяжками).
 if ! in_zone test -e /proc/sys/net/ipv6; then
   echo "ok: IPv6 в ядре нет"
 else
-  d6=$(in_zone cat /proc/sys/net/ipv6/conf/all/disable_ipv6)
-  if [ "$d6" = "1" ]; then
-    echo "ok: disable_ipv6 = 1"
+  def6=$(in_zone "$IP" -6 route show default 2>/dev/null || true)
+  echo "v6 default: ${def6:-<пусто>}"
+  if [ -z "$def6" ]; then
+    echo "ok: v6 default отсутствует"
   else
-    def6=$(in_zone "$IP" -6 route show default 2>/dev/null || true)
-    echo "disable_ipv6=$d6; v6 default: ${def6:-<пусто>}"
     echo "$def6" | grep -q '^unreachable' \
-      || fail "IPv6 не выключен и v6 default не unreachable — утечка мимо туннеля"
+      || fail "v6 default есть и он не unreachable: $def6"
   fi
 fi
 
@@ -190,11 +224,28 @@ echo "$resolv"
 echo "$resolv" | grep -Eq '^nameserver[[:space:]]+1\.1\.1\.1' \
   || fail "в /etc/resolv.conf зоны нет nameserver 1.1.1.1"
 
-step "Внутри зоны: маршрут до endpoint (192.0.2.1) идёт МИМО awg0"
+step "Внутри зоны: маршрут до endpoint (192.0.2.1) идёт В ТУННЕЛЬ"
+# Ассерт ПЕРЕВЁРНУТ по сравнению с одно-namespace версией — и это главное
+# следствие шлюзовой архитектуры. Раньше в зоне был /32 до VPN-сервера мимо
+# туннеля (иначе пакеты туннеля заворачивались бы в туннель) — и приложения его
+# видели. Теперь шифрованный трафик рождается в uplink-ns и уходит ЕГО
+# маршрутом, а в app-ns никакого исключения нет и быть не должно: петли не
+# возникает по построению.
 epr=$(in_zone "$IP" route get 192.0.2.1)
 echo "$epr"
-if echo "$epr" | grep -q 'dev awg0'; then
-  fail "маршрут до endpoint завёрнут в туннель — петля"
+echo "$epr" | grep -q 'dev awg0' \
+  || fail "маршрут до endpoint идёт мимо туннеля — в app-ns остался путь наружу"
+
+step "Внутри аплинка: tap от pasta и default route (диагностика)"
+ulinks=$(in_uplink "$IP" -o link show)
+echo "$ulinks"
+echo "$ulinks" | grep -q ': hostif[:@]' || fail "в uplink-ns нет интерфейса pasta (hostif)"
+udef=$(in_uplink "$IP" -4 route show default)
+echo "${udef:-<пусто>}"
+[ -n "$udef" ] || fail "в uplink-ns нет default route — pasta не настроила выход"
+# Туннеля в аплинке быть не должно: он там рождается и сразу переезжает вниз.
+if in_uplink "$IP" -o link show awg0 >/dev/null 2>&1; then
+  fail "awg0 остался в uplink-ns — переезд интерфейса не состоялся"
 fi
 
 # --- 6. Контейнер данных (профиль) через vpn-zone run ------------------------
@@ -256,10 +307,12 @@ for p in "${HOLDER_PIDS[@]}"; do
 done
 sleep 1
 for z in "${TEST_ZONES[@]}"; do
-  zp=$(cat "$STATE/$z/zone.pid" 2>/dev/null || true)
-  if [ -n "$zp" ] && [ -d "/proc/$zp" ]; then
-    kill -TERM "$zp" 2>/dev/null || true
-  fi
+  for f in zone.pid uplink.pid; do
+    zp=$(cat "$STATE/$z/$f" 2>/dev/null || true)
+    if [ -n "$zp" ] && [ -d "/proc/$zp" ]; then
+      kill -TERM "$zp" 2>/dev/null || true
+    fi
+  done
   # то же, что в cleanup: остаток дорустовой версии, шаблон сужен до тестовых
   # зон, чтобы на рабочей машине не задеть настоящие
   pkill -TERM -f "vpn-zone-init $z\$" 2>/dev/null || true
@@ -267,8 +320,10 @@ done
 HOLDER_PIDS=()
 
 step "Проверяю, что pasta умерла вместе с зоной"
-# Ищем ровно НАШУ pasta (по netns тестовой зоны), а не любую на машине.
-pasta_pat="pasta --netns /proc/$ZPID/ns/net"
+# Ищем ровно НАШУ pasta, а не любую на машине. В шлюзовой архитектуре pasta
+# цепляется к АПЛИНКУ, а не к namespace приложений — по этому же номеру её
+# находит и `vpn-zone gc` (он читает /proc/N/ns/net из её cmdline).
+pasta_pat="pasta --netns /proc/$UPID/ns/net"
 for _ in $(seq 1 50); do
   pgrep -f "$pasta_pat" >/dev/null || break
   sleep 0.1

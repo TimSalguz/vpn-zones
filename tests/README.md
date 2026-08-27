@@ -62,17 +62,24 @@
 - `vpn-zone add` из синтетического конфига (ключи `wg genkey`, endpoint
   `192.0.2.1` из TEST-NET — недостижим, рукопожатие не нужно), плюс тот же
   конфиг в CRLF;
-- подъём зоны держателем напрямую (без systemd-юнита), внутри зоны:
-  `awg0` существует и UP, v4 default через `awg0`, IPv6 выключен (или v6
-  default = unreachable), `/etc/resolv.conf` содержит `nameserver 1.1.1.1`
-  (дефолт при отсутствии `DNS=`), маршрут до endpoint идёт мимо туннеля;
+- подъём зоны держателем напрямую (без systemd-юнита) и **герметичность
+  шлюзовой архитектуры** (`docs/LEAK-MODEL.md`): в namespace приложений
+  (`zone.pid`) ровно два линка — `lo` и `awg0`, и больше ничего; `awg0` UP, v4
+  default через него, v6 default отсутствует или `unreachable`,
+  `/etc/resolv.conf` содержит `nameserver 1.1.1.1` (дефолт при отсутствии
+  `DNS=`), а маршрут до endpoint идёт В ТУННЕЛЬ — петли нет, потому что
+  шифрованный трафик рождается в другом namespace. В аплинке (`uplink.pid`)
+  для контраста: интерфейс pasta (`hostif`), default route и НЕТ `awg0` — он
+  там создаётся и сразу переезжает вниз;
 - контейнер данных: `vpn-zone profile create`, затем `vpn-zone run smoke
   --profile …` с записью файла — маркер обязан оказаться в верхнем слое
   профиля (`~/.local/state/vpn-profiles/<имя>/.config/upper/`) и НЕ появиться
   в настоящем `~/.config`. Это проверка всего пути запуска: `nsenter
   --keep-caps`, свой mount namespace и `vpn-zone-core profile-run`;
-- offline-зона: только `lo`, default route нет;
-- после `TERM` держателям процессы `pasta` умирают.
+- offline-зона: только `lo`, default route нет (аплинка и pasta у неё нет вовсе);
+- после `TERM` держателям процессы `pasta` умирают — ищутся по `--netns
+  /proc/<uplink.pid>/ns/net`, то есть ровно по тому признаку, по которому их
+  находит и `vpn-zone gc`.
 
 **Важно:** на раннере нет модуля `amneziawg`, поэтому смоук рассчитывает на
 fallback в держателе зоны (`vpn-zone-core zone-holder`, `rust/src/zone.rs`):

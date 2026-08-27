@@ -111,6 +111,18 @@ pub struct DroppedKey {
     pub line: usize,
 }
 
+/// What became of one `Endpoint` line in [`WgConfig::resolve_endpoints`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEndpoint {
+    /// The value as it was written, e.g. `vpn.example.org:51820`.
+    pub raw: String,
+    /// What it was replaced with, or `None` if the name did not resolve — in
+    /// which case the line was left exactly as it was.
+    pub addr: Option<IpAddr>,
+    /// 1-based line number, for diagnostics.
+    pub line: usize,
+}
+
 /// A parsed WireGuard / AmneziaWG config.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WgConfig {
@@ -296,6 +308,47 @@ impl WgConfig {
         Endpoint::parse(self.first_value("Endpoint")?)
     }
 
+    /// Replace every `Endpoint` with a literal address, using `resolve`.
+    ///
+    /// **Why a config would ever be rewritten.** `wg setconf` resolves the
+    /// endpoint itself, with `getaddrinfo`, and retries for a minute and a half
+    /// before giving up. In the gateway layout (`docs/LEAK-MODEL.md`) it runs in
+    /// the app namespace, which has no network at all until the tunnel it is
+    /// configuring is up — a hostname there would hang the zone and then fail.
+    /// So the holder resolves the names while it is still in the host's network
+    /// and hands `setconf` addresses only.
+    ///
+    /// Each `Endpoint` is resolved on its own, because a config with several
+    /// peers has several servers. A `resolve` that answers `None` leaves the
+    /// line exactly as it was written and says so in the result — what to do
+    /// about it is the caller's decision, not the parser's.
+    pub fn resolve_endpoints(
+        &mut self,
+        mut resolve: impl FnMut(&Endpoint) -> Option<IpAddr>,
+    ) -> Vec<ResolvedEndpoint> {
+        let mut out = Vec::new();
+        for section in &mut self.sections {
+            for entry in &mut section.entries {
+                if !entry.key.eq_ignore_ascii_case("Endpoint") {
+                    continue;
+                }
+                let Some(endpoint) = Endpoint::parse(&entry.value) else {
+                    continue;
+                };
+                let addr = resolve(&endpoint);
+                if let Some(addr) = addr {
+                    entry.value = Endpoint::literal(addr, endpoint.port);
+                }
+                out.push(ResolvedEndpoint {
+                    raw: endpoint.raw,
+                    addr,
+                    line: entry.line,
+                });
+            }
+        }
+        out
+    }
+
     /// The text that goes to `wg setconf` / `awg setconf`: protocol keys only.
     ///
     /// Exactly what the `sed`+`grep -v` pipeline in `zoneInit` produces —
@@ -426,6 +479,20 @@ impl Endpoint {
             port: port_str.and_then(|p| p.parse().ok()),
             raw: raw.to_string(),
         })
+    }
+
+    /// An address and a port written the way `setconf` reads them back.
+    ///
+    /// The bracket rule is not decoration: `[fd00::1]:51820` without brackets
+    /// would be split on the last colon and mangled, and a v6 literal WITHOUT a
+    /// port must not have them — brackets with nothing after them are not a
+    /// valid endpoint either.
+    pub fn literal(addr: IpAddr, port: Option<u16>) -> String {
+        match (addr, port) {
+            (IpAddr::V6(addr), Some(port)) => format!("[{addr}]:{port}"),
+            (addr, Some(port)) => format!("{addr}:{port}"),
+            (addr, None) => format!("{addr}"),
+        }
     }
 
     /// Family of the literal; `None` for a name, which only resolution can
@@ -579,6 +646,72 @@ mod tests {
         assert_eq!(name.family(), None);
 
         assert_eq!(Endpoint::parse(""), None);
+    }
+
+    #[test]
+    fn endpoints_are_resolved_into_the_setconf_text() {
+        let v4: IpAddr = "198.51.100.7".parse().unwrap();
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+
+        // Two peers with two different names: each is resolved on its own, and
+        // a v6 answer comes back bracketed because a port follows it.
+        let text = format!(
+            "[Interface]\n\
+             PrivateKey = {KEY_A}\n\
+             [Peer]\n\
+             PublicKey = {KEY_B}\n\
+             Endpoint = one.example.org:51820\n\
+             [Peer]\n\
+             PublicKey = {KEY_A}\n\
+             Endpoint = two.example.org:1234\n"
+        );
+        let mut cfg = WgConfig::parse_str(&text).unwrap();
+        let resolved = cfg.resolve_endpoints(|ep| match ep.host {
+            EndpointHost::Name(ref n) if n == "one.example.org" => Some(v4),
+            EndpointHost::Name(_) => Some(v6),
+            _ => None,
+        });
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].raw, "one.example.org:51820");
+        assert_eq!(resolved[0].addr, Some(v4));
+        assert_eq!(resolved[1].addr, Some(v6));
+        let setconf = cfg.to_setconf();
+        assert!(setconf.contains("Endpoint = 198.51.100.7:51820"));
+        assert!(setconf.contains("Endpoint = [2001:db8::1]:1234"));
+        assert!(!setconf.contains("example.org"));
+
+        // A name that does not resolve is reported and LEFT ALONE: throwing it
+        // away would turn a broken config into a silently peerless one.
+        let mut cfg = WgConfig::parse_str(&text).unwrap();
+        let resolved = cfg.resolve_endpoints(|_| None);
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.iter().all(|r| r.addr.is_none()));
+        assert_eq!(resolved[0].line, 5);
+        assert!(cfg
+            .to_setconf()
+            .contains("Endpoint = one.example.org:51820"));
+
+        // A literal is handed to the resolver too (the caller answers with the
+        // literal itself) and must come back byte for byte, brackets and all.
+        let literals = plain().replace(
+            "Endpoint = 198.51.100.7:51820",
+            "Endpoint = [fd00::1]:51820",
+        ) + "Endpoint = fd00::2\n";
+        let mut cfg = WgConfig::parse_str(&literals).unwrap();
+        cfg.resolve_endpoints(|ep| match ep.host {
+            EndpointHost::V6(addr) => Some(IpAddr::V6(addr)),
+            EndpointHost::V4(addr) => Some(IpAddr::V4(addr)),
+            EndpointHost::Name(_) => None,
+        });
+        let setconf = cfg.to_setconf();
+        assert!(setconf.contains("Endpoint = [fd00::1]:51820"));
+        // No port, no brackets: `[fd00::2]` alone is not an endpoint.
+        assert!(setconf.contains("Endpoint = fd00::2\n"));
+
+        // A config without a single Endpoint is not an error, just an empty
+        // answer — the zone says so itself.
+        let mut cfg = WgConfig::parse_str(&format!("[Interface]\nPrivateKey = {KEY_A}\n")).unwrap();
+        assert!(cfg.resolve_endpoints(|_| Some(v4)).is_empty());
     }
 
     #[test]

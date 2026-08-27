@@ -138,6 +138,12 @@ What is missing here and what you should know:
 The subtleties that took the most time are commented in detail in
 `module/default.nix`. The least obvious ones:
 
+- a zone is **two** network namespaces, not one: connectivity (pasta and the
+  tunnel's UDP socket) lives in the uplink one, while the namespace programs run
+  in has nothing but loopback and the tunnel — a leak of any protocol family is
+  impossible there because no path exists (`docs/LEAK-MODEL.md`). The interface
+  is created in the uplink and moved down, because a WireGuard socket stays in
+  the namespace the interface was born in;
 - the zone holder needs a **double uid mapping**: `0:<subuid>:1` (otherwise
   capabilities are lost on `execve` and the interface cannot be created) plus
   `<uid>:<uid>:1` (otherwise the program does not see its `$HOME`);
