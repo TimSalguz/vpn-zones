@@ -357,8 +357,8 @@ where
 /// An unnamed, unlinked file to export the program into.
 fn scratch_file() -> io::Result<File> {
     // SAFETY: memfd_create(2) only ever returns a fresh descriptor or -1, and
-    // the name is a NUL-terminated literal.
-    let fd = unsafe { libc::memfd_create(b"vpn-zone-seccomp\0".as_ptr().cast(), 0) };
+    // a C-string literal is NUL-terminated by construction.
+    let fd = unsafe { libc::memfd_create(c"vpn-zone-seccomp".as_ptr(), 0) };
     if fd >= 0 {
         // SAFETY: the descriptor is fresh and owned by nobody else.
         return Ok(unsafe { File::from_raw_fd(fd) });
