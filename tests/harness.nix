@@ -60,14 +60,16 @@ let
 
   # Скрипты модуля — внутренние let-биндинги, наружу они попадают только через
   # home.packages. Вытаскиваем их оттуда по имени деривации (lib.getName
-  # отбрасывает версию: «wl-sandbox-1» → «wl-sandbox»), чтобы CI мог собирать
-  # каждый адресно, не собирая activationPackage целиком.
+  # отбрасывает версию: «vpn-zone-rust-0.1.0» → «vpn-zone-rust»), чтобы CI мог
+  # собирать каждый адресно, не собирая activationPackage целиком.
+  #
+  # Здесь только shell-деривации: Rust-крейт (vpn-zone-rust) собирается своим
+  # job'ом, а бывший wl-sandbox — теперь его подкоманда, а не отдельный пакет.
   scriptNames = [
     "vpn-zone"
     "vpn-zone-pick"
     "vpn-zone-sync"
     "vpn-fs-sandbox"
-    "wl-sandbox"
     "vpn-zone-add-gui"
     "vpn-zone-remove-gui"
     "vpn-zone-profile-rm-gui"

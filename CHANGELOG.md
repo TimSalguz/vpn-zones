@@ -6,6 +6,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
 ## [Unreleased]
 
 ### Changed
+- C is gone: `wl-sandbox` is now a subcommand of `vpn-zone-core`
+  (`vpn-zone-core wl-sandbox <app-id> -- cmd...`) instead of a C program built
+  from `module/wl-sandbox.c` with `wayland-scanner`. The behaviour it
+  implements is unchanged — a socket of its own registered with the compositor
+  through `wp_security_context_v1`, the close-fd switch held open for the
+  lifetime of the program, `WAYLAND_SOCKET` unset so the inherited descriptor
+  cannot override `WAYLAND_DISPLAY`, and a loud fallback to an unrestricted
+  launch whenever any of that fails. Two deliberate differences: the command
+  must now be separated by `--` (the C version took it without a separator,
+  and `vpn-zone run` was updated accordingly), and a program killed by a
+  signal is reported as `128 + signal` instead of a flat `1`, matching
+  `profile-run`. No libwayland is linked in: the wire protocol is spoken from
+  Rust, so the derivation needs no Wayland `buildInputs`.
 - Python is gone: both helper scripts are now subcommands of the Rust
   `vpn-zone-core` binary — `profile-run` (the overlayfs layers of a data
   container, the ambient-capability drop and the life cycle of a throwaway

@@ -82,46 +82,23 @@ let
   notify = "${pkgs.libnotify}/bin/notify-send";
   kdialog = "${pkgs.kdePackages.kdialog}/bin/kdialog";
 
-  # --- ЧАСТЬ 0: ОГРАНИЧЕНИЕ ДОСТУПА К КОМПОЗИТОРУ ---
-  # Собираем маленькую программу на C (готовой утилиты в nixpkgs нет). Она
-  # создаёт помеченный wayland-сокет, после чего композитор перестаёт выдавать
-  # клиенту протоколы слежки — подробности в самом wl-sandbox.c.
-  wl-sandbox = pkgs.stdenv.mkDerivation {
-    pname = "wl-sandbox";
-    version = "1";
-    src = ./wl-sandbox.c;
-    dontUnpack = true;
-    nativeBuildInputs = [ pkgs.wayland-scanner pkgs.pkg-config ];
-    buildInputs = [ pkgs.wayland ];
-    buildPhase = ''
-      proto=${pkgs.wayland-protocols}/share/wayland-protocols/staging/security-context/security-context-v1.xml
-      wayland-scanner client-header "$proto" security-context-v1-client-protocol.h
-      wayland-scanner private-code  "$proto" security-context-v1-protocol.c
-      # Копия рядом с генерёнными заголовками: #include "…" ищет их относительно
-      # исходника, а тот лежит в /nix/store, где ничего сгенерировать нельзя.
-      cp $src wl-sandbox.c
-      $CC -O2 -Wall -I. -o wl-sandbox wl-sandbox.c security-context-v1-protocol.c \
-        $(pkg-config --cflags --libs wayland-client)
-    '';
-    installPhase = ''
-      install -Dm755 wl-sandbox $out/bin/wl-sandbox
-    '';
-  };
-
-  # --- ЧАСТЬ 0б: RUST-ЯДРО ---
+  # --- ЧАСТЬ 0: RUST-ЯДРО ---
   # Отсюда идёт переезд ядра на Rust (ROADMAP M1/M2). Первым переехало то, чего
   # в bash нет в принципе: BPF-фильтр системных вызовов для песочницы —
   # программу для ядра умеет собрать только код (libseccomp). Следом переехали
   # оба бывших python-скрипта: наложение слоёв профиля при запуске программы и
-  # генератор .desktop-ярлыков. Python в проекте больше нет.
+  # генератор .desktop-ярлыков. Последним — ограничитель доступа к композитору,
+  # он же бывшая программа на C (module/wl-sandbox.c): создаёт помеченный
+  # wayland-сокет, после чего композитор перестаёт выдавать клиенту протоколы
+  # слежки. Ни Python, ни C в проекте больше нет.
   #
   # В крейте лежит ещё парсер конфигов WG/AWG с тестами на все грабли из
   # docs/GOTCHAS.md §4, но зоны его пока не используют: bash-версия остаётся
   # рабочей до подтверждённого паритета.
   #
   # Два бинаря: vpn-zone-seccomp (фильтр) и vpn-zone-core (подкоманды
-  # profile-run и sync). Со скриптом vpn-zone имена не сталкиваются — всё
-  # спокойно лежит в home.packages.
+  # profile-run, sync и wl-sandbox). Со скриптом vpn-zone имена не сталкиваются —
+  # всё спокойно лежит в home.packages.
   vpn-zone-rust = pkgs.rustPlatform.buildRustPackage {
     pname = "vpn-zone-rust";
     version = "0.1.0";
@@ -141,6 +118,13 @@ let
     cargoLock.lockFile = ../rust/Cargo.lock;
     # libseccomp-sys линкуется с системной libseccomp, а её версию ищет
     # pkg-config (build.rs крейта libseccomp).
+    #
+    # А вот libwayland здесь НЕТ, и это осознанный выбор: у wayland-backend
+    # фича client_system по умолчанию выключена, то есть wayland-client говорит
+    # по проводному протоколу сам, на Rust. Ни линковки, ни dlopen — значит
+    # нечему разъехаться с версией композитора и нечего добавлять в buildInputs.
+    # Включит кто-нибудь client_system в rust/Cargo.toml — сюда придётся
+    # дописать pkgs.wayland.
     nativeBuildInputs = [ pkgs.pkg-config ];
     buildInputs = [ pkgs.libseccomp ];
     # Тесты гоняет CI (job rust). Здесь они выключены сознательно: selftest
@@ -150,7 +134,7 @@ let
     meta.mainProgram = "vpn-zone-seccomp";
   };
 
-  # --- ЧАСТЬ 0в: ПЕСОЧНИЦА ФАЙЛОВОЙ СИСТЕМЫ ---
+  # --- ЧАСТЬ 0б: ПЕСОЧНИЦА ФАЙЛОВОЙ СИСТЕМЫ ---
   # Третий слой поверх сети (зона) и данных (контейнер). Здесь программа теряет
   # доступ к $HOME целиком: вместо него tmpfs, наружу торчит только то, что ты
   # разрешил. Всё остальное она должна просить через ПОРТАЛЫ — а они в системе
@@ -972,7 +956,8 @@ let
         # __main__): разные профили не пересекаются по сокетам и мешать друг
         # другу не могут.
         # --- ОГРАНИЧЕНИЕ ДОСТУПА К КОМПОЗИТОРУ ---
-        # По умолчанию программа запускается через wl-sandbox: композитор
+        # По умолчанию программа запускается через wl-sandbox (подкоманда
+        # vpn-zone-core, бывшая программа на C): композитор
         # перестаёт выдавать ей протоколы слежки (захват экрана, чтение буфера в
         # фоне, эмуляция ввода, список чужих окон — проверено, 47 протоколов
         # против 33). Обычная работа не страдает: свои окна, ввод в них, буфер по
@@ -1020,7 +1005,10 @@ let
           if [ -f "$allowfile" ] && grep -qxF "$appbin" "$allowfile" 2>/dev/null; then
             allowed=1
           fi
-          [ $allowed -eq 0 ] && set -- ${wl-sandbox}/bin/wl-sandbox "$appbin" "$@"
+          # Команда отделяется «--»: у подкоманды ровно один свой аргумент
+          # (app-id), и явный разделитель не даёт спутать его с программой.
+          [ $allowed -eq 0 ] && \
+            set -- ${vpn-zone-rust}/bin/vpn-zone-core wl-sandbox "$appbin" -- "$@"
         fi
 
         # Песочница файловой системы — ТОЛЬКО по явному флагу. Включать её всем
@@ -2203,12 +2191,11 @@ in
     vpn-zone
     vpn-zone-sync
     vpn-zone-pick
-    wl-sandbox
     vpn-fs-sandbox
     # Rust-ядро: vpn-zone-seccomp (генератор фильтра) и vpn-zone-core
-    # (подкоманды profile-run и sync, их зовёт vpn-zone). В PATH — не только
-    # ради песочницы: тем же бинарём проверяется, что фильтр вообще работает
-    # на твоём ядре (`vpn-zone-seccomp selftest`).
+    # (подкоманды profile-run, sync и wl-sandbox, их зовёт vpn-zone). В PATH —
+    # не только ради песочницы: тем же бинарём проверяется, что фильтр вообще
+    # работает на твоём ядре (`vpn-zone-seccomp selftest`).
     vpn-zone-rust
     vpn-zone-add-gui
     vpn-zone-remove-gui

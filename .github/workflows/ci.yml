@@ -43,7 +43,7 @@ jobs:
           for s in vpn-zone vpn-zone-pick vpn-zone-sync vpn-fs-sandbox \
                    vpn-zone-add-gui vpn-zone-remove-gui vpn-zone-profile-rm-gui \
                    vpn-zone-profile-add-gui vpn-zone-settings-gui \
-                   vpn-zone-forget-gui wl-sandbox; do
+                   vpn-zone-forget-gui; do
             echo "=== nix-build -A scripts.$s"
             nix-build tests/harness.nix -A "scripts.$s" -o "results/$s"
           done
@@ -52,8 +52,9 @@ jobs:
           set -euo pipefail
           files=(tests/integration/smoke.sh)
           for f in results/*/bin/*; do
-            # Бинарники (wl-sandbox — это C) пропускаем: shellcheck только для
-            # текстов с шебангом.
+            # Бинарники пропускаем: shellcheck только для текстов с шебангом.
+            # Сейчас в списке одни shell-деривации, но проверка остаётся —
+            # добавится бинарь, и job не покраснеет на пустом месте.
             if ! head -c 2 "$f" | grep -q '#!'; then
               echo "пропуск (не скрипт): $f"
               continue
@@ -71,10 +72,14 @@ jobs:
           echo "shellcheck: ok (${#files[@]} файлов)"
 
   # Rust-ядро (ROADMAP M1/M2): формат, линт и тесты крейта rust/ — парсер
-  # конфигов WG/AWG, генератор seccomp-фильтра, слои профилей и генератор
-  # .desktop-ярлыков. В job scripts крейт тоже собирается (vpn-fs-sandbox и
-  # vpn-zone-sync на него ссылаются), но без clippy и без тестов: компилятор и
-  # линтер живут здесь.
+  # конфигов WG/AWG, генератор seccomp-фильтра, слои профилей, генератор
+  # .desktop-ярлыков и ограничитель доступа к композитору (wl-sandbox). В job
+  # scripts крейт тоже собирается (vpn-zone, vpn-fs-sandbox и vpn-zone-sync на
+  # него ссылаются), но без clippy и без тестов: компилятор и линтер живут здесь.
+  #
+  # Тесты wl-sandbox проверяют только fallback-пути (композитора на раннере
+  # нет): окружение в них чистится нарочно, иначе на машине разработчика
+  # результат отличался бы от CI.
   #
   # cargo test включает selftest фильтра: он грузит seccomp в собственный
   # процесс и проверяет, что keyctl отвечает EPERM. Прав для этого не нужно —

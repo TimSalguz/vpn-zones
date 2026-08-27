@@ -3,7 +3,7 @@
 //!
 //! The working implementation is still the bash/Nix module in `module/`; this
 //! crate is the Rust core it is being replaced with, one piece at a time, and
-//! the bash version stays in charge until parity is proven. Four pieces exist
+//! the bash version stays in charge until parity is proven. Five pieces exist
 //! so far:
 //!
 //! * [`config`] — WireGuard/AmneziaWG config parsing, the behaviour of the
@@ -14,13 +14,16 @@
 //! * [`profile`] — data containers: the overlayfs layers of a profile and the
 //!   life cycle of a throwaway one (`docs/GOTCHAS.md` §5);
 //! * [`desktop`] — the `.desktop` generator behind `vpn-zone sync`
-//!   (`docs/GOTCHAS.md` §10).
+//!   (`docs/GOTCHAS.md` §10);
+//! * [`wl_sandbox`] — the restricted Wayland socket a program is put on
+//!   (`wp_security_context_v1`, `docs/GOTCHAS.md` §7).
 //!
-//! The last two were Python scripts in `module/` until they moved here; the
-//! project has no Python left. Both are driven by the `vpn-zone-core` binary,
-//! which the bash `vpn-zone` calls.
+//! `profile` and `desktop` were Python scripts in `module/` and `wl_sandbox`
+//! was a C program there; the project has no Python and no C left. All three
+//! are driven by the `vpn-zone-core` binary, which the bash `vpn-zone` calls.
 
 pub mod config;
 pub mod desktop;
 pub mod profile;
 pub mod seccomp;
+pub mod wl_sandbox;

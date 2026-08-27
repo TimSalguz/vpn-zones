@@ -1,16 +1,17 @@
 //! `vpn-zone-core` — the helper commands the bash `vpn-zone` script delegates
-//! to. Both of them used to be Python scripts in `module/`; there is no Python
-//! in this project any more.
+//! to. Two of them used to be Python scripts in `module/` and one a C program
+//! there; there is no Python and no C in this project any more.
 //!
-//! Argument parsing is done by hand, as in `vpn-zone-seccomp`: two verbs with
-//! fixed positional arguments do not need a CLI framework, and `profile-run`
-//! sits on the startup path of every program launched into a container.
+//! Argument parsing is done by hand, as in `vpn-zone-seccomp`: a handful of
+//! verbs with fixed positional arguments do not need a CLI framework, and both
+//! `profile-run` and `wl-sandbox` sit on the startup path of every program
+//! launched into a zone.
 
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
 
-use vpn_zone::{desktop, profile};
+use vpn_zone::{desktop, profile, wl_sandbox};
 
 const USAGE: &str = "\
 vpn-zone-core — helper commands of vpn-zones
@@ -28,15 +29,22 @@ Usage:
         Regenerate the .desktop entries for the zones. <runner> and <picker>
         are the paths that end up in the generated Exec lines.
 
+  vpn-zone-core wl-sandbox <app-id> -- cmd...
+        Run the command on a Wayland socket of its own, registered with the
+        compositor as a sandbox (wp_security_context_v1): no screen capture,
+        no background clipboard reads, no input emulation, no list of other
+        windows. Without the protocol — an older compositor, an X11 session —
+        the command is run as it is, with a warning on stderr.
+
   vpn-zone-core --help
 
 Exit codes:
   0    success
   1    the pass failed
   2    bad usage
-  127  the program could not be started (profile-run)
-  *    otherwise profile-run reports the exit code of the program itself
-       (128 + N if it was killed by signal N)
+  127  the program could not be started (profile-run, wl-sandbox)
+  *    otherwise profile-run and wl-sandbox report the exit code of the
+       program itself (128 + N if it was killed by signal N)
 ";
 
 /// Bad command line.
@@ -59,6 +67,14 @@ fn main() -> ExitCode {
             Ok(parsed) => ExitCode::from(profile::run(parsed)),
             Err(e) => {
                 eprintln!("vpn-zone-core profile-run: {e}");
+                eprint!("{USAGE}");
+                ExitCode::from(EXIT_USAGE)
+            }
+        },
+        Some("wl-sandbox") => match wl_sandbox::Args::parse(&args[1..]) {
+            Ok(parsed) => ExitCode::from(wl_sandbox::run(parsed)),
+            Err(e) => {
+                eprintln!("vpn-zone-core wl-sandbox: {e}");
                 eprint!("{USAGE}");
                 ExitCode::from(EXIT_USAGE)
             }

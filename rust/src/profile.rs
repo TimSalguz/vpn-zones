@@ -281,7 +281,10 @@ where
 }
 
 /// `execvp`, which only ever returns when the program could not be started.
-fn exec_command(cmd: &[OsString]) -> io::Error {
+///
+/// Public because [`crate::wl_sandbox`] starts programs the same way; the
+/// NUL-byte handling and the `OsString` argv are not worth having twice.
+pub fn exec_command(cmd: &[OsString]) -> io::Error {
     let mut owned = Vec::with_capacity(cmd.len());
     for arg in cmd {
         match CString::new(arg.as_bytes()) {
@@ -305,7 +308,10 @@ fn exec_command(cmd: &[OsString]) -> io::Error {
 /// (`vpn-zone run` is started from shells and `.desktop` files, so that is the
 /// number a caller will recognise). Anything else — a stopped child that
 /// somehow got reported — is a plain failure.
-fn exit_code_of(status: libc::c_int) -> u8 {
+///
+/// Public because [`crate::wl_sandbox`] waits for a child too, and both layers
+/// of one launch should report the same number.
+pub fn exit_code_of(status: libc::c_int) -> u8 {
     if libc::WIFEXITED(status) {
         // WEXITSTATUS is already 0..=255.
         libc::WEXITSTATUS(status) as u8
