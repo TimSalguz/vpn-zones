@@ -1,143 +1,152 @@
 # vpn-zones
 
-Запуск программ с выбором сети, контейнера данных и песочницы — прямо из ярлыка
-приложения. Всё работает из-под пользователя: root не нужен ни для создания
-зоны, ни для запуска, системную конфигурацию править не требуется.
+Читать по-русски: [README.ru.md](README.ru.md) · Development plan: [ROADMAP.md](ROADMAP.md)
 
-Кликаешь по ярлыку — спрашивает, в какой сети запустить (через какой VPN, без
-VPN или вообще без сети) и в каком окружении (общее с системой, отдельный
-контейнер данных или песочница). Выбор запоминается, можно закрепить.
+Launch programs with a choice of network, data container and sandbox — straight
+from the app's launcher entry. Everything runs as your user: root is not needed
+either to create a zone or to launch, and no system configuration changes are
+required.
 
-## Что оно делает
+You click a launcher entry — it asks which network to run in (through which VPN,
+without VPN, or with no network at all) and in which environment (shared with
+the system, a separate data container, or a sandbox). The choice is remembered
+and can be pinned.
 
-Три независимых слоя, каждый включается сам по себе.
+## What it does
 
-**Сеть.** Зона — это сетевой namespace, поднятый из-под пользователя: внутри
-ядерный WireGuard/AmneziaWG, наружу — `pasta` из passt. Зон может быть сколько
-угодно, каждая со своим конфигом. Есть встроенные варианты «прямой интернет» и
-«без сети» — последний означает буквально отсутствие маршрута, а не правило
-файрвола.
+Three independent layers, each enabled on its own.
 
-**Данные.** Четыре режима:
+**Network.** A zone is a network namespace brought up as your user: kernel
+WireGuard/AmneziaWG inside, `pasta` from passt facing outward. There can be any
+number of zones, each with its own config. There are built-in "direct internet"
+and "no network" options — the latter means the literal absence of a route, not
+a firewall rule.
 
-| режим | дом программы | кто видит |
+**Data.** Five modes:
+
+| mode | program's home | what it sees |
 |---|---|---|
-| основной | твой настоящий `$HOME` | всё как обычно |
-| контейнер | overlayfs поверх XDG-каталогов | видит твои настройки, пишет в слой |
-| своя песочница | постоянный, только этой программы | ничего твоего |
-| именованная песочница | постоянный, общий | программы, запущенные в ней |
-| разовая песочница | tmpfs, стирается при выходе | ничего твоего |
+| main | your real `$HOME` | everything as usual |
+| container | overlayfs on top of the XDG directories | sees your settings, writes to a layer |
+| per-app sandbox | persistent, this program only | nothing of yours |
+| named sandbox | persistent, shared | programs launched in it |
+| throwaway sandbox | tmpfs, wiped on exit | nothing of yours |
 
-Контейнер нужен в первую очередь чтобы развести singleton: без него браузер,
-запущенный вторым, просто отдаёт окно уже работающему процессу — и трафик идёт
-через старую сеть, а выглядит нормально.
+The container exists first and foremost to break up singletons: without it, a
+browser launched a second time simply hands its window to the already running
+process — and the traffic goes through the old network while looking perfectly
+normal.
 
-**Изоляция.** Композитор умеет различать клиентов через
-`wp_security_context_v1`: программам, запущенным через помеченный сокет, не
-выдаются захват экрана, чтение буфера обмена в фоне, эмуляция клавиатуры и мыши,
-список чужих окон. Замер до и после — 47 протоколов против 33.
+**Isolation.** The compositor can tell clients apart via
+`wp_security_context_v1`: programs launched through the tagged socket are not
+given screen capture, background clipboard reading, keyboard and mouse
+emulation, or the list of other windows. Measured before and after — 47
+protocols versus 33.
 
-Отдельно есть песочница файловой системы на `bwrap`: вместо `$HOME` пустой
-каталог, шина через `xdg-dbus-proxy` (без Secret Service), а внутрь
-подкладывается `/.flatpak-info` — по нему GTK/Qt/Chromium понимают, что они в
-песочнице, и сами начинают ходить за файлами и камерой через порталы. Если
-программе нужен X11, ей поднимается собственный `xwayland-satellite`, чтобы она
-не видела чужие окна.
+Separately there is a filesystem sandbox on `bwrap`: an empty directory instead
+of `$HOME`, the bus through `xdg-dbus-proxy` (no Secret Service), and a
+`/.flatpak-info` planted inside — GTK/Qt/Chromium use it to figure out they are
+in a sandbox and start going through the portals for files and the camera on
+their own. If a program needs X11, it gets its own `xwayland-satellite` so it
+cannot see other windows.
 
-## Требования
+## Requirements
 
-- композитор с поддержкой `wp_security_context_v1` — проверено на **niri** и
-  **KWin**; в Mutter (GNOME) протокола нет, слой изоляции композитора работать
-  не будет;
-- непривилегированные user namespace (`kernel.unprivileged_userns_clone`);
-- диапазон в `/etc/subuid` и `/etc/subgid` для твоего пользователя — NixOS
-  выдаёт их обычным пользователям по умолчанию;
-- `/dev/net/tun` с доступом на чтение и запись;
-- для VPN-зон — ядерный модуль `wireguard` или `amneziawg`;
-- работающие XDG-порталы (для песочницы ФС).
+- a compositor supporting `wp_security_context_v1` — tested on **niri** and
+  **KWin**; Mutter (GNOME) does not have the protocol, so the compositor
+  isolation layer will not work;
+- unprivileged user namespaces (`kernel.unprivileged_userns_clone`);
+- a range in `/etc/subuid` and `/etc/subgid` for your user — NixOS hands them
+  out to regular users by default;
+- `/dev/net/tun` with read and write access;
+- for VPN zones — the `wireguard` or `amneziawg` kernel module;
+- working XDG portals (for the filesystem sandbox).
 
-Проверить готовность:
+Check readiness:
 
 ```sh
 sysctl kernel.unprivileged_userns_clone   # 1
-grep "^$USER:" /etc/subuid                 # диапазон есть
+grep "^$USER:" /etc/subuid                 # range exists
 ls -l /dev/net/tun                         # crw-rw-rw-
 ```
 
-## Установка
+## Installation
 
 ```nix
 {
   inputs.vpn-zones.url = "github:TimSalguz/vpn-zones";
 
-  # в home-manager
+  # in home-manager
   imports = [ inputs.vpn-zones.homeModules.default ];
   programs.vpn-zones.enable = true;
 }
 ```
 
-После пересборки в лаунчере появятся пункты «Добавить VPN-зону», «Удалить
-VPN-зону», «Создать контейнер», «Удалить профиль», «Настройки VPN-зон» и
-«Сбросить сети программ».
+After a rebuild, the launcher gets the entries "Add VPN zone", "Remove VPN
+zone", "Create container", "Remove profile", "VPN zone settings" and "Reset app
+networks".
 
-## Как пользоваться
+## How to use it
 
-Создать зону: ярлык **«Добавить VPN-зону»** → выбрать `.conf` → задать имя.
-Система сама скажет, прошло ли рукопожатие, — то есть жив ли конфиг.
+Create a zone: the **"Add VPN zone"** entry → pick a `.conf` → give it a name.
+The system tells you whether the handshake went through — that is, whether the
+config is alive.
 
-Дальше просто запускай программы из лаунчера. Из терминала то же самое:
+Then just launch programs from the launcher. The same from the terminal:
 
 ```sh
-vpn-zone list                                  # зоны и их состояние
-vpn-zone up <зона> / down <зона>
-vpn-zone check <зона>                          # жив ли туннель
-vpn-zone run <зона> -- firefox                 # запустить в зоне
-vpn-zone run <зона> --profile work -- firefox  # + контейнер данных
-vpn-zone run <зона> --sandbox work -- firefox  # + именованная песочница
-vpn-zone run <зона> --fs-sandbox -- firefox    # + разовая песочница
-vpn-zone run <зона> --tmp-profile -- firefox   # одноразовый контейнер
+vpn-zone list                                  # zones and their state
+vpn-zone up <zone> / down <zone>
+vpn-zone check <zone>                          # is the tunnel alive
+vpn-zone run <zone> -- firefox                 # run in a zone
+vpn-zone run <zone> --profile work -- firefox  # + data container
+vpn-zone run <zone> --sandbox work -- firefox  # + named sandbox
+vpn-zone run <zone> --fs-sandbox -- firefox    # + throwaway sandbox
+vpn-zone run <zone> --tmp-profile -- firefox   # one-off container
 
-vpn-zone profile create|list|rm <имя>
-vpn-zone sandbox create|list|rm <имя>
-vpn-zone perms list|reset <программа|--all>    # выданные доступы к файлам
-vpn-zone lock|unlock <зона>                    # запретить выход в другие сети
-vpn-zone default-profile ask|main|own|<имя>
-vpn-zone mode picker|per-zone|both|off         # как ведут себя ярлыки
+vpn-zone profile create|list|rm <name>
+vpn-zone sandbox create|list|rm <name>
+vpn-zone perms list|reset <app|--all>          # granted file accesses
+vpn-zone lock|unlock <zone>                    # forbid leaving for other networks
+vpn-zone default-profile ask|main|own|<name>
+vpn-zone mode picker|per-zone|both|off         # how launcher entries behave
 ```
 
-## Чего это не заменяет
+## What this does not replace
 
-Flatpak. У него seccomp-фильтры, которые режут опасные системные вызовы на
-уровне ядра, свой рантайм и готовые правила на тысячи приложений. Здесь пакеты
-берутся из nixpkgs (никакого дублирования и рантайма), но правила под каждую
-программу выясняются самостоятельно — впрочем, их можно подсмотреть в манифесте
-той же программы на Flathub, в секции `finish-args`.
+Flatpak. It has seccomp filters that cut off dangerous system calls at the
+kernel level, its own runtime, and ready-made rules for thousands of
+applications. Here packages come from nixpkgs (no duplication and no runtime),
+but the rules for each program have to be worked out on your own — though you
+can peek at the same program's manifest on Flathub, in the `finish-args`
+section.
 
-Чего здесь нет и что стоит знать:
+What is missing here and what you should know:
 
-- нет seccomp-фильтра (`bwrap --seccomp` не используется);
-- песочница файловой системы включается явно и требует доводки под конкретную
-  программу;
-- зона изолирует сеть, но не файлы: без песочницы программа видит весь `$HOME`;
-- проверено на одной машине и одном наборе программ.
+- no seccomp filter (`bwrap --seccomp` is not used);
+- the filesystem sandbox is enabled explicitly and needs tuning for each
+  specific program;
+- a zone isolates the network, not the files: without a sandbox the program
+  sees your entire `$HOME`;
+- tested on one machine and one set of programs.
 
-## Как это устроено внутри
+## How it works inside
 
-Тонкости, на которые ушло больше всего времени, подробно закомментированы в
-`module/default.nix`. Самые неочевидные:
+The subtleties that took the most time are commented in detail in
+`module/default.nix`. The least obvious ones:
 
-- держателю зоны нужен **двойной маппинг uid**: `0:<subuid>:1` (иначе
-  capabilities теряются при `execve` и интерфейс не создать) плюс
-  `<uid>:<uid>:1` (иначе программа не видит свой `$HOME`);
-- `upperdir` overlayfs не может лежать на overlayfs — отсюда раздельные каталоги
-  хранения;
-- `mount(8)` не работает не от root даже при наличии `CAP_SYS_ADMIN`, поэтому
-  монтирование идёт прямым вызовом `libc.mount`;
-- в NixOS работает `nsncd`, и без его сокрытия имена резолвятся мимо туннеля —
-  классическая утечка DNS;
-- конфиги Amnezia приходят в CRLF, а свежие ещё и с пустыми параметрами
-  `I1`–`I5`, на которых `awg setconf` отвергает файл целиком.
+- the zone holder needs a **double uid mapping**: `0:<subuid>:1` (otherwise
+  capabilities are lost on `execve` and the interface cannot be created) plus
+  `<uid>:<uid>:1` (otherwise the program does not see its `$HOME`);
+- an overlayfs `upperdir` cannot live on an overlayfs — hence the separate
+  storage directories;
+- `mount(8)` does not work as non-root even with `CAP_SYS_ADMIN`, so mounting
+  is done by calling `libc.mount` directly;
+- NixOS runs `nsncd`, and without hiding it names resolve past the tunnel — a
+  classic DNS leak;
+- Amnezia configs come in CRLF, and recent ones also with empty `I1`–`I5`
+  parameters, on which `awg setconf` rejects the whole file.
 
-## Лицензия
+## License
 
 MIT.
