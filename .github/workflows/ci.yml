@@ -1,0 +1,107 @@
+# CI vpn-zones: eval модуля, адресная сборка скриптов + shellcheck, смоук в
+# непривилегированном userns. Подробности — tests/README.md.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Полный eval home-manager-конфигурации с модулем: падает на любой ошибке
+  # вычисления module/default.nix. Ничего не собирает (только instantiate).
+  eval:
+    name: eval (nix-instantiate)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Инстанцировать tests/harness.nix
+        run: |
+          nix-instantiate tests/harness.nix \
+            -A activationPackage -A scripts -A zoneHolder -A deps
+          # строка ExecStart юнита vpn-zone@ должна вычисляться
+          nix-instantiate --eval tests/harness.nix -A zoneHolderExec
+
+  # Адресная сборка каждой script-деривации + shellcheck по собранным bin/*.
+  scripts:
+    name: scripts (build + shellcheck + py_compile)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: python3 -m py_compile module/*.py
+        run: python3 -m py_compile module/*.py
+      - name: Собрать script-деривации адресно
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          for s in vpn-zone vpn-zone-pick vpn-zone-sync vpn-fs-sandbox \
+                   vpn-zone-add-gui vpn-zone-remove-gui vpn-zone-profile-rm-gui \
+                   vpn-zone-profile-add-gui vpn-zone-settings-gui \
+                   vpn-zone-forget-gui wl-sandbox; do
+            echo "=== nix-build -A scripts.$s"
+            nix-build tests/harness.nix -A "scripts.$s" -o "results/$s"
+          done
+      - name: shellcheck по собранным скриптам
+        run: |
+          set -euo pipefail
+          files=(tests/integration/smoke.sh)
+          for f in results/*/bin/*; do
+            # Бинарники (wl-sandbox — это C) пропускаем: shellcheck только для
+            # текстов с шебангом.
+            if ! head -c 2 "$f" | grep -q '#!'; then
+              echo "пропуск (не скрипт): $f"
+              continue
+            fi
+            files+=("$f")
+          done
+          # Исключения — только то, что для этого стиля генерённых nix-скриптов
+          # заведомо ложноположительно; SC2086 и прочие проверки подстановок
+          # оставлены включёнными нарочно:
+          #  SC1091 — source/шебанги указывают в /nix/store, follow бессмыслен;
+          #  SC2016 — $ внутри одинарных кавычек: это нарочно, строки для
+          #           вложенного `bash -c` (см. zoneHolder, vpn-fs-sandbox);
+          #  SC2064 — trap с раскрытием переменных сразу: тоже нарочно, в trap
+          #           фиксируются pid'ы уже запущенных фоновых процессов;
+          #  SC2012 — `ls -A` для проверки «каталог не пуст», парсинга имён нет.
+          shellcheck --exclude=SC1091,SC2016,SC2064,SC2012 "${files[@]}"
+          echo "shellcheck: ok (${#files[@]} файлов)"
+
+  # Смоук: поднять настоящую зону в непривилегированном userns и проверить её
+  # изнутри. Требует fallback на ядерный wireguard (amneziawg-модуля на
+  # раннере нет) — см. tests/integration/smoke.sh.
+  integration:
+    name: integration (smoke, userns)
+    runs-on: ubuntu-24.04
+    needs: eval
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Подготовка раннера (userns, wireguard, subuid/subgid)
+        run: |
+          set -euo pipefail
+          # Ubuntu ≥23.10 душит непривилегированные userns через AppArmor
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          sudo modprobe wireguard
+          test -c /dev/net/tun
+          # setuid-помощники для двойного маппинга unshare --map-users
+          if ! command -v newuidmap >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq uidmap
+          fi
+          u=$(id -un)
+          grep -q "^$u:" /etc/subuid || sudo usermod --add-subuids 100000-165535 "$u"
+          grep -q "^$u:" /etc/subgid || sudo usermod --add-subgids 100000-165535 "$u"
+          echo "--- итог ---"
+          grep "^$u:" /etc/subuid /etc/subgid
+      - name: Смоук-тест
+        run: tests/integration/smoke.sh
