@@ -90,16 +90,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
+      # Оболочка — из harness (пин nixpkgs), не из `-p`: у раннера нет канала
+      # <nixpkgs>, и пин избавляет от внезапной красноты при обновлении clippy.
       - name: cargo fmt --check
-        run: nix-shell -p cargo rustfmt --run 'cargo fmt --check'
+        run: nix-shell ../tests/harness.nix -A rustShell --run 'cargo fmt --check'
       - name: cargo clippy (предупреждения = ошибки)
         run: |
-          nix-shell -p cargo rustc clippy pkg-config libseccomp \
+          nix-shell ../tests/harness.nix -A rustShell \
             --run 'cargo clippy --all-targets -- -D warnings'
       - name: cargo test
-        run: |
-          nix-shell -p cargo rustc pkg-config libseccomp \
-            --run 'cargo test'
+        run: nix-shell ../tests/harness.nix -A rustShell --run 'cargo test'
 
   # Смоук: поднять настоящую зону в непривилегированном userns и проверить её
   # изнутри. Требует fallback на ядерный wireguard (amneziawg-модуля на

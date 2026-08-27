@@ -130,4 +130,20 @@ in
     ];
     pathsToLink = [ "/bin" ];
   };
+
+  # Окружение для rust-джоба CI: `nix-shell tests/harness.nix -A rustShell`.
+  # Именно отсюда, а не `nix-shell -p`: у раннера нет канала <nixpkgs>
+  # (install-nix-action его не ставит), а главное — компилятор и clippy
+  # пинуются тем же nixpkgs, что и всё остальное, и CI не краснеет сам по
+  # себе от обновления линтера в unstable.
+  rustShell = pkgs.mkShell {
+    packages = with pkgs; [
+      cargo
+      rustc
+      clippy
+      rustfmt
+      pkg-config
+      libseccomp
+    ];
+  };
 }
