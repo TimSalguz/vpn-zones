@@ -40,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p results
-          for s in vpn-zone vpn-zone-pick vpn-zone-sync vpn-fs-sandbox \
+          for s in vpn-zone vpn-zone-pick vpn-zone-sync \
                    vpn-zone-add-gui vpn-zone-remove-gui vpn-zone-profile-rm-gui \
                    vpn-zone-profile-add-gui vpn-zone-settings-gui \
                    vpn-zone-forget-gui; do
@@ -73,9 +73,15 @@ jobs:
 
   # Rust-ядро (ROADMAP M1/M2): формат, линт и тесты крейта rust/ — парсер
   # конфигов WG/AWG, генератор seccomp-фильтра, слои профилей, генератор
-  # .desktop-ярлыков и ограничитель доступа к композитору (wl-sandbox). В job
-  # scripts крейт тоже собирается (vpn-zone, vpn-fs-sandbox и vpn-zone-sync на
-  # него ссылаются), но без clippy и без тестов: компилятор и линтер живут здесь.
+  # .desktop-ярлыков, ограничитель доступа к композитору (wl-sandbox) и
+  # песочница файловой системы (fs-sandbox). В job scripts крейт тоже
+  # собирается (vpn-zone и vpn-zone-sync на него ссылаются), но без clippy и
+  # без тестов: компилятор и линтер живут здесь.
+  #
+  # Интеграционные тесты крейта, которым нужен настоящий bwrap, помечены
+  # #[ignore]: userns на раннере готовит только job integration (снятие
+  # AppArmor-запрета), а `cargo test` идёт здесь, без этой подготовки. Их
+  # проверяет смоук — там окружение уже подходящее.
   #
   # Тесты wl-sandbox проверяют только fallback-пути (композитора на раннере
   # нет): окружение в них чистится нарочно, иначе на машине разработчика

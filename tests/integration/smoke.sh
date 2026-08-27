@@ -19,8 +19,9 @@
 # интерфейсов нет, утечка невозможна не по правилу, а по отсутствию пути.
 #
 # Тест использует зоны с именами smoke, smoke-crlf, offsmoke в
-# ~/.local/state/vpn-zones и профиль smoketest-prof в ~/.local/state/vpn-profiles
-# — и удаляет их же в начале.
+# ~/.local/state/vpn-zones, профиль smoketest-prof в ~/.local/state/vpn-profiles
+# и набор доступов smoke-fsapp в ~/.config/vpn-zones/fs-perms — и удаляет их же
+# в начале.
 set -euo pipefail
 
 step() { printf '\n==> %s\n' "$*"; }
@@ -34,6 +35,11 @@ PROFILES="$HOME/.local/state/vpn-profiles"
 TEST_ZONES=(smoke smoke-crlf offsmoke)
 TEST_PROFILE=smoketest-prof
 MARKER="$HOME/.config/vpn-smoke-marker"
+# Песочница файловой системы: свой app-id (набор доступов запоминается по нему)
+# и маркер в настоящем доме, которого изнутри песочницы видно быть не должно.
+FSAPP=smoke-fsapp
+FSPERMS="$HOME/.config/vpn-zones/fs-perms/$FSAPP"
+FSMARKER="$HOME/vpn-smoke-fs-marker"
 HOLDER_PIDS=()
 
 cleanup() {
@@ -61,7 +67,7 @@ cleanup() {
   # ~/.config появляется только при провале теста (слой не наложился), но
   # убрать его всё равно надо — чужого файла с таким именем не бывает.
   rm -rf "${PROFILES:?}/$TEST_PROFILE" "${STATE:?}/.running/$TEST_PROFILE"
-  rm -f "$MARKER"
+  rm -f "$MARKER" "$FSPERMS" "$FSMARKER"
   if [ "$rc" -ne 0 ]; then
     for z in smoke offsmoke; do
       if [ -s "$WORK/holder-$z.log" ]; then
@@ -112,7 +118,7 @@ for z in "${TEST_ZONES[@]}"; do
   rm -rf "${STATE:?}/$z"
 done
 rm -rf "${PROFILES:?}/$TEST_PROFILE" "${STATE:?}/.running/$TEST_PROFILE"
-rm -f "$MARKER"
+rm -f "$MARKER" "$FSPERMS" "$FSMARKER"
 
 # --- 2. Синтетический конфиг -------------------------------------------------
 step "Генерирую синтетический конфиг WireGuard (без DNS=, без обфускации)"
@@ -276,6 +282,93 @@ echo "ok: запись ушла в слой профиля, настоящий ~
 step "vpn-zone profile rm $TEST_PROFILE"
 "$VPN_ZONE" profile rm "$TEST_PROFILE"
 [ ! -d "$PROFILES/$TEST_PROFILE" ] || fail "профиль не удалился"
+
+# --- 6б. Песочница файловой системы ------------------------------------------
+# Проверяется `vpn-zone-core fs-sandbox` (крейт rust/, модуль fs_sandbox) —
+# бывший shell-скрипт vpn-fs-sandbox. Зона тут ни при чём: песочница ФС —
+# отдельный слой, и запускается она в обычной сети раннера.
+#
+# Пути инструментов НЕ собираются отдельно, а грепаются из собранного текста
+# vpn-zone: они зашиты туда флагами (--bwrap/--dbus-proxy/--kdialog/--xwayland),
+# и так тест проверяет ровно то, что поедет пользователю, а не свою сборку.
+step "Песочница ФС: достаю пути инструментов из собранного vpn-zone"
+# «grep -m1 -o», а не «grep -o | head -1»: под set -o pipefail head, закрывший
+# трубу первым, обрекает пайплайн на 141, и весь смоук падал бы по случайности
+# размера вывода. -m1 останавливает сам grep, а искомых подстрок в первой же
+# подходящей строке ровно по одной.
+FSCORE=$(grep -m1 -o '/nix/store/[^ "]*/bin/vpn-zone-core' "$VPN_ZONE")
+FSBWRAP=$(grep -m1 -o -- '--bwrap [^ ]*' "$VPN_ZONE"); FSBWRAP=${FSBWRAP#--bwrap }
+FSPROXY=$(grep -m1 -o -- '--dbus-proxy [^ ]*' "$VPN_ZONE"); FSPROXY=${FSPROXY#--dbus-proxy }
+# Оболочка и coreutils для команды ВНУТРИ песочницы: /usr и /bin туда не
+# пробрасываются, поэтому «sh» и «ls» обязаны быть store-путями. Берём их из
+# того же текста: шебанг скрипта — это bash, а PATH в его первых строках
+# начинается с каталога coreutils.
+FSSH=$(head -1 "$VPN_ZONE" | sed 's|^#!||')
+FSCOREUTILS=$(grep -m1 -o '/nix/store/[^:" ]*-coreutils[^:" ]*/bin' "$VPN_ZONE")
+for v in FSCORE FSBWRAP FSPROXY FSSH FSCOREUTILS; do
+  [ -n "${!v}" ] || fail "не нашёл $v в тексте собранного vpn-zone"
+done
+[ -x "$FSCORE" ] || fail "vpn-zone-core не исполняемый: $FSCORE"
+[ -x "$FSBWRAP" ] || fail "bwrap не исполняемый: $FSBWRAP"
+[ -x "$FSCOREUTILS/ls" ] || fail "нет $FSCOREUTILS/ls"
+echo "ok: core=$FSCORE"
+echo "ok: bwrap=$FSBWRAP"
+
+# Подставной kdialog: без графики диалог доступов не должен вызываться ВООБЩЕ.
+# Если вызовется — оставит свидетеля и выдаст «home», то есть тест покраснеет
+# сразу двумя проверками. Настоящий kdialog сюда подставлять нельзя: он ждал бы
+# ответа, которого на раннере некому дать.
+cat > "$WORK/fake-kdialog" <<EOF
+#!$FSSH
+: > "$WORK/kdialog-was-called"
+echo home
+EOF
+chmod +x "$WORK/fake-kdialog"
+
+step "Песочница ФС: дом пуст, маркер хоста не виден, /nix/store виден"
+: > "$FSMARKER"
+# Команда внутри самодостаточна: $WORK лежит в /tmp, а /tmp внутри песочницы —
+# свежий tmpfs, никакой файл-скрипт оттуда виден не будет. Путь к ls приходит
+# позиционным аргументом ($0 занят именем оболочки), а завершающий «exit 0»
+# обязателен: последняя проверка отсутствия маркера возвращает 1, и без него
+# песочница отдала бы наружу код 1.
+fsout=$(env -u WAYLAND_DISPLAY -u DISPLAY "$FSCORE" fs-sandbox \
+  --bwrap "$FSBWRAP" --dbus-proxy "$FSPROXY" \
+  --kdialog "$WORK/fake-kdialog" --xwayland /nonexistent/xwayland-satellite \
+  "$FSAPP" -- "$FSSH" -c '
+    "$1" -A "$HOME" | while read -r f; do echo "SEEN:$f"; done
+    [ -d /nix/store ] && echo STORE-OK
+    [ -e "$HOME/vpn-smoke-fs-marker" ] && echo LEAK
+    exit 0
+  ' sh "$FSCOREUTILS/ls") || fail "песочница не запустилась (см. вывод выше)"
+echo "${fsout:-<пусто>}"
+echo "$fsout" | grep -q '^STORE-OK$' || fail "внутри песочницы не виден /nix/store"
+if echo "$fsout" | grep -q '^LEAK$'; then
+  fail "маркер настоящего дома виден изнутри песочницы"
+fi
+if echo "$fsout" | grep -q '^SEEN:'; then
+  fail "дом внутри песочницы не пуст"
+fi
+[ -e "$FSMARKER" ] || fail "маркер пропал из настоящего дома"
+echo "ok: дом внутри пуст, наружу не видно ничего"
+
+step "Песочница ФС: доступы записаны пустыми, диалог не показывался"
+[ -f "$FSPERMS" ] || fail "файл доступов $FSPERMS не создан"
+[ ! -s "$FSPERMS" ] || fail "без графики доступов быть не должно, а там: $(cat "$FSPERMS")"
+[ ! -e "$WORK/kdialog-was-called" ] || fail "без графики был вызван kdialog — программа зависла бы"
+echo "ok: доступы пусты, kdialog не звался"
+
+# Мягкая деградация шины: раньше сокет недоступного прокси биндился безусловно,
+# bwrap падал на «Can't find source path», и программа не открывалась вовсе.
+step "Песочница ФС: недоступный dbus-прокси не мешает запуску, код выхода — программы"
+fsrc=0
+env -u WAYLAND_DISPLAY -u DISPLAY "$FSCORE" fs-sandbox \
+  --bwrap "$FSBWRAP" --dbus-proxy /nonexistent/xdg-dbus-proxy \
+  --kdialog "$WORK/fake-kdialog" --xwayland /nonexistent/xwayland-satellite \
+  "$FSAPP" -- "$FSSH" -c 'exit 42' || fsrc=$?
+[ "$fsrc" -eq 42 ] || fail "ожидался код выхода программы (42), получен $fsrc"
+[ ! -e "$WORK/kdialog-was-called" ] || fail "kdialog вызвался при готовом файле доступов"
+echo "ok: без шины запуск живёт, код выхода 42 донесён"
 
 # --- 7. Offline-зона ---------------------------------------------------------
 step "Создаю offline-зону offsmoke (как это делает пикер: mkdir + touch offline)"

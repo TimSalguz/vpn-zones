@@ -28,6 +28,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   the program's name.
 
 ### Changed
+- The filesystem sandbox is Rust now. The two-hundred-line `vpn-fs-sandbox`
+  shell script of `module/default.nix` is gone; `vpn-zone run --fs-sandbox` (and
+  `--sandbox <name>`) calls `vpn-zone-core fs-sandbox` instead, with the tool
+  paths substituted by Nix (`--bwrap/--dbus-proxy/--kdialog/--xwayland`) exactly
+  as the zone holder takes `--ip/--pasta`. Behaviour is deliberately unchanged:
+  the same permission files in `~/.config/vpn-zones/fs-perms/<app-id>` (old
+  space-separated ones included) and the same shared `perms` of a named sandbox,
+  the same `kdialog` checklist with the same wording, the same bwrap operations
+  in the same order, the same `/.flatpak-info`, the same filtered session bus,
+  the same GPU nodes, the same `mimeapps.list` read-only bind, the same
+  `xwayland-satellite` on a random `:100`–`:499`, and the same exit code
+  (128 + N for a signalled program). What changed underneath: the bwrap argument
+  list is now a pure function with unit tests asserting the ORDER of the
+  operations (a tmpfs listed after the bind it should hide would silently undo
+  it, and nothing about a launched program shows that); the permission files are
+  parsed and written by tested code; and the sandbox's own X server is started
+  by an internal `vpn-zone-core fs-sandbox-x11` subcommand instead of an inline
+  `bash -c`, so there is no shell inside the sandbox any more. One cosmetic
+  difference: an empty permission set is written as an empty file rather than a
+  lone newline, which is what `vpn-zone perms list` renders as "nothing".
 - A zone is now **two** network namespaces instead of one, the gateway layout of
   `docs/LEAK-MODEL.md`. Connectivity lives in the uplink namespace — pasta
   attaches there, and the tunnel's UDP socket stays there — while programs run in
@@ -92,6 +112,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   depends on `python3` at all.
 
 ### Security
+- The seccomp filter of the filesystem sandbox is built **in process** instead
+  of by a subprocess. The sandbox used to run `vpn-zone-seccomp export`, redirect
+  its stdout into a file and open that file as descriptor 34 from the shell;
+  now `crate::seccomp` is called as a library and the compiled program is handed
+  to bwrap on an inherited descriptor (`dup2` in `pre_exec`, which clears
+  `FD_CLOEXEC` as a side effect). One fork and one temporary file are gone from
+  the startup path of every sandboxed program, and so is the window in which a
+  half-written file could have been handed to `--seccomp`. The filter itself is
+  unchanged, and a filter that cannot be built is still a warning on stderr and
+  a sandbox without it.
+- The bus proxy is now killed when the sandbox is **signalled**, not only when
+  the program exits normally. In the shell version the `trap` lived in a
+  subshell that a TERM could take out on its own, leaving `xdg-dbus-proxy`
+  running with nobody to collect it. bwrap's `--die-with-parent` never covered
+  it: the proxy is our process, not bwrap's.
 - A leak out of a zone is now impossible by construction rather than forbidden
   by a rule. The namespace programs run in has exactly two interfaces, loopback
   and the tunnel, so:
@@ -130,7 +165,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   via the tunnel, with a note in the zone log.
 
 ### Added
-- Seccomp filter in the filesystem sandbox. `vpn-fs-sandbox` now compiles a BPF
+- Seccomp filter in the filesystem sandbox. It now compiles a BPF
   program with libseccomp and hands it to `bwrap --seccomp`: terminal injection
   (`ioctl` `TIOCSTI`/`TIOCLINUX`), `ptrace`, the keyring calls, `syslog`,
   `perf_event_open`, `acct`, `quotactl`, `uselib`, the NUMA calls and any
@@ -159,6 +194,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   first one; a v6-only `Address` used to kill the zone on `ip -4 addr add`.
 
 ### Fixed
+- A D-Bus proxy that did not come up took the whole program down with it. The
+  filesystem sandbox bound the proxy socket unconditionally, so when
+  `xdg-dbus-proxy` failed to start or exited before creating it — no session bus
+  at all, a tty login, a CI runner — bwrap failed with "Can't find source path"
+  and nothing started. The intent was always soft degradation: no bus is a
+  degradation, no program is a bug. The bind is now skipped and the missing bus
+  reported on stderr, while `DBUS_SESSION_BUS_ADDRESS` keeps pointing inside the
+  runtime tmpfs, where there is nothing — the program must not find the *real*
+  bus in any outcome. The five-second wait for the socket now also ends as soon
+  as the proxy is seen to have exited, instead of being paid on every launch.
+- `/run/current-system` is bound with `--ro-bind-try`. It exists only on NixOS,
+  and a missing source is a hard bwrap failure, so the sandbox could not run on
+  a machine that has a nix store but no NixOS system profile — which is what the
+  CI runner is, and what a nix-on-Debian install is.
 - The IPv6 fallback route was a syntax error and had never worked:
   `ip -6 route replace default unreachable` puts the route type after the
   prefix, which iproute2 rejects with "Command line is not complete" (exit 255).

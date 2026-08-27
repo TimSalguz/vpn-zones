@@ -12,8 +12,11 @@
 //! * [`config`] — WireGuard/AmneziaWG config parsing, the behaviour of the
 //!   `sed`/`grep` pipeline the zones used to run, written down as code and
 //!   tests (`docs/GOTCHAS.md` §4);
-//! * [`seccomp`] — the syscall filter for the bwrap sandbox, the one thing that
-//!   could not be done from bash at all;
+//! * [`fs_sandbox`] — the filesystem sandbox: bwrap, the permissions, the
+//!   `/.flatpak-info` that switches toolkits over to the portals, the filtered
+//!   session bus and the sandbox's own X server (`docs/GOTCHAS.md` §6, §8, §9);
+//! * [`seccomp`] — the syscall filter [`fs_sandbox`] loads into that box, the
+//!   one thing that could not be done from bash at all;
 //! * [`profile`] — data containers: the overlayfs layers of a profile and the
 //!   life cycle of a throwaway one (`docs/GOTCHAS.md` §5);
 //! * [`desktop`] — the `.desktop` generator behind `vpn-zone sync`
@@ -22,13 +25,14 @@
 //!   (`wp_security_context_v1`, `docs/GOTCHAS.md` §7);
 //! * [`sys`] — the handful of syscalls more than one of them needs.
 //!
-//! `profile` and `desktop` were Python scripts in `module/` and `wl_sandbox`
-//! was a C program there; the project has no Python and no C left. All of them
-//! are driven by the `vpn-zone-core` binary, which the bash `vpn-zone` and the
-//! systemd unit call.
+//! `profile` and `desktop` were Python scripts in `module/`, `wl_sandbox` was a
+//! C program there and `fs_sandbox` was a two-hundred-line shell script; the
+//! project has no Python and no C left. All of them are driven by the
+//! `vpn-zone-core` binary, which the bash `vpn-zone` and the systemd unit call.
 
 pub mod config;
 pub mod desktop;
+pub mod fs_sandbox;
 pub mod profile;
 pub mod seccomp;
 pub mod sys;

@@ -64,12 +64,12 @@ let
   # собирать каждый адресно, не собирая activationPackage целиком.
   #
   # Здесь только shell-деривации: Rust-крейт (vpn-zone-rust) собирается своим
-  # job'ом, а бывший wl-sandbox — теперь его подкоманда, а не отдельный пакет.
+  # job'ом, а бывшие wl-sandbox и vpn-fs-sandbox — теперь его подкоманды, а не
+  # отдельные пакеты.
   scriptNames = [
     "vpn-zone"
     "vpn-zone-pick"
     "vpn-zone-sync"
-    "vpn-fs-sandbox"
     "vpn-zone-add-gui"
     "vpn-zone-remove-gui"
     "vpn-zone-profile-rm-gui"

@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
 
-use vpn_zone::{desktop, profile, wl_sandbox, zone};
+use vpn_zone::{desktop, fs_sandbox, profile, wl_sandbox, zone};
 
 const USAGE: &str = "\
 vpn-zone-core — helper commands of vpn-zones
@@ -43,15 +43,34 @@ Usage:
         windows. Without the protocol — an older compositor, an X11 session —
         the command is run as it is, with a warning on stderr.
 
+  vpn-zone-core fs-sandbox [--bwrap P] [--dbus-proxy P] [--kdialog P]
+                           [--xwayland P] <app-id> [--name <sandbox>] -- cmd...
+        Run the command in a bwrap sandbox where $HOME is gone: a tmpfs takes
+        its place and only what the user allowed sticks out, everything else
+        goes through the portals (/.flatpak-info). The session bus is filtered
+        by xdg-dbus-proxy, XDG_RUNTIME_DIR is a tmpfs with the sockets bound in
+        by name, a seccomp filter is loaded, and with the x11 permission the
+        sandbox gets an xwayland-satellite of its own. The permissions are
+        asked once with kdialog and remembered in
+        ~/.config/vpn-zones/fs-perms/<app-id>; with --name they belong to the
+        named sandbox and its persistent home instead. Tool paths are
+        substituted by Nix and default to a PATH lookup.
+
+  vpn-zone-core fs-sandbox-x11 [--xwayland P] <:display> -- cmd...
+        Internal: what fs-sandbox runs INSIDE the sandbox when the x11
+        permission is granted. Starts the X server (whose socket has to appear
+        in the sandbox's own /tmp), waits a second for it and becomes the
+        program.
+
   vpn-zone-core --help
 
 Exit codes:
   0    success
   1    the pass failed
   2    bad usage
-  127  the program could not be started (profile-run, wl-sandbox)
-  *    otherwise profile-run and wl-sandbox report the exit code of the
-       program itself (128 + N if it was killed by signal N)
+  127  the program could not be started (profile-run, wl-sandbox, fs-sandbox)
+  *    otherwise profile-run, wl-sandbox and fs-sandbox report the exit code of
+       the program itself (128 + N if it was killed by signal N)
 ";
 
 /// Bad command line.
@@ -90,6 +109,22 @@ fn main() -> ExitCode {
             Ok(parsed) => ExitCode::from(wl_sandbox::run(parsed)),
             Err(e) => {
                 eprintln!("vpn-zone-core wl-sandbox: {e}");
+                eprint!("{USAGE}");
+                ExitCode::from(EXIT_USAGE)
+            }
+        },
+        Some("fs-sandbox") => match fs_sandbox::Args::parse(&args[1..]) {
+            Ok(parsed) => ExitCode::from(fs_sandbox::run(parsed)),
+            Err(e) => {
+                eprintln!("vpn-zone-core fs-sandbox: {e}");
+                eprint!("{USAGE}");
+                ExitCode::from(EXIT_USAGE)
+            }
+        },
+        Some("fs-sandbox-x11") => match fs_sandbox::X11Args::parse(&args[1..]) {
+            Ok(parsed) => ExitCode::from(fs_sandbox::run_x11(parsed)),
+            Err(e) => {
+                eprintln!("vpn-zone-core fs-sandbox-x11: {e}");
                 eprint!("{USAGE}");
                 ExitCode::from(EXIT_USAGE)
             }

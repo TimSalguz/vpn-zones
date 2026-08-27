@@ -37,8 +37,8 @@ use std::path::{Path, PathBuf};
 /// The XDG directories that make up a "profile".
 ///
 /// Documents, Downloads and the rest of `$HOME` are shared on purpose: this
-/// separates profiles, it is not a sandbox — that is what `vpn-fs-sandbox` is
-/// for. (`docs/GOTCHAS.md` §5)
+/// separates profiles, it is not a sandbox — that is what
+/// [`crate::fs_sandbox`] is for. (`docs/GOTCHAS.md` §5)
 pub const SUBDIRS: [&str; 5] = [".config", ".local/share", ".cache", ".mozilla", ".pki"];
 
 /// `PR_CAP_AMBIENT` / `PR_CAP_AMBIENT_CLEAR_ALL` from `linux/prctl.h`.

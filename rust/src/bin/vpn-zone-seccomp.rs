@@ -1,9 +1,17 @@
-//! `vpn-zone-seccomp` — generates the seccomp filter for the fs sandbox.
+//! `vpn-zone-seccomp` — the seccomp filter of the fs sandbox, on the command
+//! line.
 //!
-//! `vpn-fs-sandbox` runs `export`, keeps the program on a file descriptor and
-//! hands that descriptor to `bwrap --seccomp`. Argument parsing is done by hand
-//! on purpose: two verbs and one flag do not need a CLI framework, and this
-//! binary sits on the startup path of every sandboxed program.
+//! The sandbox itself does NOT go through this binary any more: `vpn-zone-core
+//! fs-sandbox` builds the filter in its own process and hands bwrap an
+//! inherited descriptor, which takes one fork and one temporary file off the
+//! startup path of every sandboxed program. What is left here is the part a
+//! person uses: `selftest`, which loads the filter into a process of its own
+//! and checks that the kernel really does refuse what it claims to, and
+//! `export`, which writes the compiled program to stdout for inspection or for
+//! a hand-rolled `bwrap --seccomp`.
+//!
+//! Argument parsing is done by hand on purpose: two verbs and one flag do not
+//! need a CLI framework.
 
 use std::io::{self, Write};
 use std::process::ExitCode;

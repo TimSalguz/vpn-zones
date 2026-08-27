@@ -1,4 +1,4 @@
-//! The seccomp-bpf filter for the bwrap sandbox (`vpn-fs-sandbox`).
+//! The seccomp-bpf filter for the bwrap sandbox ([`crate::fs_sandbox`]).
 //!
 //! Modelled on flatpak's base blocklist. The point is not "block everything
 //! dangerous" — a default-deny list cannot be written for arbitrary nixpkgs
@@ -27,6 +27,12 @@
 //! descriptor (`bwrap --seccomp FD`), which is the only format bwrap accepts.
 //! Filter attributes (NO_NEW_PRIVS, TSYNC) are *not* part of that program:
 //! bwrap sets `PR_SET_NO_NEW_PRIVS` itself before loading it.
+//!
+//! Two callers, and they want different things. [`crate::fs_sandbox`] is the
+//! real one and takes the program as an open, rewound file
+//! ([`Filter::export_to_file`]) it can hand straight to bwrap; the
+//! `vpn-zone-seccomp` binary exists for `selftest` and for exporting the
+//! program to stdout by hand.
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -220,8 +226,13 @@ impl Filter {
         &self.unknown
     }
 
-    /// The compiled cBPF program, exactly as `bwrap --seccomp FD` wants it.
-    pub fn export_bpf(&self) -> Result<Vec<u8>, Error> {
+    /// The compiled cBPF program on an open, unnamed file, rewound to the
+    /// start — the shape `bwrap --seccomp FD` wants, because bwrap reads the
+    /// descriptor from its current offset.
+    ///
+    /// This is what [`crate::fs_sandbox`] hands to bwrap. Keeping it a file and
+    /// not a path is the whole point: `--seccomp` takes a NUMBER, never a name.
+    pub fn export_to_file(&self) -> Result<File, Error> {
         // libseccomp only exports to a file descriptor (the in-memory export
         // is a libseccomp 2.6 feature and would make this crate refuse to
         // build against older ones), so the program takes a detour through an
@@ -229,6 +240,12 @@ impl Filter {
         let mut scratch = scratch_file()?;
         self.ctx.export_bpf(&scratch)?;
         scratch.rewind()?;
+        Ok(scratch)
+    }
+
+    /// The compiled cBPF program as bytes, for `vpn-zone-seccomp export`.
+    pub fn export_bpf(&self) -> Result<Vec<u8>, Error> {
+        let mut scratch = self.export_to_file()?;
         let mut bpf = Vec::new();
         scratch.read_to_end(&mut bpf)?;
         Ok(bpf)

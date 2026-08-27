@@ -102,16 +102,25 @@ let
   # wayland-сокет, после чего композитор перестаёт выдавать клиенту протоколы
   # слежки. Ни Python, ни C в проекте больше нет.
   #
-  # Последним переехал ЖИЗНЕННЫЙ ЦИКЛ ЗОНЫ — то, что раньше было скриптами
+  # Затем переехал ЖИЗНЕННЫЙ ЦИКЛ ЗОНЫ — то, что раньше было скриптами
   # zoneHolder и zoneInit прямо в этом файле: user namespace с двойным
   # маппингом, net+mount namespace, pasta, туннель, DNS и зеркало состояния
   # (`vpn-zone-core zone-holder`, rust/src/zone.rs). Заодно конфиги теперь
   # разбирает парсер крейта с тестами на все грабли docs/GOTCHAS.md §4, а не
-  # конвейер sed+grep. На bash остались CLI, пикер и GUI-обвязка.
+  # конвейер sed+grep.
   #
-  # Два бинаря: vpn-zone-seccomp (фильтр) и vpn-zone-core (подкоманды
-  # zone-holder, profile-run, sync и wl-sandbox). Со скриптом vpn-zone имена не
-  # сталкиваются — всё спокойно лежит в home.packages.
+  # Последней переехала ПЕСОЧНИЦА ФАЙЛОВОЙ СИСТЕМЫ — двухсотстрочный
+  # writeShellScriptBin vpn-fs-sandbox из этого файла: bwrap, разрешения,
+  # /.flatpak-info, фильтр сессионной шины и свой X-сервер
+  # (`vpn-zone-core fs-sandbox`, rust/src/fs_sandbox.rs). Seccomp-фильтр она
+  # теперь собирает В СВОЁМ ПРОЦЕССЕ (крейт зовётся как библиотека), а не
+  # запускает vpn-zone-seccomp сабпроцессом. На bash остались CLI, пикер и
+  # GUI-обвязка.
+  #
+  # Два бинаря: vpn-zone-seccomp (фильтр отдельной командой — он же selftest) и
+  # vpn-zone-core (подкоманды zone-holder, profile-run, sync, wl-sandbox и
+  # fs-sandbox). Со скриптом vpn-zone имена не сталкиваются — всё спокойно
+  # лежит в home.packages.
   vpn-zone-rust = pkgs.rustPlatform.buildRustPackage {
     pname = "vpn-zone-rust";
     version = "0.1.0";
@@ -147,266 +156,39 @@ let
     meta.mainProgram = "vpn-zone-seccomp";
   };
 
-  # --- ЧАСТЬ 0б: ПЕСОЧНИЦА ФАЙЛОВОЙ СИСТЕМЫ ---
-  # Третий слой поверх сети (зона) и данных (контейнер). Здесь программа теряет
-  # доступ к $HOME целиком: вместо него tmpfs, наружу торчит только то, что ты
-  # разрешил. Всё остальное она должна просить через ПОРТАЛЫ — а они в системе
-  # уже стоят и работают (kde/gnome/gtk + xdg-document-portal).
+  # --- ЧАСТЬ 0б: ПЕСОЧНИЦА ФАЙЛОВОЙ СИСТЕМЫ — В RUST ---
+  # Здесь был writeShellScriptBin vpn-fs-sandbox на две сотни строк. Он целиком
+  # переехал в крейт — `vpn-zone-core fs-sandbox`, модуль rust/src/fs_sandbox.rs,
+  # где и живёт теперь вся прежняя россыпь комментариев-граблей (порядок
+  # аргументов bwrap, узлы NVIDIA, mimeapps.list, задержка X-сервера, отказ от
+  # host-X11). Поведение прежнее; три отличия записаны в CHANGELOG.md:
+  #   • seccomp-фильтр собирается В ЭТОМ ЖЕ ПРОЦЕССЕ (crate::seccomp как
+  #     библиотека) и уходит в bwrap унаследованным дескриптором, вместо
+  #     запуска vpn-zone-seccomp сабпроцессом и редиректа `exec 34< файл`;
+  #   • не поднявшийся xdg-dbus-proxy больше не роняет запуск: bash биндил его
+  #     сокет безусловно, bwrap падал на «Can't find source path», и программа
+  #     не открывалась вовсе — вместо мягкой деградации получался отказ;
+  #   • прокси гасится и когда сигнал приходит нам: в bash trap жил в сабшелле,
+  #     который TERM убивал отдельно, оставляя прокси висеть.
   #
-  # КЛЮЧЕВАЯ ХИТРОСТЬ — /.flatpak-info. Приложение идёт через порталы, только
-  # если считает себя изолированным, а проверяет оно это по наличию этого файла
-  # (так делают GTK, Qt, Chromium, Electron). Подкладываем его — и файловый
-  # диалог начинает рисовать чужой процесс, отдавая программе ровно один
-  # выбранный файл (через document-portal), камера и запись экрана начинают
-  # спрашивать разрешение. То есть «андроидные» запросы получаются даром, писать
-  # их не нужно.
+  # Коротко о том, зачем этот слой (подробности — в шапке rust/src/fs_sandbox.rs
+  # и в docs/GOTCHAS.md §6, §8, §9). Третий слой поверх сети (зона) и данных
+  # (контейнер): программа теряет доступ к $HOME целиком, вместо него tmpfs, а
+  # наружу торчит только разрешённое. Всё остальное она просит через ПОРТАЛЫ —
+  # и переключает её на них подложенный /.flatpak-info, по которому GTK, Qt,
+  # Chromium и Electron решают, что изолированы. Полной заменой flatpak это не
+  # является: программа берётся из nixpkgs и видит /nix/store, так что
+  # «подменить библиотеку» песочница не мешает — она мешает читать ТВОИ файлы.
   #
-  # ЧЕГО ЗДЕСЬ НЕТ. Это не полная замена flatpak: у того ещё свой рантайм и
-  # каталог правил на каждое приложение. Здесь программа берётся из nixpkgs и
-  # видит /nix/store (иначе она попросту не запустится), так что «подменить
-  # библиотеку» песочница не мешает — она мешает читать ТВОИ файлы.
-  vpn-fs-sandbox = pkgs.writeShellScriptBin "vpn-fs-sandbox" ''
-    set -eu
-    appid=''${1:?нужен app-id}; shift
-    # --name <песочница> — постоянная песочница с общим домом: в неё можно
-    # запускать несколько программ, и они видят файлы друг друга, но не твои.
-    # Без него дом создаётся временный (tmpfs) и исчезает вместе с программой.
-    sbname=""
-    if [ "''${1:-}" = "--name" ]; then shift; sbname=''${1:-}; shift || true; fi
-    [ "''${1:-}" = "--" ] && shift || true
-    [ $# -gt 0 ] || { echo "нечего запускать" >&2; exit 1; }
-
-    home="${config.home.homeDirectory}"
-    cfg="$home/.config/vpn-zones"
-    permdir="$cfg/fs-perms"
-    ${pkgs.coreutils}/bin/mkdir -p "$permdir"
-    runtime="''${XDG_RUNTIME_DIR:-/run/user/$(${pkgs.coreutils}/bin/id -u)}"
-
-    # --- РАЗРЕШЕНИЯ ---
-    # Спрашиваем один раз на программу и запоминаем. Пусто = не давать ничего,
-    # кроме портального обмена файлами.
-    # У именованной песочницы разрешения общие: их выдают ей, а не каждой
-    # программе по отдельности — иначе вторая программа спрашивала бы заново про
-    # тот же самый дом.
-    sbdir=""
-    if [ -n "$sbname" ]; then
-      sbdir="$home/.local/state/vpn-sandboxes/$sbname"
-      ${pkgs.coreutils}/bin/mkdir -p "$sbdir/home"
-      permfile="$sbdir/perms"
-    else
-      permfile="$permdir/$appid"
-    fi
-    # Без графики диалог показать негде, а ждать ответа некому — программа
-    # просто зависла бы (проверено). Считаем, что не разрешено ничего.
-    if [ ! -f "$permfile" ] && [ -z "''${WAYLAND_DISPLAY:-}''${DISPLAY:-}" ]; then
-      : > "$permfile"
-    fi
-    if [ ! -f "$permfile" ]; then
-      sel=$(${kdialog} --title "Доступ к файлам: $appid" \
-        --separate-output \
-        --checklist "Что показать программе? Ничего не отмечай — и она не увидит НИЧЕГО из твоих файлов: нужное сможет получить только через диалог выбора файла, по одному." \
-        downloads "Загрузки (~/Downloads)" off \
-        documents "Документы (~/Documents)" off \
-        pictures "Изображения (~/Pictures)" off \
-        x11 "Свой X-сервер (нужен Wine и старым программам)" off \
-        home "ВЕСЬ домашний каталог — файловой изоляции не будет" off \
-        2>/dev/null) || sel=""
-      printf '%s\n' "$sel" > "$permfile"
-    fi
-    perms=$(${pkgs.coreutils}/bin/cat "$permfile" 2>/dev/null || true)
-
-    binds=()
-    case "$perms" in
-      *home*)
-        binds+=( --bind "$home" "$home" ) ;;
-      *)
-        if [ -n "$sbdir" ]; then
-          # Постоянный дом песочницы: переживёт закрытие программы и виден всем,
-          # кого запустили в эту же песочницу.
-          binds+=( --bind "$sbdir/home" "$home" )
-        else
-          # tmpfs вместо дома: программа получает пустой $HOME и не видит ни
-          # ключей, ни документов, ни конфигов остальных программ.
-          binds+=( --tmpfs "$home" )
-        fi
-        case "$perms" in *downloads*) binds+=( --bind "$home/Downloads" "$home/Downloads" ) ;; esac
-        case "$perms" in *documents*) binds+=( --bind "$home/Documents" "$home/Documents" ) ;; esac
-        case "$perms" in *pictures*)  binds+=( --bind "$home/Pictures" "$home/Pictures" ) ;; esac
-        ;;
-    esac
-
-    # --- АССОЦИАЦИИ ФАЙЛОВ И ССЫЛОК ---
-    # В песочнице ~/.config пуст, поэтому mimeapps.list не виден, и xdg-open
-    # подбирает обработчик сам: у Discord ссылка на вход открывалась в Chrome,
-    # хотя браузер по умолчанию — zen. Пробрасываем только этот файл, только на
-    # чтение: он крошечный и никаких секретов не содержит, зато ссылки уходят
-    # туда, куда ты назначил.
-    mimebind=()
-    [ -f "$home/.config/mimeapps.list" ] && \
-      mimebind=( --ro-bind "$home/.config/mimeapps.list" "$home/.config/mimeapps.list" )
-
-    # --- /.flatpak-info ---
-    # Минимальной секции [Application] хватает, чтобы тулкиты переключились на
-    # порталы. Файл кладём во временный каталог и монтируем только на чтение.
-    info=$(${pkgs.coreutils}/bin/mktemp -d)
-    trap '${pkgs.coreutils}/bin/rm -rf "$info"' EXIT
-    {
-      echo "[Application]"
-      echo "name=$appid"
-      echo
-      echo "[Instance]"
-      echo "instance-id=$$"
-      echo "session-bus-proxy=true"
-      echo "system-bus-proxy=false"
-    } > "$info/flatpak-info"
-
-    # --- ШИНА ЧЕРЕЗ ФИЛЬТР ---
-    # Без фильтра программа через сессионную шину дотянется до Secret Service
-    # (то есть до KWallet со всеми паролями), до списка окон и до чужих
-    # приложений. Пропускаем только порталы и уведомления.
-    proxy="$info/bus"
-    ${pkgs.xdg-dbus-proxy}/bin/xdg-dbus-proxy "''${DBUS_SESSION_BUS_ADDRESS:-unix:path=$runtime/bus}" "$proxy" \
-      --filter \
-      --talk=org.freedesktop.portal.* \
-      --talk=org.freedesktop.Notifications \
-      --talk=org.kde.StatusNotifierWatcher \
-      >/dev/null 2>&1 &
-    proxypid=$!
-    trap '${pkgs.coreutils}/bin/kill $proxypid 2>/dev/null || true; ${pkgs.coreutils}/bin/rm -rf "$info"' EXIT
-    for _ in $(seq 1 50); do [ -S "$proxy" ] && break; ${pkgs.coreutils}/bin/sleep 0.1; done
-
-    # Сокеты, которые пробрасываем поимённо: композитор (уже ограниченный
-    # wl-sandbox, если он был), звук и наш прокси шины. Всё остальное из
-    # $XDG_RUNTIME_DIR программе не видно.
-    sockets=( --tmpfs "$runtime" )
-    [ -n "''${WAYLAND_DISPLAY:-}" ] && [ -S "$runtime/$WAYLAND_DISPLAY" ] && \
-      sockets+=( --ro-bind "$runtime/$WAYLAND_DISPLAY" "$runtime/$WAYLAND_DISPLAY" )
-    [ -S "$runtime/pipewire-0" ] && sockets+=( --ro-bind "$runtime/pipewire-0" "$runtime/pipewire-0" )
-    [ -S "$runtime/pulse/native" ] && sockets+=( --ro-bind "$runtime/pulse/native" "$runtime/pulse/native" )
-    sockets+=( --bind "$proxy" "$runtime/bus" )
-    # X-сокет ХОСТА не пробрасываем никогда: в общем X-сервере все клиенты видят
-    # окна и ввод друг друга — это дыра ровно того размера, который мы
-    # закрывали. Так же считает и сам flatpak: его --socket=x11 документирован
-    # как небезопасный, а рекомендуется fallback-x11, то есть «X только если нет
-    # Wayland».
-    #
-    # Вместо этого при разрешении x11 внутри песочницы поднимается СВОЙ
-    # xwayland-satellite: приложение получает отдельный X-сервер, в котором,
-    # кроме него, никого нет. Он подключается к нашему уже ограниченному
-    # wayland-сокету, так что через X обойти security-context тоже не выйдет.
-    #
-    # Electron сюда не относится: ему хватает подсказки уйти на Wayland (см.
-    # ELECTRON_OZONE_PLATFORM_HINT ниже) — проверено на Discord, который без неё
-    # падал с «Missing X server or $DISPLAY».
-    # Подстановки вида ''${var:+…} с кавычками внутри НЕ годятся: кавычки в них
-    # остаются литеральными символами, аргументы разъезжаются, и bwrap пытается
-    # выполнить сам номер дисплея («execvp :149»). Поэтому массивы.
-    # Узлы GPU. Одного /dev/dri мало: на NVIDIA драйверу нужны ещё /dev/nvidia*,
-    # без них EGL внутри падает («failed to create dri2 screen»), а Electron
-    # намертво виснет на заставке — проверено на Discord.
-    devbinds=()
-    for d in /dev/dri /dev/nvidia*; do
-      [ -e "$d" ] && devbinds+=( --dev-bind-try "$d" "$d" )
-    done
-
-    xdisp=""
-    xenv=( --unsetenv DISPLAY )
-    xlauncher=()
-    case "$perms" in
-      *x11*)
-        xdisp=":''$(( (RANDOM % 400) + 100 ))"
-        xenv=( --setenv DISPLAY "$xdisp" )
-        xlauncher=( ${pkgs.bash}/bin/bash -c '
-          xwayland-satellite "$1" >/dev/null 2>&1 &
-          shift
-          # Секунда на подъём сервера: без неё программа стартует раньше, чем
-          # появится сокет, и падает с «cannot open display».
-          ${pkgs.coreutils}/bin/sleep 1
-          exec "$@"' -- "$xdisp" )
-        ;;
-    esac
-
-    # --- SECCOMP: ФИЛЬТР СИСТЕМНЫХ ВЫЗОВОВ ---
-    # Слой, которого в bash не могло быть в принципе: программу для ядра
-    # генерирует только код (крейт rust/, libseccomp). Набор — по образцу
-    # flatpak, и он не про «запретить всё», а про несколько вызовов, которыми
-    # из песочницы дотягиваются наружу или до ядра:
-    #   • ioctl(TIOCSTI/TIOCLINUX) — вставка символов во ввод ТВОЕГО терминала:
-    #     программа, запущенная из шелла, могла бы «напечатать» туда команду, и
-    #     выполнилась бы она уже вне песочницы;
-    #   • ptrace — присоединение к чужим процессам того же uid (а uid у
-    #     песочницы общий со всей сессией);
-    #   • keyctl/add_key/request_key, syslog, perf_event_open, acct, quotactl,
-    #     uselib, NUMA-вызовы — поверхность атаки на ядро, десктопной программе
-    #     не нужная;
-    #   • personality — только PER_LINUX (остальные ослабляют защиту userspace);
-    #   • новый mount-API и clone3 отвечают ENOSYS, а не EPERM, чтобы libc и
-    #     программы уходили на старый путь, а не падали.
-    # Вложенные user namespace НЕ запрещены, и это осознанно. У flatpak такой
-    # запрет есть, но там же есть zypak; в NixOS нет ни его, ни setuid
-    # chrome-sandbox, поэтому Chromium и все Electron-программы строят СВОЙ
-    # вложенный userns — запретишь, и они не стартуют вовсе («No usable
-    # sandbox!»). Наружу он всё равно не выводит: права даёт только над своими
-    # новыми пустыми namespace. Кому нужно строже — `vpn-zone-seccomp export
-    # --deny-userns`.
-    #
-    # Мягкая деградация, как и в остальных слоях: не собрался фильтр —
-    # предупреждаем и запускаем без него.
-    # stderr генератора НЕ глушим: он пишет туда только про пропущенные правила
-    # (libseccomp не знает такого вызова) и про ошибки — молчать о дырявом
-    # фильтре нельзя.
-    seccompargs=()
-    if ${vpn-zone-rust}/bin/vpn-zone-seccomp export > "$info/seccomp.bpf" \
-       && [ -s "$info/seccomp.bpf" ]; then
-      # bwrap читает программу из ДЕСКРИПТОРА (--seccomp FD), а редирект нельзя
-      # положить в массив аргументов — открываем его заранее через exec. Номер
-      # произвольный, лишь бы свободный; bwrap прочитает и закроет его сам.
-      exec 34< "$info/seccomp.bpf"
-      seccompargs=( --seccomp 34 )
-    else
-      echo "vpn-fs-sandbox: seccomp-фильтр не собрался — запускаю без него" >&2
-    fi
-
-    # НЕ exec: прокси шины надо погасить после выхода программы, а после exec
-    # обработчик выхода уже не сработает — и прокси остался бы висеть. Заодно
-    # его вывод уводится в /dev/null: иначе он держит открытым stdout, и вызов
-    # выглядит зависшим, хотя программа давно закончила.
-    ${pkgs.bubblewrap}/bin/bwrap \
-      --ro-bind /nix/store /nix/store \
-      --ro-bind /run/current-system /run/current-system \
-      --ro-bind-try /run/opengl-driver /run/opengl-driver \
-      --ro-bind-try /run/opengl-driver-32 /run/opengl-driver-32 \
-      --ro-bind /etc /etc \
-      --ro-bind-try /sys /sys \
-      `# /etc/resolv.conf — симлинк в /run/systemd/resolve, поэтому без этой` \
-      `# строки внутри песочницы не резолвятся имена: сам /run не пробрасывается` \
-      --ro-bind-try /run/systemd/resolve /run/systemd/resolve \
-      --dev /dev \
-      "''${devbinds[@]}" \
-      --proc /proc \
-      --tmpfs /tmp \
-      "''${binds[@]}" \
-      "''${mimebind[@]}" \
-      "''${sockets[@]}" \
-      --ro-bind "$info/flatpak-info" /.flatpak-info \
-      --setenv HOME "$home" \
-      --setenv XDG_RUNTIME_DIR "$runtime" \
-      --setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$runtime/bus" \
-      --setenv FLATPAK_ID "$appid" \
-      --setenv ELECTRON_OZONE_PLATFORM_HINT auto \
-      --setenv NIXOS_OZONE_WL 1 \
-      --unsetenv DBUS_SYSTEM_BUS_ADDRESS \
-      `# Без разрешения x11 DISPLAY сбрасывается: иначе тулкиты видят` \
-      `# унаследованный :0, идут на X и падают вместо перехода на Wayland` \
-      "''${xenv[@]}" \
-      "''${seccompargs[@]}" \
-      --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup-try \
-      --die-with-parent \
-      -- "''${xlauncher[@]}" "$@"
-    rc=$?
-    ${pkgs.coreutils}/bin/kill $proxypid 2>/dev/null || true
-    exit $rc
-  '';
+  # Пути инструментов подставляются флагами, как и у держателя зоны: часть кода
+  # исполняется внутри namespace, где PATH может быть каким угодно. Строка
+  # собирается один раз — её же дословно грепает смоук-тест, чтобы проверять
+  # ровно то, что поедет пользователю (tests/integration/smoke.sh).
+  fsSandboxTools =
+    "--bwrap ${pkgs.bubblewrap}/bin/bwrap"
+    + " --dbus-proxy ${pkgs.xdg-dbus-proxy}/bin/xdg-dbus-proxy"
+    + " --kdialog ${kdialog}"
+    + " --xwayland ${pkgs.xwayland-satellite}/bin/xwayland-satellite";
 
   # --- ЧАСТЬ 1-2: ЖИЗНЕННЫЙ ЦИКЛ ЗОНЫ — В RUST ---
   # Здесь были два shell-скрипта: zoneHolder (создавал user namespace двойным
@@ -766,9 +548,11 @@ let
           # два независимых набора доступов на одну программу.
           fsid=''${VPN_ZONE_APPID:-$appbin}
           if [ -n "$sbname" ]; then
-            set -- ${vpn-fs-sandbox}/bin/vpn-fs-sandbox "$fsid" --name "$sbname" -- "$@"
+            set -- ${vpn-zone-rust}/bin/vpn-zone-core fs-sandbox ${fsSandboxTools} \
+              "$fsid" --name "$sbname" -- "$@"
           else
-            set -- ${vpn-fs-sandbox}/bin/vpn-fs-sandbox "$fsid" -- "$@"
+            set -- ${vpn-zone-rust}/bin/vpn-zone-core fs-sandbox ${fsSandboxTools} \
+              "$fsid" -- "$@"
           fi
         fi
 
@@ -776,7 +560,7 @@ let
         [ $ephemeral -eq 1 ] && pkey="$profile"
         # Имя программы берём из id ярлыка (или из уже вычисленного appbin), а
         # НЕ из "$1": к этому месту в начало команды уже подставлены обёртки
-        # (wl-sandbox, vpn-fs-sandbox), и basename давал ИХ имя. Отсюда три
+        # (wl-sandbox, fs-sandbox), и basename давал ИХ имя. Отсюда три
         # следствия: предупреждение о конфликте называло чужую программу,
         # галочка «не спрашивать снова» была общей на все песочницы сразу (она
         # привязана к ключу --dontagain), а без VPN_ZONE_APPID все они делили
@@ -1300,7 +1084,7 @@ let
       # ниже принимал это за отмену — запуск из терминала или из юнита тихо
       # заканчивался ничем. Берём прошлый выбор и не мешаем программе
       # запуститься (так же поступают предупреждение о конфликте сетей и
-      # диалог прав песочницы — см. vpn-zone run и vpn-fs-sandbox).
+      # диалог прав песочницы — см. vpn-zone run и rust/src/fs_sandbox.rs).
       if [ -z "''${WAYLAND_DISPLAY:-}''${DISPLAY:-}" ]; then
         case "''${lastprofile:-}" in
           ""|__main__) ;;
@@ -2030,11 +1814,11 @@ in
     vpn-zone
     vpn-zone-sync
     vpn-zone-pick
-    vpn-fs-sandbox
     # Rust-ядро: vpn-zone-seccomp (генератор фильтра) и vpn-zone-core
-    # (подкоманды profile-run, sync и wl-sandbox, их зовёт vpn-zone). В PATH —
-    # не только ради песочницы: тем же бинарём проверяется, что фильтр вообще
-    # работает на твоём ядре (`vpn-zone-seccomp selftest`).
+    # (подкоманды zone-holder, profile-run, sync, wl-sandbox и fs-sandbox — их
+    # зовут юнит и vpn-zone). В PATH — не только ради этого: тем же бинарём
+    # проверяется, что фильтр вообще работает на твоём ядре
+    # (`vpn-zone-seccomp selftest`).
     vpn-zone-rust
     vpn-zone-add-gui
     vpn-zone-remove-gui
