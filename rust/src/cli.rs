@@ -552,7 +552,7 @@ fn reset_profile(tools: &Tools, args: &[OsString]) -> u8 {
         );
         return 1;
     }
-    let _ = fs::remove_dir_all(dir.join("overlay"));
+    let _ = crate::sys::remove_tree(&dir.join("overlay"));
     println!(
         "слой профиля зоны {} очищен (основной профиль не тронут)",
         name.to_string_lossy()
@@ -578,7 +578,7 @@ fn remove(tools: &Tools, args: &[OsString]) -> u8 {
         return 1;
     }
     let _ = systemctl(tools, "stop", name);
-    if let Err(e) = fs::remove_dir_all(&dir) {
+    if let Err(e) = crate::sys::remove_tree(&dir) {
         eprintln!("не удалить {}: {e}", dir.display());
         return 1;
     }
@@ -653,8 +653,8 @@ fn gc(tools: &Tools) -> u8 {
         if registry::any_live(&regdir, &proc_is_alive) {
             continue;
         }
-        let _ = fs::remove_dir_all(&dir);
-        let _ = fs::remove_dir_all(&regdir);
+        let _ = crate::sys::remove_tree(&dir);
+        let _ = crate::sys::remove_tree(&regdir);
         cleaned += 1;
     }
 
@@ -751,7 +751,7 @@ fn perms(tools: &Tools, args: &[OsString]) -> u8 {
                 return 1;
             };
             if what == "--all" {
-                let _ = fs::remove_dir_all(&dir);
+                let _ = crate::sys::remove_tree(&dir);
                 println!("сброшено для всех — при следующем запуске спросит заново");
             } else {
                 let _ = fs::remove_file(dir.join(what));
@@ -837,7 +837,7 @@ fn sandbox(tools: &Tools, args: &[OsString]) -> u8 {
                 eprintln!("песочницы {} нет", name.to_string_lossy());
                 return 1;
             }
-            if let Err(e) = fs::remove_dir_all(&dir) {
+            if let Err(e) = crate::sys::remove_tree(&dir) {
                 eprintln!("не удалить {}: {e}", dir.display());
                 return 1;
             }

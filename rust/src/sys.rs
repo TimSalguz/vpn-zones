@@ -76,3 +76,60 @@ fn cstring(bytes: &[u8]) -> io::Result<CString> {
     CString::new(bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "argument contains a NUL byte"))
 }
+
+/// `rm -rf` that copes with what overlayfs leaves behind.
+///
+/// The kernel creates `work/work` inside every overlay workdir with mode 000.
+/// GNU `rm -rf` (what the bash version called) handles that by falling back to
+/// rmdir when a directory cannot be read; `std::fs::remove_dir_all` just gives
+/// up with EACCES — which made `vpn-zone profile rm` fail on any profile that
+/// had ever been mounted. Order of attempts: the fast path, then rmdir for an
+/// unreadable-but-empty directory, then chmod u+rwx and recurse.
+pub fn remove_tree(path: &Path) -> io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => remove_tree_fallback(path),
+    }
+}
+
+fn remove_tree_fallback(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !meta.is_dir() {
+        return std::fs::remove_file(path);
+    }
+    // Empty but unreadable (the overlay's work/work): rmdir needs no read
+    // permission on the directory itself.
+    if std::fs::remove_dir(path).is_ok() {
+        return Ok(());
+    }
+    let mut perms = meta.permissions();
+    perms.set_mode(perms.mode() | 0o700);
+    let _ = std::fs::set_permissions(path, perms);
+    for entry in std::fs::read_dir(path)? {
+        remove_tree_fallback(&entry?.path())?;
+    }
+    std::fs::remove_dir(path)
+}
+
+#[cfg(test)]
+mod remove_tree_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn removes_a_mode_zero_overlay_work_dir() {
+        let root = std::env::temp_dir().join(format!("vpn-rmtree-{}", std::process::id()));
+        let work = root.join(".config").join("work").join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(root.join(".config").join("upper"), b"x").unwrap();
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0)).unwrap();
+        remove_tree(&root).unwrap();
+        assert!(!root.exists());
+    }
+}

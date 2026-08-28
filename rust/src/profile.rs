@@ -309,7 +309,7 @@ fn remove_tree(path: &Path) {
     if path.as_os_str().is_empty() {
         return;
     }
-    let _ = fs::remove_dir_all(path);
+    let _ = crate::sys::remove_tree(path);
 }
 
 /// For messages only: an argument may be any byte string, and a message is
