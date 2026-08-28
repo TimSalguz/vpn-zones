@@ -128,7 +128,7 @@ mod remove_tree_tests {
         let work = root.join(".config").join("work").join("work");
         std::fs::create_dir_all(&work).unwrap();
         std::fs::write(root.join(".config").join("upper"), b"x").unwrap();
-        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o000)).unwrap();
         remove_tree(&root).unwrap();
         assert!(!root.exists());
     }
