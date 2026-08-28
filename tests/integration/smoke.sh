@@ -280,7 +280,11 @@ UPPER="$PROFILES/$TEST_PROFILE/.config/upper/vpn-smoke-marker"
 echo "ok: запись ушла в слой профиля, настоящий ~/.config не тронут"
 
 step "vpn-zone profile rm $TEST_PROFILE"
-"$VPN_ZONE" profile rm "$TEST_PROFILE"
+# При провале — владельцы и права всего дерева: без этого EACCES нечитаем.
+"$VPN_ZONE" profile rm "$TEST_PROFILE" || {
+  ls -lnRa "$PROFILES/$TEST_PROFILE" >&2 || true
+  fail "profile rm не смог удалить дерево профиля"
+}
 [ ! -d "$PROFILES/$TEST_PROFILE" ] || fail "профиль не удалился"
 
 # --- 6б. Песочница файловой системы ------------------------------------------
