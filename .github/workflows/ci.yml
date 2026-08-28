@@ -30,6 +30,12 @@ jobs:
           nix-instantiate --eval tests/harness.nix -A zoneHolderExec
 
   # Адресная сборка каждой script-деривации + shellcheck по собранным bin/*.
+  #
+  # Список из трёх — это итог M1: shell в модуле остался ровно обёртками над
+  # бинарями крейта (vpn-zone, vpn-zone-pick — по две строки, vpn-zone-sync —
+  # одна с четырьмя аргументами). Пикер и шесть GUI-ярлыков теперь бинари, их
+  # проверяет job rust. Цикл и shellcheck остаются: обёртки — тоже код, и
+  # смоук-скрипт проверяется здесь же.
   scripts:
     name: scripts (build + shellcheck)
     runs-on: ubuntu-24.04
@@ -40,10 +46,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p results
-          for s in vpn-zone vpn-zone-pick vpn-zone-sync \
-                   vpn-zone-add-gui vpn-zone-remove-gui vpn-zone-profile-rm-gui \
-                   vpn-zone-profile-add-gui vpn-zone-settings-gui \
-                   vpn-zone-forget-gui; do
+          for s in vpn-zone vpn-zone-pick vpn-zone-sync; do
             echo "=== nix-build -A scripts.$s"
             nix-build tests/harness.nix -A "scripts.$s" -o "results/$s"
           done
@@ -53,8 +56,8 @@ jobs:
           files=(tests/integration/smoke.sh)
           for f in results/*/bin/*; do
             # Бинарники пропускаем: shellcheck только для текстов с шебангом.
-            # Сейчас в списке одни shell-деривации, но проверка остаётся —
-            # добавится бинарь, и job не покраснеет на пустом месте.
+            # Сейчас в списке одни обёртки, но проверка остаётся — положат сюда
+            # бинарь, и job не покраснеет на пустом месте.
             if ! head -c 2 "$f" | grep -q '#!'; then
               echo "пропуск (не скрипт): $f"
               continue
@@ -74,11 +77,13 @@ jobs:
   # Rust-ядро (ROADMAP M1/M2): формат, линт и тесты крейта rust/ — парсер
   # конфигов WG/AWG, генератор seccomp-фильтра, слои профилей, генератор
   # .desktop-ярлыков, ограничитель доступа к композитору (wl-sandbox),
-  # песочница файловой системы (fs-sandbox) и сам CLI vpn-zone (разбор
-  # аргументов запуска, реестр запусков, манифест путей инструментов).
-  # В job scripts крейт тоже собирается (обёртка vpn-zone и vpn-zone-sync на
-  # него ссылаются), но без clippy и без тестов: компилятор и линтер живут
-  # здесь.
+  # песочница файловой системы (fs-sandbox), CLI vpn-zone (разбор аргументов
+  # запуска, реестр запусков, манифест путей инструментов), пикер сети
+  # (машина выбора как чистая функция + сквозные сценарии с подставными
+  # kdialog и vpn-zone) и шесть GUI-ярлыков.
+  # В job scripts крейт тоже собирается (обёртки vpn-zone/vpn-zone-pick и
+  # vpn-zone-sync на него ссылаются), но без clippy и без тестов: компилятор и
+  # линтер живут здесь.
   #
   # Интеграционные тесты крейта, которым нужен настоящий bwrap, помечены
   # #[ignore]: userns на раннере готовит только job integration (снятие

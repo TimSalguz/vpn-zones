@@ -63,19 +63,16 @@ let
   # отбрасывает версию: «vpn-zone-rust-0.1.0» → «vpn-zone-rust»), чтобы CI мог
   # собирать каждый адресно, не собирая activationPackage целиком.
   #
-  # Здесь только shell-деривации: Rust-крейт (vpn-zone-rust) собирается своим
-  # job'ом, а бывшие wl-sandbox и vpn-fs-sandbox — теперь его подкоманды, а не
-  # отдельные пакеты.
+  # Список короткий, и это результат: shell в модуле остался ровно тремя
+  # двухстрочными обёртками над бинарями крейта. Пикер, шесть GUI-ярлыков, обе
+  # песочницы и сам CLI — теперь подкоманды и бинари vpn-zone-rust, а он
+  # собирается своим job'ом. Ярлычный бинарь vpn-zone-gui в home.packages не
+  # кладётся вовсе (его зовут .desktop-записи store-путём), поэтому и вытащить
+  # его отсюда нельзя.
   scriptNames = [
     "vpn-zone"
     "vpn-zone-pick"
     "vpn-zone-sync"
-    "vpn-zone-add-gui"
-    "vpn-zone-remove-gui"
-    "vpn-zone-profile-rm-gui"
-    "vpn-zone-profile-add-gui"
-    "vpn-zone-settings-gui"
-    "vpn-zone-forget-gui"
   ];
 
   scriptByName =

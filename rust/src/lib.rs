@@ -3,11 +3,19 @@
 //!
 //! The project used to be a Nix module full of shell; this crate is what it has
 //! been replaced with, one piece at a time, and each piece stayed in shell until
-//! parity was proven. What is left in `module/` is the network picker, the
-//! kdialog wrappers and the packaging. What is here:
+//! parity was proven. What is left in `module/` is the packaging and three
+//! two-line wrappers that point `VPN_ZONE_TOOLS` at the manifest. What is here:
 //!
 //! * [`cli`] — the `vpn-zone` command line itself: the zone verbs, the
 //!   containers, the sandboxes, the settings and the garbage collection;
+//! * [`picker`] — `vpn-zone-pick`, the dialog an intercepted launcher entry
+//!   opens: which network, which container, and the three levels of memory
+//!   behind both answers (`docs/GOTCHAS.md` §11);
+//! * [`gui`] — `vpn-zone-gui`, the six launcher entries (add and remove a zone,
+//!   create and remove a container, the settings, reset the pins), kdialog over
+//!   the CLI;
+//! * [`dialog`] — the shapes of `kdialog` and `notify-send` call those two make,
+//!   and the traps of each;
 //! * [`launch`] — `vpn-zone run`, from the delegation of a launch that comes
 //!   from inside a zone to the `execvp` into `nsenter`
 //!   (`docs/GOTCHAS.md` §1, §5, §7, §13);
@@ -37,18 +45,22 @@
 //! * [`sys`] — the handful of syscalls more than one of them needs.
 //!
 //! `profile` and `desktop` were Python scripts in `module/`, `wl_sandbox` was a
-//! C program there, `fs_sandbox` a two-hundred-line shell script and `cli` the
-//! seven-hundred-line `vpn-zone` one; the project has no Python and no C left,
-//! and no shell outside the picker and the GUI wrappers. Three binaries drive
-//! all of it: `vpn-zone` (the CLI), `vpn-zone-core` (what the CLI and the
-//! systemd unit delegate to) and `vpn-zone-seccomp` (the filter, and its own
-//! selftest).
+//! C program there, `fs_sandbox` a two-hundred-line shell script, `cli` the
+//! seven-hundred-line `vpn-zone` one, and `picker` and `gui` the last shell in
+//! the project: there is no Python, no C and no logic in shell left anywhere.
+//! Five binaries drive all of it: `vpn-zone` (the CLI), `vpn-zone-pick` (the
+//! picker), `vpn-zone-gui` (the launcher entries), `vpn-zone-core` (what the CLI
+//! and the systemd unit delegate to) and `vpn-zone-seccomp` (the filter, and its
+//! own selftest).
 
 pub mod cli;
 pub mod config;
 pub mod desktop;
+pub mod dialog;
 pub mod fs_sandbox;
+pub mod gui;
 pub mod launch;
+pub mod picker;
 pub mod profile;
 pub mod registry;
 pub mod seccomp;

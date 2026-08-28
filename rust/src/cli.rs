@@ -214,7 +214,11 @@ fn safe_zone_name(name: &OsStr) -> bool {
 
 /// Entries of a directory whose names do not start with a dot, sorted — the set
 /// and the order of a shell glob.
-fn visible_entries(dir: &Path) -> Vec<PathBuf> {
+///
+/// Public because the picker and the GUI walk the same directories and have to
+/// see them in the same order: a menu that lists the zones differently from
+/// `vpn-zone list` would be a bug report waiting to happen.
+pub fn visible_entries(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(dir) else {
         return out;
@@ -232,7 +236,10 @@ fn visible_entries(dir: &Path) -> Vec<PathBuf> {
 /// Disk usage of a directory tree, in bytes, the way `du` counts it: allocated
 /// blocks rather than apparent size, directories included, hard links counted
 /// once, symlinks not followed.
-fn tree_size(path: &Path) -> u64 {
+///
+/// Public for the container removal dialog, which shows the same sizes as
+/// `vpn-zone profile list`.
+pub fn tree_size(path: &Path) -> u64 {
     fn walk(path: &Path, seen: &mut Vec<(u64, u64)>, total: &mut u64) {
         let Ok(meta) = fs::symlink_metadata(path) else {
             return;
@@ -263,7 +270,7 @@ fn tree_size(path: &Path) -> u64 {
 
 /// `du -h`: powers of 1024, one decimal below ten, rounded UP, no unit letter
 /// below a kilobyte.
-fn human_size(bytes: u64) -> String {
+pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 7] = ["", "K", "M", "G", "T", "P", "E"];
     let mut value = bytes as f64;
     let mut unit = 0;

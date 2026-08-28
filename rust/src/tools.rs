@@ -77,6 +77,9 @@ pub struct Tools {
     pub unshare: PathBuf,
     pub ip: PathBuf,
     pub kdialog: PathBuf,
+    /// `notify-send`: how the GUI shortcuts report what they did. Only
+    /// `vpn-zone-gui` runs it — the CLI says the same things on stdout.
+    pub notify_send: PathBuf,
     /// The three the filesystem sandbox is given on its command line. The CLI
     /// does not run them itself; it passes them on to `vpn-zone-core
     /// fs-sandbox`, which is what the zone holder's unit does with `--ip` and
@@ -88,7 +91,7 @@ pub struct Tools {
 
 /// The keys of the manifest, in the order they are reported. Kept next to the
 /// struct so that `module/default.nix` and this file can be diffed by eye.
-const KEYS: [&str; 17] = [
+const KEYS: [&str; 18] = [
     "home",
     "state",
     "profiles",
@@ -103,6 +106,7 @@ const KEYS: [&str; 17] = [
     "unshare",
     "ip",
     "kdialog",
+    "notify-send",
     "bwrap",
     "dbus-proxy",
     "xwayland",
@@ -188,6 +192,7 @@ impl Tools {
             unshare: take("unshare")?,
             ip: take("ip")?,
             kdialog: take("kdialog")?,
+            notify_send: take("notify-send")?,
             bwrap: take("bwrap")?,
             dbus_proxy: take("dbus-proxy")?,
             xwayland: take("xwayland")?,
@@ -517,6 +522,7 @@ mod tests {
         let tools = Tools::from_entries(Path::new("/m.json"), &entries).unwrap();
         assert_eq!(tools.home, PathBuf::from("/p/home"));
         assert_eq!(tools.systemd_run, PathBuf::from("/p/systemd-run"));
+        assert_eq!(tools.notify_send, PathBuf::from("/p/notify-send"));
         assert_eq!(tools.dbus_proxy, PathBuf::from("/p/dbus-proxy"));
         assert_eq!(tools.core, PathBuf::from("/p/core"));
     }

@@ -300,7 +300,11 @@ pub fn app_word(cmd: &[OsString]) -> Option<&OsStr> {
 
 /// `[A-Za-z_]*=*` as a shell glob: a name-looking word with an equals sign
 /// somewhere after the first character.
-fn is_assignment(word: &[u8]) -> bool {
+///
+/// Public because the picker derives its memory key the same way when a launch
+/// did not come from a shortcut (`crate::picker::fallback_key`), and the two
+/// must not drift apart.
+pub fn is_assignment(word: &[u8]) -> bool {
     matches!(word.first(), Some(b) if b.is_ascii_alphabetic() || *b == b'_')
         && word[1..].contains(&b'=')
 }
@@ -372,9 +376,10 @@ fn env_nonempty(name: &str) -> Option<OsString> {
 /// Is there a graphical session to show a dialog on?
 ///
 /// Without one `kdialog` dies immediately, and treating that as "the user
-/// cancelled" turned a launch from a terminal into silence. Same test as the
-/// picker and the filesystem sandbox make. (`docs/GOTCHAS.md` §5, §6)
-fn has_display() -> bool {
+/// cancelled" turned a launch from a terminal into silence. The picker and the
+/// filesystem sandbox make the same test, and this is the one they make.
+/// (`docs/GOTCHAS.md` §5, §6)
+pub fn has_display() -> bool {
     env_nonempty("WAYLAND_DISPLAY").is_some() || env_nonempty("DISPLAY").is_some()
 }
 

@@ -28,6 +28,55 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   the program's name.
 
 ### Changed
+- **The picker and the GUI are Rust now — THE END OF BASH.** The last two
+  pieces of shell logic in the project are gone: the four-hundred-line
+  `vpn-zone-pick` and the six `writeShellScriptBin` wrappers behind the launcher
+  entries. What replaces them is two more binaries in the crate,
+  `vpn-zone-pick` (`rust/src/picker.rs`) and `vpn-zone-gui`
+  (`rust/src/gui.rs`), plus the `kdialog`/`notify-send` shapes they share
+  (`rust/src/dialog.rs`). Parity is the point, again: the same three levels of
+  memory in the same files under `~/.local/state/vpn-zones`, the same menu
+  entries in the same order with the same Russian texts, the same
+  `VPN_ZONE_ASK` / `VPN_ZONE_PROFILE` hand-over across the re-exec of "⚙
+  Сменить контейнер", the same `.desktop` argument shapes (`--id`, `--label`,
+  and the legacy leading label), and the same `vpn-zone run` command line at the
+  end of it. `module/default.nix` went from 1279 lines to 520 and holds no logic
+  at all any more — three two-line wrappers that point `VPN_ZONE_TOOLS` at the
+  manifest and `exec` a binary.
+  What changed underneath:
+  - **the decision is a pure function now.** "Which network, which container"
+    is computed from a snapshot of the memory (`Memory` → `net_step`,
+    `container_without_dialog`, `Container::from_selector`), so every branch of
+    the machine — including all ten fixed in the launch-flow audit above — is a
+    test case instead of a click. The menus are pure functions too, asserted
+    entry by entry, because their ORDER is what a person navigates by;
+  - **end-to-end scenarios run in CI.** `rust/tests/picker_cli.rs` drives the
+    real binary against a fake manifest, a `kdialog` that answers from a queue
+    and a `vpn-zone` that records its arguments: a fresh program, a pinned
+    network, "change container" through the re-exec, unpinning, a cancel, no
+    graphical session, and a program that is already running. The invariant
+    asserted every time is the one the audit was about — each scenario ends
+    either in a recorded `exec` or in an explicit cancel, never in silence.
+    `rust/tests/vpn_zone_gui_cli.rs` does the same for the six shortcuts;
+  - **the six shortcuts are one binary with six verbs**, and their `.desktop`
+    entries call it directly: `Exec=env VPN_ZONE_TOOLS=… …/vpn-zone-gui add`.
+    Those entries are written by home-manager and rewritten on every switch, so
+    a store path in them cannot go stale — unlike the entries our own `sync`
+    generates, which keep the profile paths of `vpn-zone` and `vpn-zone-pick`
+    for exactly that reason;
+  - **`notify-send` joined the manifest** (`notify-send` key) — it is the one
+    tool only the GUI runs.
+
+  Three deliberate behaviour differences, all small:
+  - the "занят сетью …" note in the container menu now actually appears. It was
+    read out of a container's `inuse` file, which nothing has written for a long
+    time; the launch registry — the same source `vpn-zone profile list` uses —
+    answers it as well now, and the `inuse` file is still read first;
+  - `vpn-zone-gui add` calls the CLI through the profile path like every other
+    dialog, where the shell version of that one wrapper used the store path;
+  - a memory file that cannot be written (a full disk, a permission) is a line
+    on stderr instead of the end of the launch. Under `set -e` the shell died
+    there, silently, after every dialog had been answered.
 - **The `vpn-zone` command line is Rust now.** The seven-hundred-line
   `writeShellScriptBin vpn-zone` of `module/default.nix` is gone; the crate
   grew a third binary of the same name (`rust/src/cli.rs` for the verbs,
@@ -213,6 +262,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   local resolver is unreachable through the tunnel (names just stopped
   resolving). The zone now gets public resolvers (1.1.1.1, 9.9.9.9) reached
   via the tunnel, with a note in the zone log.
+
+### Removed
+- The last `writeShellScriptBin`s that held any logic: `vpn-zone-pick` and the
+  six GUI wrappers (`vpn-zone-add-gui`, `vpn-zone-remove-gui`,
+  `vpn-zone-profile-add-gui`, `vpn-zone-profile-rm-gui`,
+  `vpn-zone-settings-gui`, `vpn-zone-forget-gui`). What is left in
+  `module/default.nix` is three wrappers of two lines each — `vpn-zone`,
+  `vpn-zone-pick` (both of which must own their name in the profile, because
+  the generated shortcuts point at those paths) and `vpn-zone-sync` — plus the
+  packaging. With them went the last runtime uses of `grep`, `sed`, `basename`,
+  `cat`, `ls`, `du` and `sleep`: the module no longer references coreutils,
+  gnused or gnugrep for anything but the `env` in a `.desktop` line.
 
 ### Added
 - Seccomp filter in the filesystem sandbox. It now compiles a BPF

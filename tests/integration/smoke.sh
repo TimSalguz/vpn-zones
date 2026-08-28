@@ -19,9 +19,11 @@
 # интерфейсов нет, утечка невозможна не по правилу, а по отсутствию пути.
 #
 # Тест использует зоны с именами smoke, smoke-crlf, offsmoke в
-# ~/.local/state/vpn-zones, профиль smoketest-prof в ~/.local/state/vpn-profiles
-# и набор доступов smoke-fsapp в ~/.config/vpn-zones/fs-perms — и удаляет их же
-# в начале.
+# ~/.local/state/vpn-zones, профиль smoketest-prof в ~/.local/state/vpn-profiles,
+# набор доступов smoke-fsapp в ~/.config/vpn-zones/fs-perms и память пикера по
+# ключу smoke-pickapp (.last/.lastprofile/.labels) — и удаляет их же в начале.
+# Настройки пользователя (~/.config/vpn-zones/default и прочие) НЕ трогает: на
+# рабочей машине это его настоящая конфигурация.
 set -euo pipefail
 
 step() { printf '\n==> %s\n' "$*"; }
@@ -40,6 +42,9 @@ MARKER="$HOME/.config/vpn-smoke-marker"
 FSAPP=smoke-fsapp
 FSPERMS="$HOME/.config/vpn-zones/fs-perms/$FSAPP"
 FSMARKER="$HOME/vpn-smoke-fs-marker"
+# Синтетический ключ программы для проверки пикера: свои файлы памяти в общем
+# каталоге состояния, чужих (настоящих) не касаемся.
+PICKKEY=smoke-pickapp
 HOLDER_PIDS=()
 
 cleanup() {
@@ -68,6 +73,9 @@ cleanup() {
   # убрать его всё равно надо — чужого файла с таким именем не бывает.
   rm -rf "${PROFILES:?}/$TEST_PROFILE" "${STATE:?}/.running/$TEST_PROFILE"
   rm -f "$MARKER" "$FSPERMS" "$FSMARKER"
+  # Память пикера по синтетическому ключу — свои файлы, чужих здесь не бывает.
+  rm -f "${STATE:?}/.last/$PICKKEY" "${STATE:?}/.lastprofile/$PICKKEY" \
+        "${STATE:?}/.labels/$PICKKEY"
   if [ "$rc" -ne 0 ]; then
     for z in smoke offsmoke; do
       if [ -s "$WORK/holder-$z.log" ]; then
@@ -89,10 +97,12 @@ build() {
     -A "$1" -o "$WORK/$2" >/dev/null
 }
 build scripts.vpn-zone vpn-zone
+build scripts.vpn-zone-pick vpn-zone-pick
 build zoneHolder zone-holder
 build smokeTools tools
 
 VPN_ZONE="$WORK/vpn-zone/bin/vpn-zone"
+VPN_ZONE_PICK="$WORK/vpn-zone-pick/bin/vpn-zone-pick"
 ZONE_HOLDER="$WORK/zone-holder/bin/zone-holder"
 WG="$WORK/tools/bin/wg"
 IP="$WORK/tools/bin/ip"
@@ -119,6 +129,8 @@ for z in "${TEST_ZONES[@]}"; do
 done
 rm -rf "${PROFILES:?}/$TEST_PROFILE" "${STATE:?}/.running/$TEST_PROFILE"
 rm -f "$MARKER" "$FSPERMS" "$FSMARKER"
+rm -f "${STATE:?}/.last/$PICKKEY" "${STATE:?}/.lastprofile/$PICKKEY" \
+      "${STATE:?}/.labels/$PICKKEY"
 
 # --- 2. Синтетический конфиг -------------------------------------------------
 step "Генерирую синтетический конфиг WireGuard (без DNS=, без обфускации)"
@@ -382,6 +394,40 @@ env -u WAYLAND_DISPLAY -u DISPLAY "$FSCORE" fs-sandbox \
 [ "$fsrc" -eq 42 ] || fail "ожидался код выхода программы (42), получен $fsrc"
 [ ! -e "$WORK/kdialog-was-called" ] || fail "kdialog вызвался при готовом файле доступов"
 echo "ok: без шины запуск живёт, код выхода 42 донесён"
+
+# --- 6в. Пикер сети без графики ----------------------------------------------
+# Пикер интерактивен, и проверять здесь можно ровно одно: ветку «спросить
+# негде». Она не косметическая — это недавний фикс: без графики kdialog падает
+# сразу, а «|| exit 0» принимал это за отмену, и запуск из терминала или из
+# юнита тихо заканчивался ничем. Теперь берётся то, что было бы выделено в
+# меню (прошлый выбор, иначе общий дефолт), и об этом говорится в stderr.
+#
+# ПОЧЕМУ ИМЕННО direct, А НЕ offline. Ветка offline поднимает зону через
+# `systemctl --user`, которого на раннере нет вовсе (сессионного systemd в
+# контейнере CI не бывает) — тест падал бы не по делу. При выборе direct пикер
+# НИЧЕГО не поднимает и не зовёт `vpn-zone run`: он становится самой командой
+# (exec), потому что «прямой интернет» — это отсутствие зоны. Ассерт получается
+# точный и ни от чего не зависящий.
+#
+# Выбор задаётся файлом памяти .last у синтетического ключа, а не командой
+# `vpn-zone default`: смоук гоняют и на рабочей машине, а `default` — настоящая
+# настройка пользователя, её трогать нельзя. Файл памяти на своём ключе — нет.
+step "Пикер без графики: берёт прошлый выбор и исполняет команду сама"
+mkdir -p "$STATE/.last"
+printf '%s' direct > "$STATE/.last/$PICKKEY"
+pickout=$(env -u WAYLAND_DISPLAY -u DISPLAY -u VPN_ZONE_ASK -u VPN_ZONE_PROFILE \
+  -u VPN_ZONE_CURRENT "$VPN_ZONE_PICK" --label "Смоук-программа" --id "$PICKKEY" \
+  -- sh -c 'echo ПИКЕР-ЗАПУСТИЛ' 2>"$WORK/pick.err") \
+  || fail "пикер без графики завершился с ошибкой (см. $WORK/pick.err)"
+echo "${pickout:-<пусто>}"
+[ "$pickout" = "ПИКЕР-ЗАПУСТИЛ" ] || fail "пикер не исполнил команду: $pickout"
+grep -q 'спросить негде' "$WORK/pick.err" \
+  || fail "пикер не сказал, что спрашивать негде: $(cat "$WORK/pick.err")"
+# Метку он обязан записать: из неё берутся имена программ в диалогах и в
+# списке сброса закреплений (там иначе виден ключ ярлыка).
+[ "$(cat "$STATE/.labels/$PICKKEY" 2>/dev/null)" = "Смоук-программа" ] \
+  || fail "пикер не записал метку в $STATE/.labels/$PICKKEY"
+echo "ok: без графики выбран direct, команда исполнена, метка записана"
 
 # --- 7. Offline-зона ---------------------------------------------------------
 step "Создаю offline-зону offsmoke (как это делает пикер: mkdir + touch offline)"
