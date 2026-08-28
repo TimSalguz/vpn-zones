@@ -915,7 +915,7 @@ fn profile(tools: &Tools, args: &[OsString]) -> u8 {
                 eprintln!("профиля {} нет", name.to_string_lossy());
                 return 1;
             }
-            if let Err(e) = fs::remove_dir_all(&dir) {
+            if let Err(e) = crate::sys::remove_tree(&dir) {
                 eprintln!("не удалить {}: {e}", dir.display());
                 return 1;
             }
@@ -1064,7 +1064,7 @@ fn forget(tools: &Tools, args: &[OsString]) -> u8 {
     };
     if what == "--all" {
         for sub in SUBDIRS {
-            let _ = fs::remove_dir_all(tools.state.join(sub));
+            let _ = crate::sys::remove_tree(&tools.state.join(sub));
         }
         println!("сброшено для всех программ");
     } else {
