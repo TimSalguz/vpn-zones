@@ -28,6 +28,56 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   the program's name.
 
 ### Changed
+- **The `vpn-zone` command line is Rust now.** The seven-hundred-line
+  `writeShellScriptBin vpn-zone` of `module/default.nix` is gone; the crate
+  grew a third binary of the same name (`rust/src/cli.rs` for the verbs,
+  `rust/src/launch.rs` for `run`, `rust/src/registry.rs` for the launch
+  registry). Parity is the point: the same verbs and flags, the same Russian
+  messages word for word, the same exit codes (`check` still answers 0 alive /
+  1 no handshake / 2 zone down / 3 state unknown, and it is meant to be
+  scripted against), the same files under `~/.local/state/vpn-zones`, and the
+  same registry format `pid zone selector` written under the same `flock` on
+  the same `.lock` file — so the picker and the GUI wrappers, which are still
+  shell, keep working through the same profile path without a change.
+  What changed underneath:
+  - **tool paths arrive in a manifest instead of being interpolated.** String
+    interpolation by Nix is the one thing a compiled binary cannot do, and
+    absolute paths are mandatory (part of what is started runs inside a
+    namespace where `PATH` can be anything). Nix now writes them into a small
+    flat JSON in the store and a two-line `writeShellScriptBin` wrapper points
+    `VPN_ZONE_TOOLS` at it and execs the binary. The parser is written out by
+    hand — the format is ours and flat, and it is read on the startup path of
+    every program launched into a zone — and a missing key is a loud error
+    naming it, never a silent default;
+  - **the CLI no longer depends on `PATH` at all.** The wrapper carries no
+    `PATH` of its own, and `du`, `mktemp`, `pgrep`, `flock`, `sed`, `grep`,
+    `awk` and `basename` are gone from the runtime: sizes, temporary
+    directories, the process scan, the locking and the parsing are code now,
+    with unit tests for the parts that used to be one-liners (the `run`
+    argument grammar, the app-id extraction with all its traps, the registry
+    rewrite and gc criteria, the manifest parser, the `check` handshake
+    scan);
+  - **packaging:** the crate's `bin/vpn-zone` would collide with the wrapper of
+    the same name in `home.packages`, so the crate no longer goes into the
+    profile whole — a small symlink farm (`vpn-zone-helpers`) puts
+    `vpn-zone-core` and `vpn-zone-seccomp` there, and the CLI comes through the
+    wrapper.
+
+  Four deliberate behaviour differences, all small:
+  - `vpn-zone add` validates the config with the crate's parser instead of
+    grepping for `[Interface]`. A file that cannot be parsed (or is not UTF-8)
+    is refused right there, with the reason, instead of producing a zone that
+    fails to start later. Everything that parsed before still parses;
+  - `vpn-zone status` exits 0 for a zone whose `status` mirror does not exist
+    yet. The shell version exited 1 there by accident — a trailing
+    `[ -f … ] && { … }` was the last command of the branch;
+  - directory sizes in `profile list` and `sandbox list` come from our own
+    tree walk rather than `du -sh`. Same accounting (512-byte blocks, hard
+    links counted once, symlinks not followed) and the same round-up
+    formatting, but the last digit may differ from `du` in odd cases;
+  - a missing or broken manifest is a new failure mode of its own: exit code 2
+    with a message naming the file. `vpn-zone --help` deliberately works
+    without one.
 - The filesystem sandbox is Rust now. The two-hundred-line `vpn-fs-sandbox`
   shell script of `module/default.nix` is gone; `vpn-zone run --fs-sandbox` (and
   `--sandbox <name>`) calls `vpn-zone-core fs-sandbox` instead, with the tool

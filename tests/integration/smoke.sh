@@ -288,23 +288,32 @@ step "vpn-zone profile rm $TEST_PROFILE"
 # бывший shell-скрипт vpn-fs-sandbox. Зона тут ни при чём: песочница ФС —
 # отдельный слой, и запускается она в обычной сети раннера.
 #
-# Пути инструментов НЕ собираются отдельно, а грепаются из собранного текста
-# vpn-zone: они зашиты туда флагами (--bwrap/--dbus-proxy/--kdialog/--xwayland),
-# и так тест проверяет ровно то, что поедет пользователю, а не свою сборку.
-step "Песочница ФС: достаю пути инструментов из собранного vpn-zone"
+# Пути инструментов НЕ собираются отдельно, а достаются из МАНИФЕСТА — того
+# самого JSON, на который показывает обёртка vpn-zone (VPN_ZONE_TOOLS). Так тест
+# проверяет ровно то, что поедет пользователю, а не свою сборку. Раньше они
+# грепались из текста shell-скрипта vpn-zone; скрипта больше нет, есть бинарь и
+# двухстрочная обёртка к нему.
+step "Песочница ФС: достаю пути инструментов из манифеста собранного vpn-zone"
 # «grep -m1 -o», а не «grep -o | head -1»: под set -o pipefail head, закрывший
 # трубу первым, обрекает пайплайн на 141, и весь смоук падал бы по случайности
 # размера вывода. -m1 останавливает сам grep, а искомых подстрок в первой же
 # подходящей строке ровно по одной.
-FSCORE=$(grep -m1 -o '/nix/store/[^ "]*/bin/vpn-zone-core' "$VPN_ZONE")
-FSBWRAP=$(grep -m1 -o -- '--bwrap [^ ]*' "$VPN_ZONE"); FSBWRAP=${FSBWRAP#--bwrap }
-FSPROXY=$(grep -m1 -o -- '--dbus-proxy [^ ]*' "$VPN_ZONE"); FSPROXY=${FSPROXY#--dbus-proxy }
+TOOLS=$(grep -m1 -o '/nix/store/[^ "]*-vpn-zone-tools.json' "$VPN_ZONE")
+[ -n "$TOOLS" ] && [ -f "$TOOLS" ] || fail "в обёртке vpn-zone нет пути к манифесту инструментов"
+# Плоский JSON «ключ: значение» — «|| true» на случай отсутствующего ключа:
+# пустое значение поймает общая проверка ниже и скажет, какого именно нет.
+tool() {
+  grep -m1 -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$TOOLS" \
+    | sed 's/.*:[[:space:]]*"//; s/"$//' || true
+}
+FSCORE=$(tool core)
+FSBWRAP=$(tool bwrap)
+FSPROXY=$(tool dbus-proxy)
 # Оболочка и coreutils для команды ВНУТРИ песочницы: /usr и /bin туда не
-# пробрасываются, поэтому «sh» и «ls» обязаны быть store-путями. Берём их из
-# того же текста: шебанг скрипта — это bash, а PATH в его первых строках
-# начинается с каталога coreutils.
+# пробрасываются, поэтому «sh» и «ls» обязаны быть store-путями. Шебанг обёртки
+# — это bash, а ls берём из тех же smokeTools, откуда nsenter и ip.
 FSSH=$(head -1 "$VPN_ZONE" | sed 's|^#!||')
-FSCOREUTILS=$(grep -m1 -o '/nix/store/[^:" ]*-coreutils[^:" ]*/bin' "$VPN_ZONE")
+FSCOREUTILS="$WORK/tools/bin"
 for v in FSCORE FSBWRAP FSPROXY FSSH FSCOREUTILS; do
   [ -n "${!v}" ] || fail "не нашёл $v в тексте собранного vpn-zone"
 done

@@ -1,10 +1,21 @@
 //! Core of vpn-zones: rootless network zones with VPN, data containers and
 //! sandboxes (see `ROADMAP.md`).
 //!
-//! The user-facing CLI is still the bash/Nix module in `module/`; this crate is
-//! the Rust core it is being replaced with, one piece at a time, and the bash
-//! version stays in charge of a piece until parity is proven. What is here:
+//! The project used to be a Nix module full of shell; this crate is what it has
+//! been replaced with, one piece at a time, and each piece stayed in shell until
+//! parity was proven. What is left in `module/` is the network picker, the
+//! kdialog wrappers and the packaging. What is here:
 //!
+//! * [`cli`] — the `vpn-zone` command line itself: the zone verbs, the
+//!   containers, the sandboxes, the settings and the garbage collection;
+//! * [`launch`] — `vpn-zone run`, from the delegation of a launch that comes
+//!   from inside a zone to the `execvp` into `nsenter`
+//!   (`docs/GOTCHAS.md` §1, §5, §7, §13);
+//! * [`registry`] — the "who runs where" registry the launches keep under
+//!   `flock`, read by the picker and by the throwaway containers
+//!   (`docs/GOTCHAS.md` §5);
+//! * [`tools`] — the manifest of absolute tool paths Nix hands the CLI in one
+//!   environment variable (`docs/GOTCHAS.md` §12);
 //! * [`zone`] — the life cycle of a zone: the user namespace with its double
 //!   mapping, the net+mount namespace, pasta, the tunnel, DNS and the state
 //!   mirror. This is what `vpn-zone@<name>.service` starts
@@ -26,15 +37,22 @@
 //! * [`sys`] — the handful of syscalls more than one of them needs.
 //!
 //! `profile` and `desktop` were Python scripts in `module/`, `wl_sandbox` was a
-//! C program there and `fs_sandbox` was a two-hundred-line shell script; the
-//! project has no Python and no C left. All of them are driven by the
-//! `vpn-zone-core` binary, which the bash `vpn-zone` and the systemd unit call.
+//! C program there, `fs_sandbox` a two-hundred-line shell script and `cli` the
+//! seven-hundred-line `vpn-zone` one; the project has no Python and no C left,
+//! and no shell outside the picker and the GUI wrappers. Three binaries drive
+//! all of it: `vpn-zone` (the CLI), `vpn-zone-core` (what the CLI and the
+//! systemd unit delegate to) and `vpn-zone-seccomp` (the filter, and its own
+//! selftest).
 
+pub mod cli;
 pub mod config;
 pub mod desktop;
 pub mod fs_sandbox;
+pub mod launch;
 pub mod profile;
+pub mod registry;
 pub mod seccomp;
 pub mod sys;
+pub mod tools;
 pub mod wl_sandbox;
 pub mod zone;

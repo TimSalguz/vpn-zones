@@ -136,6 +136,10 @@ in
       iproute2
       util-linux
       passt
+      # Не для самой зоны: coreutils нужен КОМАНДЕ ВНУТРИ песочницы ФС — там
+      # своя /tmp и никакого /usr, поэтому `ls` обязан быть store-путём. Раньше
+      # он грепался из текста shell-скрипта vpn-zone, а тот теперь бинарь.
+      coreutils
     ];
     pathsToLink = [ "/bin" ];
   };

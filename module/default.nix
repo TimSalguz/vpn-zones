@@ -114,13 +114,17 @@ let
   # /.flatpak-info, фильтр сессионной шины и свой X-сервер
   # (`vpn-zone-core fs-sandbox`, rust/src/fs_sandbox.rs). Seccomp-фильтр она
   # теперь собирает В СВОЁМ ПРОЦЕССЕ (крейт зовётся как библиотека), а не
-  # запускает vpn-zone-seccomp сабпроцессом. На bash остались CLI, пикер и
-  # GUI-обвязка.
+  # запускает vpn-zone-seccomp сабпроцессом.
   #
-  # Два бинаря: vpn-zone-seccomp (фильтр отдельной командой — он же selftest) и
+  # Последним переехал сам CLI `vpn-zone` — семьсот строк bash из части 3 этого
+  # файла (rust/src/cli.rs + launch.rs + registry.rs). На bash остались пикер и
+  # GUI-обвязка, и они зовут CLI по прежнему пути профиля.
+  #
+  # Три бинаря: vpn-zone-seccomp (фильтр отдельной командой — он же selftest),
   # vpn-zone-core (подкоманды zone-holder, profile-run, sync, wl-sandbox и
-  # fs-sandbox). Со скриптом vpn-zone имена не сталкиваются — всё спокойно
-  # лежит в home.packages.
+  # fs-sandbox) и vpn-zone (сам CLI). ПОСЛЕДНИЙ ИМЕНЕМ СТАЛКИВАЕТСЯ с обёрткой
+  # из home.packages, поэтому крейт целиком туда не кладётся — в профиль уходит
+  # symlink-набор vpn-zone-helpers (см. часть 3).
   vpn-zone-rust = pkgs.rustPlatform.buildRustPackage {
     pname = "vpn-zone-rust";
     version = "0.1.0";
@@ -180,15 +184,11 @@ let
   # является: программа берётся из nixpkgs и видит /nix/store, так что
   # «подменить библиотеку» песочница не мешает — она мешает читать ТВОИ файлы.
   #
-  # Пути инструментов подставляются флагами, как и у держателя зоны: часть кода
-  # исполняется внутри namespace, где PATH может быть каким угодно. Строка
-  # собирается один раз — её же дословно грепает смоук-тест, чтобы проверять
-  # ровно то, что поедет пользователю (tests/integration/smoke.sh).
-  fsSandboxTools =
-    "--bwrap ${pkgs.bubblewrap}/bin/bwrap"
-    + " --dbus-proxy ${pkgs.xdg-dbus-proxy}/bin/xdg-dbus-proxy"
-    + " --kdialog ${kdialog}"
-    + " --xwayland ${pkgs.xwayland-satellite}/bin/xwayland-satellite";
+  # Пути инструментов песочница получает флагами, как и держатель зоны: часть
+  # кода исполняется внутри namespace, где PATH может быть каким угодно. Флаги
+  # ей передаёт CLI, а сами пути лежат в манифесте ниже (bwrap, dbus-proxy,
+  # kdialog, xwayland) — оттуда же их берёт смоук-тест, чтобы проверять ровно
+  # то, что поедет пользователю (tests/integration/smoke.sh).
 
   # --- ЧАСТЬ 1-2: ЖИЗНЕННЫЙ ЦИКЛ ЗОНЫ — В RUST ---
   # Здесь были два shell-скрипта: zoneHolder (создавал user namespace двойным
@@ -216,753 +216,70 @@ let
   # угодно.
 
   # --- ЧАСТЬ 3: пользовательский CLI ---
+  # Здесь лежали семьсот строк bash: add/up/down/list/status/check/run/gc,
+  # реестр запусков с flock, разбор флагов запуска и вся остальная россыпь
+  # команд. Всё переехало в крейт — `vpn-zone` (rust/src/cli.rs), запуск со
+  # всеми граблями (rust/src/launch.rs) и реестр (rust/src/registry.rs).
+  # Пользовательские тексты и коды выхода сохранены дословно: их читает человек
+  # в терминале, а `vpn-zone check` ещё и грепают. На bash остались пикер и
+  # GUI-обвязка.
+  #
+  # ПУТИ ИНСТРУМЕНТОВ — МАНИФЕСТОМ. Скомпилированный бинарь не умеет того, на
+  # чём стоял скрипт: подстановки строк Nix'ом. А абсолютные пути обязательны —
+  # часть кода работает внутри namespace, где PATH может быть каким угодно
+  # (docs/GOTCHAS.md §12). Поэтому Nix кладёт их в маленький JSON в store, а
+  # обёртка ниже показывает на него ЕДИНСТВЕННОЙ переменной окружения. Ключи
+  # перечислены в rust/src/tools.rs; отсутствие любого — внятная ошибка при
+  # старте, а не сюрприз посреди запуска программы.
+  vpn-zone-tools = pkgs.writeText "vpn-zone-tools.json" (
+    builtins.toJSON {
+      home = config.home.homeDirectory;
+      state = stateDir;
+      profiles = profilesDir;
+      sandboxes = "${config.home.homeDirectory}/.local/state/vpn-sandboxes";
+      config = "${config.home.homeDirectory}/.config/vpn-zones";
+      # ПРОФИЛЬНЫЕ пути, а не store: так разрывается зависимость по кругу
+      # (vpn-zone зовёт sync, sync подставляет vpn-zone в ярлыки) и ярлыки не
+      # протухают после каждой пересборки пакета (docs/GOTCHAS.md §10).
+      runner = "${config.home.profileDirectory}/bin/vpn-zone";
+      picker = "${config.home.profileDirectory}/bin/vpn-zone-pick";
+      # А ядро — наоборот, store-путём: оно версионируется вместе с CLI, и
+      # разъезжаться им нельзя.
+      core = "${vpn-zone-rust}/bin/vpn-zone-core";
+      systemctl = "${pkgs.systemd}/bin/systemctl";
+      systemd-run = "${pkgs.systemd}/bin/systemd-run";
+      nsenter = "${pkgs.util-linux}/bin/nsenter";
+      unshare = "${pkgs.util-linux}/bin/unshare";
+      ip = iproute;
+      inherit kdialog;
+      # Эти три CLI не запускает сам — он передаёт их флагами песочнице ФС,
+      # ровно как юнит передаёт держателю зоны --ip/--pasta.
+      bwrap = "${pkgs.bubblewrap}/bin/bwrap";
+      dbus-proxy = "${pkgs.xdg-dbus-proxy}/bin/xdg-dbus-proxy";
+      xwayland = "${pkgs.xwayland-satellite}/bin/xwayland-satellite";
+      # awg/wg/pasta здесь намеренно НЕТ: их зовёт только держатель зоны, и
+      # получает он их флагами ExecStart своего юнита. Дублировать пути в двух
+      # местах — значит однажды поменять их в одном.
+    }
+  );
+
+  # Обёртка в две строки: назначить манифест и стать бинарём. Имя vpn-zone
+  # занимает именно она — по нему CLI зовут пикер, GUI и ярлыки. Такой же
+  # bin/vpn-zone есть и в крейте, поэтому крейт целиком в профиль не кладётся
+  # (см. vpn-zone-helpers ниже), иначе два одинаковых имени столкнулись бы.
   vpn-zone = pkgs.writeShellScriptBin "vpn-zone" ''
-    set -eu
-    export PATH="${
-      lib.makeBinPath [
-        pkgs.coreutils
-        pkgs.util-linux
-        pkgs.gnugrep
-        pkgs.gnused
-        pkgs.gawk
-        pkgs.systemd
-      ]
-    }:${config.home.profileDirectory}/bin:$PATH"
-    root="${stateDir}"
-    # Профили живут ОТДЕЛЬНО от зон — в этом вся суть разделения: сеть можно
-    # сменить или удалить, а настроенное окружение остаётся.
-    profiles="${profilesDir}"
-    mkdir -p "$root" "$profiles"
+    export VPN_ZONE_TOOLS=${vpn-zone-tools}
+    exec ${vpn-zone-rust}/bin/vpn-zone "$@"
+  '';
 
-    usage() {
-      cat <<'EOF'
-    vpn-zone — сетевые зоны с VPN, без root
-
-      vpn-zone add <имя> <файл.conf>   создать зону из конфига AmneziaWG/WireGuard
-      vpn-zone up <имя>                поднять
-      vpn-zone down <имя>              опустить
-      vpn-zone list                    список зон и их состояние
-      vpn-zone status <имя>            подробности (адрес, handshake)
-      vpn-zone run <имя> -- <кмд>      запустить программу внутри зоны
-      vpn-zone rm <имя>                удалить зону вместе с ярлыками
-      vpn-zone sync                    пересобрать .desktop-ярлыки
-      vpn-zone mode <режим>            как ярлыки работают:
-                                         picker   — один ярлык, спрашивает сеть
-                                                    при запуске (по умолчанию)
-                                         per-zone — отдельный ярлык на каждую зону
-                                         both     — и то, и другое
-                                         off      — не трогать ярлыки вовсе
-      vpn-zone default <вариант>       что предлагать в пикере для незнакомой
-                                       программы: offline (по умолчанию), direct
-                                       или имя зоны
-      vpn-zone gc                      убрать зависшие держатели зон, осиротевшую
-                                       обвязку и мёртвые записи
-      vpn-zone perms list|reset <прог.|--all>
-                                       какие доступы к файлам выданы программам
-                                       в песочнице; reset — спросить заново
-      vpn-zone sandbox create|list|rm <имя>
-                                       именованные песочницы: свой дом, общий для
-                                       всех программ, запущенных в этой песочнице
-      vpn-zone run <имя> --sandbox <п> -- <кмд>
-                                       запустить в именованной песочнице
-      vpn-zone run <имя> --fs-sandbox -- <кмд>
-                                       запустить в песочнице файловой системы:
-                                       вместо $HOME — пустой каталог, наружу
-                                       видно только разрешённое, остальное — через
-                                       диалог выбора файла (порталы)
-      vpn-zone run <имя> --tmp-profile -- <кмд>
-                                       запустить в одноразовом контейнере: слой
-                                       создаётся в /tmp и стирается по выходе
-      vpn-zone default-profile <v>     контейнер по умолчанию для всех запусков:
-                                       ask (спрашивать), main (основной),
-                                       own (своя песочница у каждой программы)
-                                       или имя контейнера
-      vpn-zone pins                    какие программы закреплены за сетями
-      vpn-zone forget <прог.|--all>    снять закрепление (снова будет спрашивать)
-      vpn-zone isolate <overlay|off>   свой слой профиля у зоны (overlay — по
-                                       умолчанию). Без него браузер откроет окно
-                                       в уже запущенном процессе, мимо VPN
-      vpn-zone reset-profile <имя>     очистить слой профиля зоны
-      vpn-zone wayland-sandbox on|off  отбирать ли у программ захват экрана,
-                                       чтение буфера в фоне и эмуляцию ввода
-                                       (по умолчанию on; исключения —
-                                       ~/.config/vpn-zones/wayland-allow)
-      vpn-zone check <имя>             прошло ли рукопожатие (жив ли конфиг)
-      vpn-zone lock|unlock <имя>       запретить/разрешить программам этой зоны
-                                       запускать что-либо в ДРУГИХ сетях
-                                       (по умолчанию разрешено)
-    EOF
-    }
-
-    zone_pid() {
-      p=$(cat "$root/$1/zone.pid" 2>/dev/null || true)
-      [ -n "''${p:-}" ] && [ -d "/proc/$p" ] && echo "$p"
-    }
-
-    cmd=''${1:-}; [ $# -gt 0 ] && shift || true
-    case "$cmd" in
-      add)
-        name=''${1:?нужно имя зоны}; conf=''${2:?нужен путь к .conf}
-        case "$name" in *[!a-zA-Z0-9_-]*) echo "имя только из букв, цифр, - и _" >&2; exit 1;; esac
-        [ -f "$conf" ] || { echo "нет файла $conf" >&2; exit 1; }
-        grep -qiE '^[[:space:]]*\[Interface\]' "$conf" || {
-          echo "$conf не похож на конфиг WireGuard/AmneziaWG" >&2; exit 1; }
-        mkdir -p "$root/$name"
-        # Копия, а не ссылка: конфиг с приватным ключом должен пережить и
-        # перемещение исходного файла, и его удаление.
-        #
-        # И сразу нормализуем переводы строк. Amnezia отдаёт .conf в формате
-        # Windows (CRLF) — проверено на настоящем файле: там 21 строка с \r.
-        # Без этого «\r» попадает В КОНЕЦ ЗНАЧЕНИЯ, и зона падает на первой же
-        # команде: `ip addr add 10.8.1.10/32<CR>` → «inet prefix is expected
-        # rather than "10.8.1.10/32"». Ошибка выглядит бессмысленно, потому что
-        # в сообщении возврат каретки не виден.
-        install -m 600 /dev/null "$root/$name/config.conf"
-        sed 's/\r$//' "$conf" > "$root/$name/config.conf"
-        echo "зона $name создана"
-        ;;
-      up)   name=''${1:?нужно имя}; systemctl --user start "vpn-zone@$name.service"
-            for _ in $(seq 1 100); do [ -f "$root/$name/ready" ] && break; sleep 0.1; done
-            if [ -f "$root/$name/ready" ]; then echo "зона $name поднята"
-            else echo "зона $name не поднялась — journalctl --user -u vpn-zone@$name" >&2; exit 1; fi
-            ;;
-      down) name=''${1:?нужно имя}; systemctl --user stop "vpn-zone@$name.service"; echo "зона $name опущена" ;;
-      list)
-        for d in "$root"/*/; do
-          [ -d "$d" ] || continue
-          n=$(basename "$d")
-          if [ -n "$(zone_pid "$n")" ]; then echo "$n — поднята"; else echo "$n — опущена"; fi
-        done
-        ;;
-      status)
-        name=''${1:?нужно имя}; p=$(zone_pid "$name" || true)
-        [ -n "''${p:-}" ] || { echo "зона $name не поднята"; exit 1; }
-        nsenter --preserve-credentials -U -n -m -t "$p" -- ${iproute} -br -4 addr show
-        # Состояние туннеля читаем из зеркала, которое пишет сама зона: изнутри
-        # под обычным uid `awg show` прав не имеет и молчит.
-        [ -f "$root/$name/status" ] && { echo; cat "$root/$name/status"; }
-        ;;
-      lock|unlock)
-        zname=''${1:?нужно имя зоны}
-        [ -d "$root/$zname" ] || { echo "зоны $zname нет" >&2; exit 1; }
-        if [ "$cmd" = "lock" ]; then
-          : > "$root/$zname/no-escape"
-          echo "зона $zname заперта: программы из неё не смогут запускать что-либо в других сетях"
-        else
-          rm -f "$root/$zname/no-escape"
-          echo "зона $zname открыта: запуск из неё в другой сети снова разрешён"
-        fi
-        ;;
-      check)
-        # «Этот конфиг вообще рабочий?» — короткий ответ по факту рукопожатия.
-        name=''${1:?нужно имя}
-        [ -n "$(zone_pid "$name" || true)" ] || { echo "зона $name не поднята"; exit 2; }
-        # Отличаем «рукопожатия нет» от «данных нет»: зеркало состояния пишет
-        # сама зона, и у зон, поднятых до его появления, файла просто не будет —
-        # без этой проверки check уверенно объявлял бы живой туннель мёртвым.
-        if [ ! -f "$root/$name/status" ]; then
-          echo "зона $name: состояние неизвестно — она поднята старой версией,"
-          echo "перезапусти её: vpn-zone down $name && vpn-zone up $name"
-          exit 3
-        fi
-        hs=$(grep -A20 "peer" "$root/$name/status" 2>/dev/null \
-          | grep -i "latest handshake" | head -1)
-        if [ -n "''${hs:-}" ]; then
-          echo "зона $name: туннель живой ($(echo "$hs" | sed 's/^ *//'))"
-        else
-          echo "зона $name: рукопожатия нет — конфиг мёртвый или сервер недоступен"
-          exit 1
-        fi
-        ;;
-      run)
-        # --- ЗАПУСК ИЗ ЗОНЫ: ДЕЛЕГИРУЕМ НАРУЖУ ---
-        # Симптом, из-за которого это появилось: в Telegram, запущенном в зоне,
-        # клик по ссылке открывал диалог выбора сети, а браузер не появлялся
-        # вовсе. Причина — ядро: процесс, уже находящийся в одном user+net
-        # namespace, НЕ МОЖЕТ перейти в другой («nsenter: reassociate to
-        # namespaces failed»). А «Прямой интернет» в этом случае молча
-        # наследовал сеть зоны, то есть прямым не был.
-        #
-        # Выход — попросить systemd --user: он живёт в корневом namespace, его
-        # сокет виден изнутри зоны, и запущенная им команда стартует снаружи.
-        # Оттуда переход в любую зону уже разрешён. Графическое окружение у него
-        # своё, полное (WAYLAND_DISPLAY, DBUS, XDG_RUNTIME_DIR) — проверено.
-        # ЗАМОК. Для VPN-зон выход наружу — удобство: программа в зоне и так
-        # видит весь $HOME, dbus и композитор, так что настоящей границы он не
-        # ломает. Но зона может быть карантинной (недоверенная программа) — тогда
-        # выпускать её запуски в другую сеть нельзя. `vpn-zone lock <зона>`
-        # ставит запрет: чужой выбор сети игнорируется, и всё, что программа
-        # запускает, остаётся в её же зоне.
-        if [ -n "''${VPN_ZONE_CURRENT:-}" ] && [ -z "''${VPN_ZONE_DELEGATED:-}" ]; then
-          if [ -f "$root/''${VPN_ZONE_CURRENT}/no-escape" ]; then
-            echo "зона ''${VPN_ZONE_CURRENT} заперта: запускаем в ней же, а не в «''${1:-?}»" >&2
-            # Никаких nsenter: мы УЖЕ внутри этой зоны, а войти в неё повторно
-            # из вложенного namespace ядро не даёт («reassociate to namespaces
-            # failed»). Просто отбрасываем аргументы выбора и запускаем.
-            # Профиль тоже отбрасывается: смонтировать слой отсюда нечем — прав
-            # на это внутри зоны уже нет.
-            shift
-            case "''${1:-}" in
-              --profile|-p) shift 2 ;;
-              --tmp-profile) shift; [ "''${1:-}" = "--join" ] && shift 2 ;;
-            esac
-            # Песочницу ФС отбрасываем тем же порядком, что и профиль, и это
-            # не украшение: без этой ветки «--sandbox <имя>» (или
-            # «--fs-sandbox») оставался в аргументах, «--» дальше не
-            # находилось, и exec пытался запустить сам флаг — «--sandbox: не
-            # найдено». Программа не открывалась вовсе, а сообщение уходило в
-            # stderr ярлыка, где его никто не видит.
-            case "''${1:-}" in
-              --fs-sandbox) shift ;;
-              --sandbox) shift 2 ;;
-            esac
-            [ "''${1:-}" = "--" ] && shift
-            [ $# -gt 0 ] || { echo "нечего запускать" >&2; exit 1; }
-            exec "$@"
-          else
-            # Идентификатор ярлыка передаём явно: systemd-run стартует юнит с
-            # окружением менеджера, а не нашим, и VPN_ZONE_APPID до него не
-            # доезжал. Из-за этого запуск, делегированный наружу (ссылка из
-            # мессенджера в зоне), заводил ОТДЕЛЬНЫЙ набор доступов к файлам и
-            # отдельную запись в реестре — та же программа переставала
-            # узнаваться.
-            exec systemd-run --user --quiet --collect \
-              --setenv=VPN_ZONE_DELEGATED=1 \
-              --setenv=VPN_ZONE_APPID="''${VPN_ZONE_APPID:-}" \
-              -- ${config.home.profileDirectory}/bin/vpn-zone run "$@"
-          fi
-        fi
-        name=''${1:?нужно имя}; shift
-        profile=""; profiledir=""; ephemeral=0; fssandbox=0
-        if [ "''${1:-}" = "--profile" ] || [ "''${1:-}" = "-p" ]; then
-          shift; profile=''${1:?нужно имя профиля}; shift
-          profiledir="$profiles/$profile"
-        elif [ "''${1:-}" = "--tmp-profile" ]; then
-          # Одноразовый контейнер: чистый слой на один запуск, стирается, когда
-          # из него выйдет ПОСЛЕДНЯЯ программа. Живёт в /tmp (у нас это btrfs на
-          # диске, а не tmpfs, поэтому кэш браузера не съест оперативку).
-          #
-          # --join <каталог> подсаживает ещё одну программу в уже открытый
-          # временный контейнер: так Chrome и Telegram могут делить одну разовую
-          # сессию. Без него каждый запуск получает свой чистый слой.
-          shift
-          if [ "''${1:-}" = "--join" ]; then
-            shift; profiledir=''${1:?нужен каталог временного контейнера}; shift
-            [ -d "$profiledir" ] || { echo "временного контейнера $profiledir уже нет" >&2; exit 1; }
-          else
-            profiledir=$(mktemp -d /tmp/vpn-profile-XXXXXXXX)
-          fi
-          profile=$(basename "$profiledir")
-          ephemeral=1
-        fi
-        sbname=""
-        if [ "''${1:-}" = "--fs-sandbox" ]; then shift; fssandbox=1
-        elif [ "''${1:-}" = "--sandbox" ]; then
-          shift; sbname=''${1:?нужно имя песочницы}; shift; fssandbox=1
-        fi
-        [ "''${1:-}" = "--" ] && shift
-
-        [ $ephemeral -eq 0 ] && [ -n "$profile" ] && [ ! -d "$profiledir" ] && {
-          echo "профиля $profile нет — создай: vpn-zone profile create $profile" >&2; exit 1; }
-
-        # --- ЗАЩИТА ОТ «ДУМАЛ, ЧТО ПОД VPN» ---
-        # Соль проблемы: у браузеров и мессенджеров один процесс на профиль.
-        # Запустил Chrome без VPN, потом его же в зоне — второй процесс находит
-        # сокет первого, отдаёт ему «открой окно» и выходит. И вот что делает
-        # это опасным: окно ОТКРЫВАЕТСЯ и выглядит совершенно нормально, ничего
-        # не падает и не ругается. Просто рисует его старый процесс, в старой
-        # сети — то есть человек уверен, что сидит под VPN, а он нет. А вот alacritty так себя не ведёт: у него каждое окно — свой
-        # процесс, и две сети рядом работают нормально.
-        #
-        # Отличить одно от другого заранее нельзя: это свойство программы, а не
-        # системы, и списком его не покрыть — именно поэтому здесь ПРЕДУПРЕЖДЕНИЕ
-        # с выбором, а не запрет. Кто ведёт себя как alacritty — отмечается
-        # галочкой «не спрашивать», и больше вопрос не всплывает.
-        #
-        # Проверяем в пределах ОДНОГО профиля (основной тоже профиль — ключ
-        # __main__): разные профили не пересекаются по сокетам и мешать друг
-        # другу не могут.
-        # --- ОГРАНИЧЕНИЕ ДОСТУПА К КОМПОЗИТОРУ ---
-        # По умолчанию программа запускается через wl-sandbox (подкоманда
-        # vpn-zone-core, бывшая программа на C): композитор
-        # перестаёт выдавать ей протоколы слежки (захват экрана, чтение буфера в
-        # фоне, эмуляция ввода, список чужих окон — проверено, 47 протоколов
-        # против 33). Обычная работа не страдает: свои окна, ввод в них, буфер по
-        # Ctrl+C/Ctrl+V, GPU и звук остаются.
-        #
-        # Исключения нужны тем, кто этими протоколами и живёт: скриншотилкам,
-        # менеджеру буфера, записи экрана. Список правится в
-        # ~/.config/vpn-zones/wayland-allow, по программе на строку.
-        wlmode=$(cat "${config.home.homeDirectory}/.config/vpn-zones/wayland-sandbox" 2>/dev/null || echo on)
-        allowfile="${config.home.homeDirectory}/.config/vpn-zones/wayland-allow"
-        appbin="''${VPN_ZONE_APPID:-}"
-        if [ -z "$appbin" ]; then
-          for w in "$@"; do
-            case "$w" in
-              env|sh|bash|setsid|nohup|-*) continue ;;
-              # Присваивание переменной пропускаем, но ТОЛЬКО настоящее: шаблон
-              # «*=*» отбрасывал и обычные аргументы со знаком равенства внутри
-              # (например строку скрипта после sh -c), и app-id получался пустым.
-              *" "*) appbin=$(basename "$w"); break ;;
-              [A-Za-z_]*=*) continue ;;
-              *) appbin=$(basename "$w"); break ;;
-            esac
-          done
-        fi
-        # Идентификатор уходит в аргумент wl-sandbox, поэтому он ОБЯЗАН быть
-        # одним словом: пробелы разваливали его на два аргумента, и запускалась
-        # не та программа. Проверено на `sh -c 'echo …'`.
-        # tr -d перед обрезкой обязателен: у многострочной команды первая
-        # строка пустая, cut отдавал пустоту, и запуск падал с «нужен app-id».
-        appbin=$(printf '%s' "$appbin" | tr -d '\n' | tr -c 'A-Za-z0-9_.-' '_' | cut -c1-64)
-        if [ "$wlmode" = "on" ] && [ -n "$appbin" ]; then
-          allowed=0
-          case "$appbin" in
-            grim|slurp|swappy|wl-copy|wl-paste|copyq|wf-recorder|obs|obs-studio|\
-            spectacle|ksnip|wtype|ydotool|niri|noctalia|noctalia-shell|waybar|\
-            wayland-info|wlr-randr|kanshi|gammastep|wlsunset|wdisplays|\
-            flatpak|bwrap|podman|distrobox)
-              # flatpak и прочие песочницы исключены НЕ по недосмотру: они
-              # создают security-context сами, а у ограниченного клиента этот
-              # протокол как раз отобран — вложить одну песочницу в другую не
-              # выйдет. Их собственная изоляция строже нашей, так что пусть
-              # работают своим механизмом.
-              allowed=1 ;;
-          esac
-          if [ -f "$allowfile" ] && grep -qxF "$appbin" "$allowfile" 2>/dev/null; then
-            allowed=1
-          fi
-          # Команда отделяется «--»: у подкоманды ровно один свой аргумент
-          # (app-id), и явный разделитель не даёт спутать его с программой.
-          [ $allowed -eq 0 ] && \
-            set -- ${vpn-zone-rust}/bin/vpn-zone-core wl-sandbox "$appbin" -- "$@"
-        fi
-
-        # Песочница файловой системы — ТОЛЬКО по явному флагу. Включать её всем
-        # подряд нельзя: программа теряет доступ к своим привычным каталогам, и
-        # что именно ей нужно, выясняется поштучно.
-        if [ $fssandbox -eq 1 ]; then
-          # Идентификатор берём тот же, что у пикера (id ярлыка), и только при
-          # его отсутствии — имя бинаря. Иначе разрешения двоятся: у Discord
-          # ярлык даёт «discord», а бинарь называется «Discord», и получались
-          # два независимых набора доступов на одну программу.
-          fsid=''${VPN_ZONE_APPID:-$appbin}
-          if [ -n "$sbname" ]; then
-            set -- ${vpn-zone-rust}/bin/vpn-zone-core fs-sandbox ${fsSandboxTools} \
-              "$fsid" --name "$sbname" -- "$@"
-          else
-            set -- ${vpn-zone-rust}/bin/vpn-zone-core fs-sandbox ${fsSandboxTools} \
-              "$fsid" -- "$@"
-          fi
-        fi
-
-        pkey=''${profile:-__main__}
-        [ $ephemeral -eq 1 ] && pkey="$profile"
-        # Имя программы берём из id ярлыка (или из уже вычисленного appbin), а
-        # НЕ из "$1": к этому месту в начало команды уже подставлены обёртки
-        # (wl-sandbox, fs-sandbox), и basename давал ИХ имя. Отсюда три
-        # следствия: предупреждение о конфликте называло чужую программу,
-        # галочка «не спрашивать снова» была общей на все песочницы сразу (она
-        # привязана к ключу --dontagain), а без VPN_ZONE_APPID все они делили
-        # одну запись в реестре.
-        appname=''${VPN_ZONE_APPID:-''${appbin:-программа}}
-        regdir="$root/.running/$pkey"
-        mkdir -p "$regdir"
-        reg="$regdir/$appname"
-        busy=""
-        if [ -f "$reg" ]; then
-          # Мёртвые записи выбрасываем на лету: файл переписывается только
-          # живыми. Перепись — под flock: два одновременных запуска одной
-          # программы делали read→rewrite→mv без блокировки и теряли записи
-          # друг друга. Строку добавляем printf'ом — многострочная переменная
-          # с закрывающей кавычкой в нулевой колонке сбила бы снятие общего
-          # отступа в Nix-строке и разломала бы heredoc справки выше.
-          # ПЕРЕМЕННЫХ В read ТРИ, А НЕ ДВЕ, и это самая дорогая строчка тут.
-          # С двумя весь хвост записи («зона выбор») уезжал в $z, и запуск в
-          # ТОЙ ЖЕ зоне, но с песочницей или контейнером, выглядел как
-          # «nl sb:app-x» ≠ «nl»: вылезало предупреждение «программа уже
-          # запущена в другой сети», а «Отмена» в нём тихо отменяла запуск.
-          # Снаружи это выглядело как «нажал ярлык, ответил на вопрос — и
-          # ничего не открылось, надо жать второй раз».
-          busy=$(
-            (
-              flock 9
-              : > "$reg.new"
-              b=""
-              while read -r pid z sel; do
-                [ -n "''${pid:-}" ] || continue
-                [ -d "/proc/$pid" ] || continue
-                printf '%s %s %s\n' "$pid" "$z" "$sel" >> "$reg.new"
-                [ "$z" = "$name" ] || b="$z"
-              done < "$reg"
-              mv "$reg.new" "$reg"
-              printf '%s' "$b"
-            ) 9>>"$regdir/.lock"
-          )
-        fi
-        if [ -n "$busy" ] && [ -z "''${VPN_ZONE_DRYRUN:-}" ]; then
-          msg=$(printf '«%s» уже запущена в сети «%s», а ты открываешь её в «%s».\n\nОсторожно: у программ с одним процессом на профиль (браузеры, Telegram, Discord) окно ОТКРОЕТСЯ и будет выглядеть обычно — но нарисует его старый процесс, и трафик в нём пойдёт через «%s», а не через «%s». Со стороны неотличимо, поэтому и предупреждаем.\n\nЕсли у программы каждое окно своё (терминалы, редакторы), всё в порядке — отметь «не спрашивать снова».' \
-            "$appname" "$busy" "$name" "$busy" "$name")
-          if [ -n "''${WAYLAND_DISPLAY:-}''${DISPLAY:-}" ]; then
-            ${kdialog} --title "Программа уже запущена в другой сети" \
-              --dontagain "vpn-zonesrc:conflict-$appname" \
-              --warningcontinuecancel "$msg" 2>/dev/null || exit 0
-          else
-            # Из терминала диалог показать негде: предупреждаем и продолжаем —
-            # молча отменять запуск здесь было бы хуже, чем предупредить.
-            echo "$msg" >&2
-          fi
-        fi
-        p=$(zone_pid "$name" || true)
-        if [ -z "''${p:-}" ]; then
-          # Ярлык мог быть нажат при опущенной зоне — поднимаем сами, это
-          # ожидаемое поведение, а не ошибка.
-          #
-          # «|| true» тут обязательно: без него set -e убивал бы запуск прямо
-          # на этой строке и молча — stderr ярлыка никто не читает. Ниже и так
-          # есть внятная проверка «зона не поднимается».
-          systemctl --user start "vpn-zone@$name.service" || true
-          for _ in $(seq 1 100); do [ -f "$root/$name/ready" ] && break; sleep 0.1; done
-          p=$(zone_pid "$name" || true)
-        fi
-        [ -n "''${p:-}" ] || { echo "зона $name не поднимается" >&2; exit 1; }
-
-        # Разделение профилей делает overlayfs поверх XDG-каталогов, который
-        # накладывается уже при запуске программы (vpn-zone-core profile-run,
-        # см. exec ниже). Поэтому здесь ничего к команде дописывать не нужно:
-        # работает для любой программы, независимо от того, какие флаги она
-        # понимает. Прежняя таблица флагов (--user-data-dir и компания) убрана —
-        # она требовала знать каждую программу поимённо.
-
-        # Отладочный выхлоп: показать итоговую команду, ничего не запуская.
-        if [ -n "''${VPN_ZONE_DRYRUN:-}" ]; then
-          echo "зона $name, профиль ''${profile:-основной}: $*"
-          exit 0
-        fi
-
-        # Отмечаемся в реестре: $$ переживёт exec (PID не меняется), поэтому
-        # запись остаётся верной всё время работы программы, а мёртвые чистятся
-        # при следующем запуске.
-        #
-        # Третьим полем — ЧТО было выбрано. Без него повторный клик по ярлыку
-        # уже запущенной программы возвращал её «голой»: сеть из реестра бралась,
-        # а песочница терялась, потому что при песочнице profile пуст и ключ
-        # каталога всегда получался __main__.
-        if [ -n "$sbname" ]; then selector="sb:$sbname"
-        elif [ $fssandbox -eq 1 ]; then selector="__fs__"
-        else selector=''${profile:-}
-        fi
-        # Под тем же flock: без него запись могла попасть между чужими
-        # read и mv при переписи файла — и молча пропасть. $$ в сабшелле
-        # остаётся PID основного процесса, то есть того, кто сделает exec.
-        ( flock 9; printf '%s %s %s\n' "$$" "$name" "$selector" >> "$reg" ) 9>>"$regdir/.lock"
-
-        # Метка для потомков: если программа, запущенная в зоне, попробует
-        # открыть что-то ещё (ссылку из мессенджера, файл из редактора), её
-        # запуск будет делегирован наружу — см. блок в начале `run`.
-        export VPN_ZONE_CURRENT="$name"
-
-        if [ -z "$profiledir" ]; then
-          # Без профиля — обычный вход в зону, ~/ общий.
-          exec nsenter --preserve-credentials -U -n -m -t "$p" -- "$@"
-        fi
-
-        # С профилем: --keep-caps оставляет права, полученные при входе в
-        # user-namespace зоны (без него CapEff обнуляется и смонтировать слой
-        # нечем), затем свой mount namespace на этот запуск, и уже внутри
-        # накладываются слои профиля. Права снимаются перед стартом программы —
-        # см. крейт rust/, модуль profile.
-        exec nsenter --preserve-credentials --keep-caps -U -n -m -t "$p" -- \
-          unshare --mount --propagation private -- \
-          ${vpn-zone-rust}/bin/vpn-zone-core profile-run \
-            "$profiledir" "$name" "$ephemeral" "$regdir" -- "$@"
-        ;;
-      gc)
-        # Уборка зависших наборов «unshare + sleep + pasta». Критерии намеренно
-        # ТОЧНЫЕ, а не «убить всё осиротевшее»: первая версия этой команды
-        # погасила живую зону, потому что смотрела только на zone.pid.
-        #
-        #   • процессы под systemd (vpn-zone@…) не трогаем вовсе — ими управляет
-        #     юнит, и если что-то не так, это его дело;
-        #   • pasta гасим, только если netns, который она обслуживает, мёртв —
-        #     номер процесса виден прямо в её командной строке;
-        #   • чужие песочницы (bwrap) не трогаем: в них работают программы.
-        killed=0
-        for pid in $(pgrep -x pasta 2>/dev/null || true); do
-          cg=$(cat "/proc/$pid/cgroup" 2>/dev/null || true)
-          case "$cg" in *vpn-zone@*) continue ;; esac
-          target=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null \
-            | grep -oE '/proc/[0-9]+/ns/net' | head -1 | cut -d/ -f3)
-          [ -n "''${target:-}" ] || continue
-          [ -d "/proc/$target" ] && continue
-          kill "$pid" 2>/dev/null && killed=$((killed + 1))
-        done
-        # Мёртвые записи «кто где запущен» — под тем же flock, что и запись:
-        # без него gc мог прочитать файл до чужого printf и стереть свежую
-        # запись только что стартовавшей программы.
-        cleaned=0
-        for f in "$root"/.running/*/*; do
-          [ -f "$f" ] || continue
-          if (
-            flock 9
-            while read -r rp _; do
-              [ -n "''${rp:-}" ] && [ -d "/proc/$rp" ] && exit 1
-            done < "$f"
-            rm -f "$f"
-          ) 9>>"$(dirname "$f")/.lock"; then
-            cleaned=$((cleaned + 1))
-          fi
-        done
-        # Брошенные одноразовые контейнеры: их дом стирается за последним
-        # жильцом, но при жёстком убийстве каталог остаётся. Судим по живым
-        # PID в реестре, а не по существованию его каталога: после жёсткого
-        # убийства каталог реестра остаётся лежать с мёртвыми записями, и
-        # прежняя проверка держала мусор в /tmp вечно.
-        for d in /tmp/vpn-profile-*; do
-          [ -d "$d" ] || continue
-          n=$(basename "$d")
-          live=0
-          for f in "$root/.running/$n"/*; do
-            [ -f "$f" ] || continue
-            while read -r rp _; do
-              [ -n "''${rp:-}" ] && [ -d "/proc/$rp" ] && { live=1; break; }
-            done < "$f"
-            [ $live -eq 1 ] && break
-          done
-          [ $live -eq 1 ] && continue
-          rm -rf "$d" "$root/.running/$n"
-          cleaned=$((cleaned + 1))
-        done
-        echo "остановлено зависших выходов в сеть: $killed, подчищено записей: $cleaned"
-        ;;
-      perms)
-        # Доступы спрашиваются один раз на программу и запоминаются. Отсюда их
-        # видно и можно сбросить, чтобы диалог появился снова.
-        pdir="${config.home.homeDirectory}/.config/vpn-zones/fs-perms"
-        sub=''${1:-list}; [ $# -gt 0 ] && shift || true
-        case "$sub" in
-          list)
-            if [ -d "$pdir" ] && [ -n "$(ls -A "$pdir" 2>/dev/null)" ]; then
-              for f in "$pdir"/*; do
-                [ -f "$f" ] || continue
-                v=$(tr '\n' ' ' < "$f")
-                echo "$(basename "$f") → ''${v:-ничего}"
-              done
-            else
-              echo "доступы никому не выдавались"
-            fi
-            ;;
-          reset)
-            what=''${1:?имя программы или --all}
-            if [ "$what" = "--all" ]; then
-              rm -rf "''${pdir:?}"; echo "сброшено для всех — при следующем запуске спросит заново"
-            else
-              rm -f "''${pdir:?}/$what"; echo "сброшено для $what"
-            fi
-            ;;
-          *) echo "vpn-zone perms list|reset <программа|--all>" >&2; exit 1 ;;
-        esac
-        ;;
-      sandbox)
-        # Песочницы — это НЕ контейнеры: у контейнера слой поверх твоего дома
-        # (видно всё, разведены только данные), у песочницы дом свой и пустой,
-        # а наружу торчит лишь разрешённое. Потому и хранятся отдельно.
-        sbroot="${config.home.homeDirectory}/.local/state/vpn-sandboxes"
-        sub=''${1:-list}; [ $# -gt 0 ] && shift || true
-        case "$sub" in
-          create)
-            sname=''${1:?нужно имя песочницы}
-            case "$sname" in
-              */*|*" "*|-*|.*) echo "в имени нельзя: / пробел, и оно не должно начинаться с - или ." >&2; exit 1 ;;
-            esac
-            mkdir -p "$sbroot/$sname/home"
-            echo "песочница $sname создана (свой пустой дом, доступ наружу спросится при запуске)"
-            ;;
-          list)
-            if [ -d "$sbroot" ] && [ -n "$(ls -A "$sbroot" 2>/dev/null)" ]; then
-              for d in "$sbroot"/*/; do
-                sn=$(basename "$d")
-                perms=$(cat "$d/perms" 2>/dev/null | tr '\n' ' ')
-                case "$sn" in
-                  app-*) echo "$sn — своя песочница программы ''${sn#app-}, $(du -sh "$d" 2>/dev/null | cut -f1), доступ: ''${perms:-ничего}" ;;
-                  *) echo "$sn — $(du -sh "$d" 2>/dev/null | cut -f1), доступ: ''${perms:-ничего}" ;;
-                esac
-              done
-            else
-              echo "песочниц нет. Создать: vpn-zone sandbox create <имя>"
-            fi
-            ;;
-          rm)
-            sname=''${1:?нужно имя песочницы}
-            [ -d "$sbroot/$sname" ] || { echo "песочницы $sname нет" >&2; exit 1; }
-            rm -rf "''${sbroot:?}/$sname"
-            echo "песочница $sname удалена вместе со своим домом"
-            ;;
-          *) echo "vpn-zone sandbox create|list|rm <имя>" >&2; exit 1 ;;
-        esac
-        ;;
-      profile)
-        sub=''${1:-list}; [ $# -gt 0 ] && shift || true
-        case "$sub" in
-          create)
-            pname=''${1:?нужно имя профиля}
-            # Раньше разрешалась только латиница, и GUI, санитизируя ввод,
-            # превращал русское название в строку дефисов. Такое имя ломает
-            # kdialog: аргумент, начинающийся с «-», он принимает за опцию и
-            # молча закрывается. Теперь запрещаем ровно опасное: разделители
-            # пути, пробелы и ведущий дефис/точку.
-            case "$pname" in
-              */*|*" "*|-*|.*) echo "в имени нельзя: / пробел, и оно не должно начинаться с - или ." >&2; exit 1 ;;
-            esac
-            mkdir -p "$profiles/$pname"
-            echo "профиль $pname создан (пустой слой поверх твоего ~/)"
-            ;;
-          list)
-            if [ -d "$profiles" ] && [ -n "$(ls -A "$profiles" 2>/dev/null)" ]; then
-              for d in "$profiles"/*/; do
-                pn=$(basename "$d"); where=""
-                # Кто и где сейчас открыт — из общего реестра запусков
-                # ($root/.running/<профиль>/<программа>), тот же, по которому
-                # ловится конфликт сетей.
-                for f in "$root/.running/$pn"/*; do
-                  [ -f "$f" ] || continue
-                  while read -r pid z _; do
-                    [ -n "''${pid:-}" ] && [ -d "/proc/$pid" ] && { where="$z"; break; }
-                  done < "$f"
-                  [ -n "$where" ] && break
-                done
-                size=$(du -sh "$d" 2>/dev/null | cut -f1)
-                if [ -n "$where" ]; then echo "$pn — открыт в сети $where ($size)"
-                else echo "$pn — свободен ($size)"; fi
-              done
-            else
-              echo "профилей нет. Создать: vpn-zone profile create <имя>"
-            fi
-            ;;
-          rm)
-            pname=''${1:?нужно имя профиля}
-            [ -d "$profiles/$pname" ] || { echo "профиля $pname нет" >&2; exit 1; }
-            rm -rf "''${profiles:?}/$pname"
-            echo "профиль $pname удалён"
-            ;;
-          *) echo "vpn-zone profile create|list|rm <имя>" >&2; exit 1 ;;
-        esac
-        ;;
-      wayland-sandbox)
-        v=''${1:?on или off}
-        case "$v" in on|off) ;; *) echo "только on или off" >&2; exit 1;; esac
-        mkdir -p "${config.home.homeDirectory}/.config/vpn-zones"
-        printf '%s' "$v" > "${config.home.homeDirectory}/.config/vpn-zones/wayland-sandbox"
-        if [ "$v" = "on" ]; then
-          echo "программы запускаются без доступа к захвату экрана, буферу в фоне и эмуляции ввода"
-        else
-          echo "ограничение снято: программы снова получают полный набор протоколов композитора"
-        fi
-        ;;
-      isolate)
-        v=''${1:?overlay или off}
-        case "$v" in overlay|off) ;; *) echo "только overlay или off" >&2; exit 1;; esac
-        mkdir -p "${config.home.homeDirectory}/.config/vpn-zones"
-        printf '%s' "$v" > "${config.home.homeDirectory}/.config/vpn-zones/isolate"
-        if [ "$v" = "overlay" ]; then
-          echo "зоны накладывают свой слой на ~/.config, ~/.local/share, ~/.cache,"
-          echo "~/.mozilla, ~/.pki — программа видит настройки, но пишет в слой зоны"
-        else
-          echo "зоны используют общий профиль. Учти: браузер тогда откроет окно"
-          echo "в уже запущенном процессе, и трафик пойдёт мимо VPN"
-        fi
-        echo "поднятые зоны надо перезапустить, чтобы это применилось"
-        ;;
-      reset-profile)
-        # Слой зоны разрастается (кэш браузера, куки) — вот кнопка «начать с
-        # чистого листа», не трогая основной профиль.
-        name=''${1:?нужно имя зоны}
-        [ -d "$root/$name" ] || { echo "зоны $name нет" >&2; exit 1; }
-        if [ -n "$(zone_pid "$name" || true)" ]; then
-          echo "сначала опусти зону: vpn-zone down $name" >&2; exit 1
-        fi
-        rm -rf "''${root:?}/$name/overlay"
-        echo "слой профиля зоны $name очищен (основной профиль не тронут)"
-        ;;
-      rm)
-        name=''${1:?нужно имя}
-        # direct и offline — встроенные варианты пикера, а не зоны: удалять там
-        # нечего (прямой трафик — это отсутствие зоны вовсе, а пустая зона
-        # создаётся заново сама при первом же запуске «Без сети»).
-        case "$name" in
-          direct|offline) echo "«$name» — встроенный вариант, его нельзя удалить" >&2; exit 1;;
-        esac
-        [ -d "$root/$name" ] || { echo "зоны $name нет" >&2; exit 1; }
-        systemctl --user stop "vpn-zone@$name.service" 2>/dev/null || true
-        rm -rf "''${root:?}/$name"
-        # Снимаем закрепления, которые указывали на эту зону: иначе программа
-        # осталась бы намертво привязана к несуществующей сети и молча падала
-        # бы при каждом запуске.
-        for f in "$root"/.pinned/* "$root"/.last/*; do
-          [ -f "$f" ] || continue
-          [ "$(cat "$f")" = "$name" ] && rm -f "$f"
-        done
-        vpn-zone sync
-        echo "зона $name удалена"
-        ;;
-      sync) exec vpn-zone-sync ;;   # из профиля (см. PATH выше) — так нет зависимости по кругу
-      mode)
-        m=''${1:?режим: picker | per-zone | both | off}
-        case "$m" in picker|per-zone|both|off) ;; *) echo "неизвестный режим: $m" >&2; exit 1;; esac
-        mkdir -p "${config.home.homeDirectory}/.config/vpn-zones"
-        printf '%s' "$m" > "${config.home.homeDirectory}/.config/vpn-zones/mode"
-        vpn-zone-sync
-        ;;
-      default-profile)
-        # Контейнер по умолчанию для ВСЕХ запусков. «ask» — спрашивать каждый
-        # раз (как было), «main» — всегда основной без вопроса, иначе имя
-        # профиля. Вопрос о сети это не отменяет.
-        v=''${1:?ask | main | own | <имя профиля>}
-        case "$v" in
-          ask|main|own) ;;
-          *) [ -d "$profiles/$v" ] || { echo "профиля $v нет" >&2; exit 1; } ;;
-        esac
-        mkdir -p "${config.home.homeDirectory}/.config/vpn-zones"
-        printf '%s' "$v" > "${config.home.homeDirectory}/.config/vpn-zones/default-profile"
-        echo "контейнер по умолчанию: $v"
-        ;;
-      default)
-        v=''${1:?вариант: offline | direct | <имя зоны>}
-        mkdir -p "${config.home.homeDirectory}/.config/vpn-zones"
-        printf '%s' "$v" > "${config.home.homeDirectory}/.config/vpn-zones/default"
-        echo "по умолчанию в пикере: $v"
-        ;;
-      pins)
-        found=0
-        for f in "$root"/.pinned/* "$root"/.pinnedprofile/*; do
-          [ -f "$f" ] || continue
-          k=$(basename "$f")
-          nm=$(cat "$root/.labels/$k" 2>/dev/null || echo "$k")
-          if [ "$(dirname "$f")" = "$root/.pinned" ]; then
-            echo "$nm: сеть → $(cat "$f")"
-          else
-            v=$(cat "$f"); [ "$v" = "__main__" ] && v="основной"
-            echo "$nm: контейнер → $v"
-          fi
-          found=1
-        done
-        [ $found -eq 1 ] || echo "закреплённых программ нет — пикер спрашивает каждый раз"
-        ;;
-      forget)
-        what=''${1:?имя программы или --all}
-        if [ "$what" = "--all" ]; then
-          rm -rf "''${root:?}/.pinned" "''${root:?}/.last" "''${root:?}/.lastprofile" \
-            "''${root:?}/.pinnedprofile"
-          echo "сброшено для всех программ"
-        else
-          rm -f "''${root:?}/.pinned/$what" "''${root:?}/.last/$what" \
-            "''${root:?}/.lastprofile/$what" "''${root:?}/.pinnedprofile/$what"
-          echo "сброшено для $what"
-        fi
-        ;;
-      ""|-h|--help|help) usage ;;
-      *) echo "неизвестная команда: $cmd" >&2; usage; exit 1 ;;
-    esac
+  # Помощники крейта в PATH: ядро (его зовёт юнит vpn-zone@ и сам CLI) и
+  # генератор seccomp-фильтра — тем же бинарём проверяется, что фильтр вообще
+  # работает на твоём ядре (`vpn-zone-seccomp selftest`). Симлинки, а не копии:
+  # ссылка на store-путь тянет за собой сам крейт.
+  vpn-zone-helpers = pkgs.runCommand "vpn-zone-helpers" { } ''
+    mkdir -p $out/bin
+    ln -s ${vpn-zone-rust}/bin/vpn-zone-core $out/bin/vpn-zone-core
+    ln -s ${vpn-zone-rust}/bin/vpn-zone-seccomp $out/bin/vpn-zone-seccomp
   '';
 
   # --- ЧАСТЬ 3б: ПИКЕР СЕТИ ---
@@ -1814,12 +1131,12 @@ in
     vpn-zone
     vpn-zone-sync
     vpn-zone-pick
-    # Rust-ядро: vpn-zone-seccomp (генератор фильтра) и vpn-zone-core
-    # (подкоманды zone-holder, profile-run, sync, wl-sandbox и fs-sandbox — их
-    # зовут юнит и vpn-zone). В PATH — не только ради этого: тем же бинарём
-    # проверяется, что фильтр вообще работает на твоём ядре
-    # (`vpn-zone-seccomp selftest`).
-    vpn-zone-rust
+    # Помощники Rust-ядра: vpn-zone-core (подкоманды zone-holder, profile-run,
+    # sync, wl-sandbox и fs-sandbox — их зовут юнит и сам CLI) и
+    # vpn-zone-seccomp (генератор фильтра, он же selftest). Сам CLI приходит
+    # обёрткой vpn-zone выше — крейт целиком сюда класть нельзя, в нём тоже есть
+    # bin/vpn-zone.
+    vpn-zone-helpers
     vpn-zone-add-gui
     vpn-zone-remove-gui
     vpn-zone-profile-rm-gui
