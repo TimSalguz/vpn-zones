@@ -144,6 +144,11 @@ The subtleties that took the most time are commented in detail in
   impossible there because no path exists (`docs/LEAK-MODEL.md`). The interface
   is created in the uplink and moved down, because a WireGuard socket stays in
   the namespace the interface was born in;
+- on top of that topology, and only as insurance against a mistake of ours,
+  both namespaces get an **nftables ruleset**: nothing leaves the app namespace
+  except through the tunnel, and nothing leaves the uplink except the tunnel's
+  own packets to the server. A kernel that will not have it costs a warning in
+  the journal, not the zone — the topology is what carries the weight;
 - the zone holder needs a **double uid mapping**: `0:<subuid>:1` (otherwise
   capabilities are lost on `execve` and the interface cannot be created) plus
   `<uid>:<uid>:1` (otherwise the program does not see its `$HOME`);

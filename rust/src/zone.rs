@@ -79,6 +79,16 @@
 //! sockets. awg0 stays where it is and drops every packet. Fail-closed by
 //! construction, with nothing to fall back to.
 //!
+//! **The second echelon.** Both namespaces also get an nftables ruleset, and it
+//! is insurance, not the load-bearing wall (`docs/LEAK-MODEL.md`): the app
+//! namespace may send nothing except through the tunnel, the uplink nothing
+//! except the tunnel's own packets to the endpoint we resolved. Neither rule has
+//! anything to do today — there is no other interface in the app namespace, and
+//! nothing but the tunnel runs in the uplink — which is exactly the point: the
+//! day a mistake puts an interface or a process where none belongs, the packets
+//! stop instead of leaving quietly. nftables missing or refused by the kernel is
+//! a loud warning and a zone that comes up anyway.
+//!
 //! **No PID namespace anywhere**, and that is deliberate: `zone.pid` has to
 //! name the app-namespace process the way the HOST sees it — `vpn-zone
 //! run`/`status` `nsenter` into it by that number — and the uplink hands the
@@ -137,6 +147,10 @@ const DEFAULT_MTU: u32 = 1420;
 /// tunnel. (`docs/GOTCHAS.md` §3)
 const DEFAULT_RESOLVERS: [&str; 2] = ["1.1.1.1", "9.9.9.9"];
 
+/// Name of the table both namespaces get, so that `nft list ruleset` inside a
+/// zone says whose rules these are.
+const NFT_TABLE: &str = "vpnzone";
+
 /// Waiting is done in 0.1 s steps, 50 of them — five seconds, as in bash.
 const WAIT_STEPS: u32 = 50;
 const WAIT_STEP: Duration = Duration::from_millis(100);
@@ -166,6 +180,9 @@ pub struct Tools {
     pub awg: PathBuf,
     pub wg: PathBuf,
     pub pasta: PathBuf,
+    /// The second echelon (`docs/LEAK-MODEL.md`). Optional in the sense that a
+    /// zone without it still comes up — loudly, and on its topology alone.
+    pub nft: PathBuf,
 }
 
 impl Default for Tools {
@@ -177,6 +194,7 @@ impl Default for Tools {
             awg: PathBuf::from("awg"),
             wg: PathBuf::from("wg"),
             pasta: PathBuf::from("pasta"),
+            nft: PathBuf::from("nft"),
         }
     }
 }
@@ -216,7 +234,7 @@ impl std::fmt::Display for ArgError {
 impl std::error::Error for ArgError {}
 
 impl Args {
-    /// Parse `[--ip P] [--awg P] [--wg P] [--pasta P] <name>`.
+    /// Parse `[--ip P] [--awg P] [--wg P] [--pasta P] [--nft P] <name>`.
     ///
     /// Only `--`-prefixed words are flags, so a zone name is free to start with
     /// a single dash. The order does not matter, but the unit puts the tool
@@ -240,6 +258,7 @@ impl Args {
                 "--awg" => &mut tools.awg,
                 "--wg" => &mut tools.wg,
                 "--pasta" => &mut tools.pasta,
+                "--nft" => &mut tools.nft,
                 _ => return Err(ArgError::UnknownFlag(flag)),
             };
             let value = rest
@@ -298,6 +317,25 @@ impl Zone {
             .next()
             .unwrap_or_default()
             .to_string()
+    }
+
+    /// Load the second echelon into the CURRENT network namespace.
+    ///
+    /// Never fatal, and that is a decision rather than laziness
+    /// (`docs/LEAK-MODEL.md`): the filter insures the topology, the topology
+    /// does not lean on the filter. An old kernel, a kernel without the
+    /// `nf_tables` module loaded (it cannot be autoloaded from inside an
+    /// unprivileged user namespace) or no `nft` at all must not cost the user
+    /// the zone — but it must be impossible to miss in the journal, because a
+    /// zone whose second echelon is off is a zone one mistake away from a leak.
+    fn seal(&self, side: &str, ruleset: &str) {
+        if let Err(e) = feed_nft(&self.tools.nft, ruleset) {
+            eprintln!(
+                "zone {}: {side}: nftables second echelon is OFF ({e}) — the zone is up and \
+                 still hermetic by construction, but nothing insures it against a mistake",
+                self.name()
+            );
+        }
     }
 }
 
@@ -953,6 +991,19 @@ fn uplink_setup(zone: &Zone, links: UplinkLinks<'_>) -> Result<(), String> {
         .map_err(|e| format!("cannot write {UPLINK_PID}: {e}"))?;
     zone.ip(&["link", "set", "lo", "up"])?;
 
+    // --- THE SECOND ECHELON, BEFORE THERE IS ANYTHING TO FILTER ---
+    // Loaded before pasta is even told about this namespace, so that connectivity
+    // never exists here unfiltered. The rules cost the setup nothing: everything
+    // below (waiting for a route, creating the interface, handing it over) is
+    // netlink, which no filter hook of the `inet` family ever sees.
+    //
+    // What it buys: this namespace may send exactly the tunnel's own packets to
+    // the endpoint, and nothing else. Should a userspace VPN client ever run
+    // here (ROADMAP M4), or should any code of ours grow a DNS lookup or a
+    // "quick check" against the network, it does not get out — the endpoint is
+    // all this namespace is for.
+    zone.seal("uplink", &uplink_ruleset(&endpoint_sockets(cfg)));
+
     // The holder is waiting for this to attach pasta to us.
     let mut ready = File::from(ready_w);
     ready
@@ -1102,10 +1153,27 @@ fn zone_setup(zone: &Zone, links: Option<ZoneLinks<'_>>) -> Result<(), String> {
         moved_r,
     }) = links
     else {
+        // An offline zone gets no rules, and needs none: loopback is the only
+        // interface there will ever be, and `oifname "lo" accept` over an empty
+        // namespace would say nothing that the empty namespace does not.
         touch(&zone.path(READY)).map_err(|e| format!("cannot create {READY}: {e}"))?;
         println!("zone {}: no network (loopback only)", zone.name());
         return Ok(());
     };
+
+    // --- THE SECOND ECHELON, BEFORE THE TUNNEL EVEN ARRIVES ---
+    // The rule names the interface (`oifname`) and not its index, so it does not
+    // need awg0 to exist yet — which is why this can go first, and why it keeps
+    // working if the interface is ever recreated. Everything below is netlink
+    // (setconf, addresses, routes) and runs regardless: no filter hook of the
+    // `inet` family sees a netlink message.
+    //
+    // Today this rule has nothing to stop: the namespace has lo and the tunnel
+    // and no third interface can appear in it (the programs inside hold no
+    // capabilities over it). That is precisely what makes it worth having — the
+    // day a change of ours puts an interface here by mistake, the packets stop
+    // instead of quietly leaving through it.
+    zone.seal("zone", &app_ruleset());
 
     // The uplink is waiting for this before it hands the interface over.
     let mut ready = File::from(ready_w);
@@ -1369,6 +1437,136 @@ pub fn v6_plan(kernel_has_v6: bool, tunnel_has_v6: bool) -> V6Plan {
     }
 }
 
+// --- THE SECOND ECHELON: THE TWO RULESETS ------------------------------------
+
+/// One endpoint as the uplink's filter sees it: an address the tunnel may talk
+/// to and, when the config bothered to say so, the port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndpointSocket {
+    pub addr: IpAddr,
+    pub port: Option<u16>,
+}
+
+/// Every endpoint of a config that has already been through
+/// [`WgConfig::resolve_endpoints`] — in file order, without duplicates.
+///
+/// An endpoint that is still a NAME cannot get this far (`prepare` refuses to
+/// start a zone whose endpoint did not resolve) and is skipped rather than
+/// guessed at: a filter built out of an address nobody has would be a filter
+/// that lies.
+pub fn endpoint_sockets(cfg: &WgConfig) -> Vec<EndpointSocket> {
+    let mut out: Vec<EndpointSocket> = Vec::new();
+    for section in &cfg.sections {
+        for entry in &section.entries {
+            if !entry.key.eq_ignore_ascii_case("Endpoint") {
+                continue;
+            }
+            let Some(endpoint) = Endpoint::parse(&entry.value) else {
+                continue;
+            };
+            let EndpointHostKind::Literal(addr) = endpoint_host_kind(&endpoint) else {
+                continue;
+            };
+            let socket = EndpointSocket {
+                addr,
+                port: endpoint.port,
+            };
+            // Several peers of one server are one rule, not three.
+            if !out.contains(&socket) {
+                out.push(socket);
+            }
+        }
+    }
+    out
+}
+
+/// Neighbour discovery, without which a v6 endpoint is simply unreachable.
+///
+/// pasta hands the namespace a v6 default `via fe80::1`, and the kernel cannot
+/// send a single packet there before it has resolved that address — with an
+/// ICMPv6 neighbour solicitation, which the output hook sees like any other
+/// packet. Drop it and the tunnel never gets off the ground. IPv4 needs no such
+/// exception: ARP is not in the `inet` family at all (it has a family of its
+/// own), so an `inet` filter never touches it.
+///
+/// Nothing can be smuggled out this way: these three types are link-local
+/// multicast, and the only thing on that link is pasta.
+const NDP_RULE: &str =
+    "icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept";
+
+/// The app namespace's ruleset: out through the tunnel, or nowhere.
+///
+/// `oifname` and not `oif` on purpose. `oif` is resolved to an interface INDEX
+/// when the rule is loaded, which would mean the rule has to be loaded after the
+/// tunnel has arrived and would silently stop matching if the interface were
+/// ever recreated; `oifname` compares the name every time, so the ruleset can go
+/// in before the tunnel does and keeps meaning what it says afterwards.
+pub fn app_ruleset() -> String {
+    output_table(&[
+        "oifname \"lo\" accept".to_string(),
+        format!("oifname \"{TUN_IFACE}\" accept"),
+    ])
+}
+
+/// The uplink's ruleset: the tunnel's own packets to the endpoint, and nothing
+/// else.
+///
+/// The addresses are literals we resolved ourselves in the host's network
+/// before any namespace existed, so there is nothing here to escape or to look
+/// up. No DNS rule and no ICMP rule either, for the same reason: by the time
+/// this namespace exists, every name in the config is already an address.
+///
+/// A config whose endpoints are all unusable ends up with a loopback-only
+/// ruleset, which is the fail-closed answer to a tunnel that has nowhere to go —
+/// and the holder has already said so out loud.
+pub fn uplink_ruleset(endpoints: &[EndpointSocket]) -> String {
+    let mut rules = vec!["oifname \"lo\" accept".to_string()];
+    let mut needs_ndp = false;
+    for endpoint in endpoints {
+        let (family, addr) = match endpoint.addr {
+            IpAddr::V4(addr) => ("ip", addr.to_string()),
+            IpAddr::V6(addr) => {
+                needs_ndp = true;
+                ("ip6", addr.to_string())
+            }
+        };
+        // A port is what the config wrote; without one `setconf` would have
+        // rejected the endpoint anyway, so the rule stays as wide as the
+        // address and no wider.
+        rules.push(match endpoint.port {
+            Some(port) => format!("{family} daddr {addr} udp dport {port} accept"),
+            None => format!("{family} daddr {addr} accept"),
+        });
+    }
+    if needs_ndp {
+        rules.push(NDP_RULE.to_string());
+    }
+    output_table(&rules)
+}
+
+/// Wrap accept rules into the one table and chain both namespaces get.
+///
+/// Only `output` is filtered. There is no point in an input chain: the app
+/// namespace can be reached from the tunnel alone, the uplink from pasta alone,
+/// and neither of those becomes safer for being filtered here — what this is
+/// about is packets LEAVING somewhere they should not.
+fn output_table(rules: &[String]) -> String {
+    let mut text = String::new();
+    text.push_str("table inet ");
+    text.push_str(NFT_TABLE);
+    text.push_str(" {\n");
+    text.push_str("\tchain output {\n");
+    text.push_str("\t\ttype filter hook output priority filter; policy drop;\n");
+    for rule in rules {
+        text.push_str("\t\t");
+        text.push_str(rule);
+        text.push('\n');
+    }
+    text.push_str("\t}\n");
+    text.push_str("}\n");
+    text
+}
+
 /// The zone's `/etc/resolv.conf` and whether the default had to be used.
 ///
 /// A config without `DNS=` used to leave the zone with the host's resolv.conf,
@@ -1494,6 +1692,45 @@ fn tool_output(tool: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Hand a ruleset to `nft -f -` on stdin.
+///
+/// On stdin and not in a file: the ruleset is generated, it has no business
+/// existing on disk, and a file would need a directory that both namespaces can
+/// write to. nft's own diagnostics go to the journal untouched — when a ruleset
+/// is refused, the line and the reason are the only things worth having.
+fn feed_nft(nft: &Path, ruleset: &str) -> Result<(), String> {
+    let mut child = Command::new(nft)
+        .arg("-f")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                format!("{} is not there", nft.display())
+            } else {
+                format!("cannot run {}: {e}", nft.display())
+            }
+        })?;
+    // Taken out of the child so the pipe closes at the end of this statement:
+    // `nft -f -` reads to EOF and would wait for one forever.
+    let fed = match child.stdin.take() {
+        Some(mut pipe) => pipe
+            .write_all(ruleset.as_bytes())
+            .map_err(|e| format!("cannot hand the ruleset to nft: {e}")),
+        None => Err("nft was given no stdin".to_string()),
+    };
+    // Reap first, report second: a child that died on its own must not be left
+    // behind just because the write end noticed it first.
+    let status = child
+        .wait()
+        .map_err(|e| format!("cannot wait for {}: {e}", nft.display()))?;
+    fed?;
+    if !status.success() {
+        return Err(format!("{} -f - failed ({status})", nft.display()));
+    }
+    Ok(())
+}
+
 fn wait_for_default_route(zone: &Zone) {
     for _ in 0..WAIT_STEPS {
         if !zone.ip_line(&["-4", "route", "show", "default"]).is_empty() {
@@ -1542,7 +1779,8 @@ mod tests {
     #[test]
     fn tool_paths_are_flags_and_the_zone_name_is_positional() {
         let parsed = Args::parse(&argv(&[
-            "--ip", "/n/ip", "--awg", "/n/awg", "--wg", "/n/wg", "--pasta", "/n/pasta", "nl",
+            "--ip", "/n/ip", "--awg", "/n/awg", "--wg", "/n/wg", "--pasta", "/n/pasta", "--nft",
+            "/n/nft", "nl",
         ]))
         .unwrap();
         assert_eq!(parsed.name, OsString::from("nl"));
@@ -1550,6 +1788,7 @@ mod tests {
         assert_eq!(parsed.tools.awg, PathBuf::from("/n/awg"));
         assert_eq!(parsed.tools.wg, PathBuf::from("/n/wg"));
         assert_eq!(parsed.tools.pasta, PathBuf::from("/n/pasta"));
+        assert_eq!(parsed.tools.nft, PathBuf::from("/n/nft"));
     }
 
     #[test]
@@ -1689,5 +1928,134 @@ mod tests {
         assert!(!handshake_seen(""));
         assert!(!handshake_seen("\n \n"));
         assert!(!handshake_seen("nonsense\n"));
+    }
+
+    #[test]
+    fn the_app_ruleset_lets_nothing_out_but_the_tunnel() {
+        // `oifname`, not `oif`: the rule must not depend on an interface index
+        // that does not exist yet when the ruleset is loaded.
+        assert_eq!(
+            app_ruleset(),
+            concat!(
+                "table inet vpnzone {\n",
+                "\tchain output {\n",
+                "\t\ttype filter hook output priority filter; policy drop;\n",
+                "\t\toifname \"lo\" accept\n",
+                "\t\toifname \"awg0\" accept\n",
+                "\t}\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn the_uplink_ruleset_opens_the_tunnel_transport_and_nothing_else() {
+        let v4 = [EndpointSocket {
+            addr: "198.51.100.7".parse().unwrap(),
+            port: Some(51820),
+        }];
+        assert_eq!(
+            uplink_ruleset(&v4),
+            concat!(
+                "table inet vpnzone {\n",
+                "\tchain output {\n",
+                "\t\ttype filter hook output priority filter; policy drop;\n",
+                "\t\toifname \"lo\" accept\n",
+                "\t\tip daddr 198.51.100.7 udp dport 51820 accept\n",
+                "\t}\n",
+                "}\n",
+            )
+        );
+
+        // No endpoint at all: loopback only. A tunnel with nowhere to go is
+        // already fatal-ish (the holder says so), and the answer to "which
+        // packets may leave" is "none" rather than "all of them".
+        let empty = uplink_ruleset(&[]);
+        assert!(empty.contains("policy drop;"));
+        assert!(empty.contains("oifname \"lo\" accept"));
+        assert!(!empty.contains("daddr"));
+    }
+
+    #[test]
+    fn a_v6_endpoint_brings_neighbour_discovery_with_it() {
+        // Without the ND exception the kernel cannot even resolve pasta's
+        // fe80::1, and a v6 tunnel never sends its first packet. v4 needs no
+        // counterpart: ARP is not in the `inet` family.
+        let v6 = [EndpointSocket {
+            addr: "2001:db8::1".parse().unwrap(),
+            port: Some(443),
+        }];
+        assert_eq!(
+            uplink_ruleset(&v6),
+            concat!(
+                "table inet vpnzone {\n",
+                "\tchain output {\n",
+                "\t\ttype filter hook output priority filter; policy drop;\n",
+                "\t\toifname \"lo\" accept\n",
+                "\t\tip6 daddr 2001:db8::1 udp dport 443 accept\n",
+                "\t\ticmpv6 type { nd-router-solicit, nd-neighbor-solicit, \
+                 nd-neighbor-advert } accept\n",
+                "\t}\n",
+                "}\n",
+            )
+        );
+
+        // Two families, one ND rule.
+        let both = uplink_ruleset(&[
+            EndpointSocket {
+                addr: "198.51.100.7".parse().unwrap(),
+                port: Some(51820),
+            },
+            EndpointSocket {
+                addr: "2001:db8::1".parse().unwrap(),
+                port: Some(51820),
+            },
+        ]);
+        assert_eq!(both.matches("icmpv6 type").count(), 1);
+        assert!(both.contains("ip daddr 198.51.100.7 udp dport 51820 accept"));
+        assert!(both.contains("ip6 daddr 2001:db8::1 udp dport 51820 accept"));
+
+        // An endpoint written without a port: the rule is as wide as the
+        // address and no wider.
+        let portless = uplink_ruleset(&[EndpointSocket {
+            addr: "198.51.100.7".parse().unwrap(),
+            port: None,
+        }]);
+        assert!(portless.contains("\t\tip daddr 198.51.100.7 accept\n"));
+        assert!(!portless.contains("dport"));
+    }
+
+    #[test]
+    fn endpoints_of_the_config_become_the_uplinks_rules() {
+        let text = "[Interface]\n\
+                    PrivateKey = U1lOVEhFVElDLUtFWS1BLURPLU5PVC1VU0UtMDAwMDAwMDA9\n\
+                    [Peer]\n\
+                    Endpoint = 198.51.100.7:51820\n\
+                    [Peer]\n\
+                    Endpoint = 198.51.100.7:51820\n\
+                    [Peer]\n\
+                    Endpoint = [2001:db8::1]:51820\n\
+                    [Peer]\n\
+                    Endpoint = vpn.example.org:51820\n";
+        let cfg = WgConfig::parse_str(text).unwrap();
+        // Two peers behind one server are one rule; a name that never got
+        // resolved is left out rather than guessed at.
+        assert_eq!(
+            endpoint_sockets(&cfg),
+            vec![
+                EndpointSocket {
+                    addr: "198.51.100.7".parse().unwrap(),
+                    port: Some(51820),
+                },
+                EndpointSocket {
+                    addr: "2001:db8::1".parse().unwrap(),
+                    port: Some(51820),
+                },
+            ]
+        );
+
+        // And a config that has no peers at all yields no rules.
+        let bare = WgConfig::parse_str("[Interface]\nListenPort = 51820\n").unwrap();
+        assert!(endpoint_sockets(&bare).is_empty());
     }
 }

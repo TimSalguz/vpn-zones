@@ -89,6 +89,10 @@ let
   awg = "${pkgs.amneziawg-tools}/bin/awg";
   wg = "${pkgs.wireguard-tools}/bin/wg";
   pasta = "${pkgs.passt}/bin/pasta";
+  # Второй эшелон герметичности (docs/LEAK-MODEL.md): фаерволл в обоих
+  # namespace зоны. Зовёт его только держатель зоны, поэтому путь идёт флагом
+  # ExecStart, как ip/awg/wg/pasta, а не манифестом.
+  nft = "${pkgs.nftables}/bin/nft";
   notify = "${pkgs.libnotify}/bin/notify-send";
   kdialog = "${pkgs.kdePackages.kdialog}/bin/kdialog";
 
@@ -266,7 +270,7 @@ let
       bwrap = "${pkgs.bubblewrap}/bin/bwrap";
       dbus-proxy = "${pkgs.xdg-dbus-proxy}/bin/xdg-dbus-proxy";
       xwayland = "${pkgs.xwayland-satellite}/bin/xwayland-satellite";
-      # awg/wg/pasta здесь намеренно НЕТ: их зовёт только держатель зоны, и
+      # awg/wg/pasta/nft здесь намеренно НЕТ: их зовёт только держатель зоны, и
       # получает он их флагами ExecStart своего юнита. Дублировать пути в двух
       # местах — значит однажды поменять их в одном.
     }
@@ -404,9 +408,14 @@ in
       # Исключение — newuidmap/newgidmap: их держатель ищет ИМЕННО в PATH, как
       # это делал unshare(1), потому что setuid-обёртки лежат в /run/wrappers/bin
       # и в store их нет.
+      #
+      # --nft — второй эшелон (docs/LEAK-MODEL.md): в app-ns выход только через
+      # туннель, в uplink-ns наружу только пакеты самого туннеля до endpoint.
+      # Не поднявшийся фаерволл зону НЕ роняет: это страховка поверх топологии,
+      # и держатель громко пишет об этом в журнал.
       ExecStart =
         "${vpn-zone-rust}/bin/vpn-zone-core zone-holder"
-        + " --ip ${iproute} --awg ${awg} --wg ${wg} --pasta ${pasta} %i";
+        + " --ip ${iproute} --awg ${awg} --wg ${wg} --pasta ${pasta} --nft ${nft} %i";
       Restart = "no";
       # KillMode=control-group по умолчанию: гасим зону — гаснет и pasta, и всё,
       # что в зоне работало, теряет сеть. Это и есть kill switch.

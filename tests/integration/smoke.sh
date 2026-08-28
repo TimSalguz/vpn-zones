@@ -18,6 +18,14 @@
 # и awg0. Главный ассерт теста — именно это «ничего, кроме»: пока других
 # интерфейсов нет, утечка невозможна не по правилу, а по отсутствию пути.
 #
+# ВТОРОЙ ЭШЕЛОН проверяется МЯГКО, и это не халтура. nftables в зоне — страховка
+# поверх топологии, а не её основа: держатель, которому ядро не дало создать
+# таблицу (нет nf_tables — из непривилегированного userns модуль не
+# автозагружается), громко пишет об этом в журнал и поднимает зону дальше.
+# Раннер CI может оказаться и таким, и другим, поэтому ассерт различает ровно
+# два исхода: либо правила стоят и они те самые, либо предупреждение в журнале
+# держателя. Третьего — «правил нет и все молчат» — быть не должно.
+#
 # Тест использует зоны с именами smoke, smoke-crlf, offsmoke в
 # ~/.local/state/vpn-zones, профиль smoketest-prof в ~/.local/state/vpn-profiles,
 # набор доступов smoke-fsapp в ~/.config/vpn-zones/fs-perms и память пикера по
@@ -108,6 +116,7 @@ WG="$WORK/tools/bin/wg"
 IP="$WORK/tools/bin/ip"
 NSENTER="$WORK/tools/bin/nsenter"
 UNSHARE="$WORK/tools/bin/unshare"
+NFT="$WORK/tools/bin/nft"
 
 # --- 1. Предусловия ----------------------------------------------------------
 step "Проверяю предусловия раннера"
@@ -196,6 +205,53 @@ in_uplink() {
   "$NSENTER" --preserve-credentials -U -n -m -t "$UPID" -- "$@"
 }
 
+# То же, но uid 0 ВНУТРИ userns зоны — только для nft. Без --preserve-credentials
+# nsenter делает setuid(0)/setgid(0) уже внутри, где ноль — это subuid-«root»
+# зоны со всеми capabilities. Под обычным uid они обнуляются на execve
+# (docs/GOTCHAS.md §1), а nfnetlink требует CAP_NET_ADMIN даже на ЧТЕНИЕ
+# ruleset'а — ровно по этой же причине зона пишет зеркало `awg show` сама изнутри
+# (§4). Заодно это и есть свойство второго эшелона: программа, вошедшая в зону
+# обычным `vpn-zone run`, правил не то что снять — прочитать не может.
+in_zone_root() {
+  "$NSENTER" -U -n -m -t "$ZPID" -- "$@"
+}
+in_uplink_root() {
+  "$NSENTER" -U -n -m -t "$UPID" -- "$@"
+}
+
+# Второй эшелон: правила стоят и они те самые, ЛИБО ядро раннера не даёт
+# nf_tables и держатель честно сказал об этом. Третьего исхода нет.
+#
+# Мягкость ассерта могла бы спрятать НАШУ ошибку: битый ruleset тоже не
+# загрузился бы, тоже дал бы предупреждение — и тест позеленел бы на баге.
+# Поэтому «правил нет» разбирается до конца: если заведомо валидная пустая
+# таблица в этом же namespace создаётся, значит nf_tables работает и не принят
+# был именно наш ruleset — это провал, а не деградация.
+check_echelon() { # <входилка-в-namespace> <журнал держателя> <имя> <шаблон>…
+  local enter="$1" log="$2" what="$3"
+  shift 3
+  local err="$WORK/nft-$what.err" probe="$WORK/nft-$what.probe"
+  local rules pat
+  rules=$("$enter" "$NFT" list ruleset 2>"$err" || true)
+  echo "${rules:-<пусто>}"
+  if [ -n "$rules" ]; then
+    for pat in "$@"; do
+      echo "$rules" | grep -Eq "$pat" || fail "$what: в ruleset нет /$pat/"
+    done
+    echo "ok: $what — правила на месте"
+    return 0
+  fi
+  grep -qi 'second echelon is off' "$log" || {
+    printf 'nft сказал: %s\n' "$(cat "$err" 2>/dev/null)" >&2
+    fail "$what: правил нет, а держатель о выключенном эшелоне не предупредил"
+  }
+  if printf 'table inet vpnzoneprobe {}\n' | "$enter" "$NFT" -f - 2>"$probe"; then
+    printf 'nft о нашем ruleset: %s\n' "$(cat "$err" 2>/dev/null)" >&2
+    fail "$what: пустая таблица создаётся, а наш ruleset не принят — ошибка не в ядре, а у нас"
+  fi
+  echo "ok (деградация): $what без nf_tables ($(head -1 "$probe")); держит топология"
+}
+
 # --- 5. Проверки внутри зоны -------------------------------------------------
 # ГЛАВНЫЙ АССЕРТ ГЕРМЕТИЧНОСТИ (docs/LEAK-MODEL.md). Всё остальное — маршруты,
 # IPv6, DNS — производные от него: если в namespace приложений нет ничего, кроме
@@ -254,6 +310,13 @@ echo "$epr"
 echo "$epr" | grep -q 'dev awg0' \
   || fail "маршрут до endpoint идёт мимо туннеля — в app-ns остался путь наружу"
 
+step "Внутри зоны: второй эшелон — output policy drop, выпускать только в awg0"
+# Страховка поверх топологии, а не её замена: если однажды в app-ns по ошибке
+# появится ещё один интерфейс, трафик в него молча не уйдёт. Правило именно
+# oifname (по имени), а не oif (по индексу) — оно грузится ДО приезда туннеля.
+check_echelon in_zone_root "$WORK/holder-smoke.log" "app-ns" \
+  'chain output' 'policy drop' 'oifname "awg0" accept'
+
 step "Внутри аплинка: tap от pasta и default route (диагностика)"
 ulinks=$(in_uplink "$IP" -o link show)
 echo "$ulinks"
@@ -265,6 +328,14 @@ echo "${udef:-<пусто>}"
 if in_uplink "$IP" -o link show awg0 >/dev/null 2>&1; then
   fail "awg0 остался в uplink-ns — переезд интерфейса не состоялся"
 fi
+
+step "Внутри аплинка: второй эшелон — наружу только транспорт туннеля"
+# Аплинк заперт до одного адреса и одного порта: даже скомпрометированный
+# процесс здесь не отправит ничего, кроме пакетов туннеля. DNS и ICMP тут не
+# нужны — имя endpoint'а резолвится заранее, в сети хоста. Шаблон без ведущего
+# «ip»: нас интересует форма правила, а не то, как nft печатает семейство.
+check_echelon in_uplink_root "$WORK/holder-smoke.log" "uplink-ns" \
+  'chain output' 'policy drop' 'daddr 192\.0\.2\.1 udp dport 51820 accept'
 
 # --- 6. Контейнер данных (профиль) через vpn-zone run ------------------------
 # Проверяется весь путь запуска: nsenter в зону с --keep-caps, свой mount
@@ -442,6 +513,9 @@ echo "ok: offline-зона поднята, pid $OPID"
 in_off() {
   "$NSENTER" --preserve-credentials -U -n -m -t "$OPID" -- "$@"
 }
+in_off_root() {
+  "$NSENTER" -U -n -m -t "$OPID" -- "$@"
+}
 
 step "Внутри offline-зоны: только lo, default route отсутствует"
 links=$(in_off "$IP" -o link show)
@@ -451,6 +525,13 @@ echo "$links" | grep -q ': lo:' || fail "в offline-зоне нет даже lo"
 offdef=$(in_off "$IP" -4 route show default)
 [ -z "$offdef" ] || fail "в offline-зоне есть default route: $offdef"
 echo "ok: сети нет физически"
+
+step "Внутри offline-зоны: правил нет — запрещать нечего"
+# Второй эшелон сюда не ставится сознательно: интерфейсов, кроме lo, здесь не
+# будет никогда, и правило про них не сказало бы ничего нового.
+offrules=$(in_off_root "$NFT" list ruleset 2>/dev/null || true)
+[ -z "$offrules" ] || fail "в offline-зоне появился ruleset: $offrules"
+echo "ok: ruleset пуст"
 
 # --- 8. Гасим и проверяем уборку ---------------------------------------------
 step "Гашу держателей (TERM) и добиваю процессы зон"
