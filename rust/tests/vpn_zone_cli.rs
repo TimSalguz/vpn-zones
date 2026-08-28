@@ -61,6 +61,7 @@ impl Home {
             ("bwrap", "/nonexistent/bwrap".to_owned()),
             ("dbus-proxy", "/nonexistent/xdg-dbus-proxy".to_owned()),
             ("xwayland", "/nonexistent/xwayland-satellite".to_owned()),
+            ("notify-send", "/nonexistent/notify-send".to_owned()),
         ] {
             json.push_str(&format!("  \"{key}\": \"{value}\",\n"));
         }
