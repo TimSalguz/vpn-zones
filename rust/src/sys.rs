@@ -95,13 +95,17 @@ pub fn remove_tree(path: &Path) -> io::Result<()> {
 
 fn remove_tree_fallback(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    // Every error names the path and the operation: an EACCES three levels
+    // deep is undebuggable when the caller reports only the tree's root.
+    let at =
+        |op: &str, e: io::Error| io::Error::new(e.kind(), format!("{op} {}: {e}", path.display()));
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
+        Err(e) => return Err(at("stat", e)),
     };
     if !meta.is_dir() {
-        return std::fs::remove_file(path);
+        return std::fs::remove_file(path).map_err(|e| at("unlink", e));
     }
     // Empty but unreadable (the overlay's work/work): rmdir needs no read
     // permission on the directory itself.
@@ -110,11 +114,13 @@ fn remove_tree_fallback(path: &Path) -> io::Result<()> {
     }
     let mut perms = meta.permissions();
     perms.set_mode(perms.mode() | 0o700);
-    let _ = std::fs::set_permissions(path, perms);
-    for entry in std::fs::read_dir(path)? {
-        remove_tree_fallback(&entry?.path())?;
+    if let Err(e) = std::fs::set_permissions(path, perms) {
+        eprintln!("remove_tree: chmod {}: {e}", path.display());
     }
-    std::fs::remove_dir(path)
+    for entry in std::fs::read_dir(path).map_err(|e| at("opendir", e))? {
+        remove_tree_fallback(&entry.map_err(|e| at("readdir", e))?.path())?;
+    }
+    std::fs::remove_dir(path).map_err(|e| at("rmdir", e))
 }
 
 #[cfg(test)]
