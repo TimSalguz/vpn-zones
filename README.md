@@ -70,6 +70,32 @@ grep "^$USER:" /etc/subuid                 # range exists
 ls -l /dev/net/tun                         # crw-rw-rw-
 ```
 
+## Supported environments
+
+Most of the project does not depend on the desktop at all: the zones and the
+tunnel, DNS, the data containers, the filesystem sandbox with its seccomp
+filter, the `.desktop` interception (a freedesktop standard) and the portals —
+any backend will do. Two things do depend on it: the compositor layer and the
+dialogs.
+
+| environment | state |
+|---|---|
+| **Plasma 6, Wayland** | every layer, out of the box |
+| **niri / sway / wlroots, Wayland** | every layer — the development platform |
+| **GNOME, Wayland** | works, minus the compositor layer: Mutter has no `wp_security_context_v1`, so `wl-sandbox` starts the program unrestricted and says so on stderr. Mitigating: Mutter hands out no `wlr-screencopy`, `data-control`, `virtual-keyboard` or `foreign-toplevel` either — most of what that layer takes away does not exist there. Dialogs are Qt and look foreign |
+| **any X11 session** | the network and the filesystem are isolated, the display is NOT: the host's X socket is reachable from inside a zone, and one client there sees every window, keystroke and clipboard on the machine. Not recommended |
+| **not NixOS** | same logic, different packaging: nix plus standalone home-manager (a plain package is planned), unprivileged userns (on Ubuntu 24.04 also `sysctl kernel.apparmor_restrict_unprivileged_userns=0`), subuid/subgid, and `amneziawg` through DKMS — or the in-tree `wireguard`, which is supported as a fallback |
+
+Check the compositor:
+
+```sh
+wayland-info | grep -i security_context   # the protocol is there
+```
+
+`kdialog` is installed by the module itself, so no KDE session is needed —
+only the binary. A zenity/kdialog abstraction is on the roadmap (M6), and so is
+naming the degraded layer in `vpn-zone doctor` instead of on stderr alone.
+
 ## Installation
 
 ```nix
