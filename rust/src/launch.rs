@@ -33,7 +33,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::cli::{self, zone_pid};
@@ -373,6 +373,22 @@ fn env_nonempty(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|v| !v.is_empty())
 }
 
+/// The human-readable name the picker remembered for this key
+/// (`.labels/<key>`), if any.
+///
+/// Dialogs should say «Telegram», not "org.telegram.desktop": the raw id is
+/// the PERMISSION KEY, not a name for humans. A launch that never went through
+/// the picker has no label — callers fall back to the id, which is still
+/// better than naming no program at all.
+fn pretty_label(state: &Path, key: &OsStr) -> Option<String> {
+    if key.is_empty() {
+        return None;
+    }
+    let text = std::fs::read_to_string(state.join(".labels").join(key)).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
 /// Is there a graphical session to show a dialog on?
 ///
 /// Without one `kdialog` dies immediately, and treating that as "the user
@@ -425,6 +441,14 @@ pub fn run(tools: &Tools, argv: &[OsString]) -> u8 {
             .or_else(|| app_word(&selection.cmd))
             .unwrap_or(OsStr::new("")),
     );
+    // The human-readable name for every dialog below: the label the picker
+    // remembered for this key, when there is one. Two programs starting at
+    // once each ask their own questions, and a dialog that names its program
+    // with a raw id (or not at all) is how the answers get swapped.
+    let label = pretty_label(
+        &tools.state,
+        appid_env.as_deref().unwrap_or(appbin.as_os_str()),
+    );
     let mut cmd = selection.cmd.clone();
 
     if wayland_sandbox_wanted(tools, &appbin) {
@@ -461,6 +485,10 @@ pub fn run(tools: &Tools, argv: &[OsString]) -> u8 {
             wrapped.push("--name".into());
             wrapped.push(name.clone());
         }
+        if let Some(label) = &label {
+            wrapped.push("--label".into());
+            wrapped.push(label.clone().into());
+        }
         wrapped.push("--".into());
         wrapped.extend(cmd);
         cmd = wrapped;
@@ -492,8 +520,13 @@ pub fn run(tools: &Tools, argv: &[OsString]) -> u8 {
     if let Some(busy) = busy.filter(|_| !dryrun) {
         // Both `{busy}` and both `{zone}` get the same value, so a plain
         // replace does what the shell's five `%s` did.
+        // The pretty label again: the warning is about a PROGRAM, and with two
+        // of them launching the raw key does not say which one.
+        let shown = label
+            .clone()
+            .unwrap_or_else(|| appname.to_string_lossy().into_owned());
         let message = CONFLICT_MESSAGE
-            .replace("{app}", &appname.to_string_lossy())
+            .replace("{app}", &shown)
             .replace("{busy}", &busy)
             .replace("{zone}", &zone_name);
         if has_display() {
@@ -786,6 +819,24 @@ mod tests {
 
     fn os(s: &str) -> OsString {
         OsString::from(s)
+    }
+
+    #[test]
+    fn pretty_label_reads_trims_and_ignores_junk() {
+        let state = mkdtemp("/tmp/vpn-launch-test-XXXXXXXX").unwrap();
+        std::fs::create_dir_all(state.join(".labels")).unwrap();
+        std::fs::write(state.join(".labels").join("app"), "Телеграм\n").unwrap();
+        std::fs::write(state.join(".labels").join("blank"), "  \n").unwrap();
+        assert_eq!(
+            pretty_label(&state, OsStr::new("app")).as_deref(),
+            Some("Телеграм")
+        );
+        // Whitespace-only, missing and empty keys are all "no label": the
+        // dialog falls back to the id rather than showing «».
+        assert_eq!(pretty_label(&state, OsStr::new("blank")), None);
+        assert_eq!(pretty_label(&state, OsStr::new("missing")), None);
+        assert_eq!(pretty_label(&state, OsStr::new("")), None);
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]

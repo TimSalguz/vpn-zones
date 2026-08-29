@@ -73,7 +73,7 @@
 //!
 //! Usage:
 //! `vpn-zone-core fs-sandbox [--bwrap P] [--dbus-proxy P] [--kdialog P]
-//! [--xwayland P] <app-id> [--name <sandbox>] -- <command…>`.
+//! [--xwayland P] <app-id> [--name <sandbox>] [--label <text>] -- <command…>`.
 //!
 //! The tool paths are flags because Nix substitutes them: part of this runs
 //! inside namespaces where `PATH` can be anything, the same reason the zone
@@ -178,6 +178,12 @@ pub struct Args {
     /// programs can be started into it and they see each other's files but not
     /// yours. Without it the home is a tmpfs that dies with the program.
     pub sandbox: Option<String>,
+    /// `--label <text>`: the human-readable program name for the dialogs. The
+    /// app-id stays the KEY the permissions are remembered under; this is only
+    /// what the user reads. Two programs starting at once each ask their
+    /// question, and a dialog titled with a raw id is how the answers get
+    /// swapped.
+    pub label: Option<String>,
     pub tools: Tools,
     /// The program and its arguments.
     pub cmd: Vec<OsString>,
@@ -239,6 +245,7 @@ impl Args {
 
         let mut tools = Tools::default();
         let mut sandbox: Option<String> = None;
+        let mut label: Option<String> = None;
         let mut app_id: Option<OsString> = None;
         let mut rest = argv[..split].iter();
         while let Some(arg) = rest.next() {
@@ -264,6 +271,11 @@ impl Args {
                 "--name" => {
                     sandbox = Some(value.to_string_lossy().into_owned()).filter(|n| !n.is_empty())
                 }
+                // Same shape as `--name`: an empty label is "no label", not a
+                // dialog about a program called "".
+                "--label" => {
+                    label = Some(value.to_string_lossy().into_owned()).filter(|l| !l.is_empty())
+                }
                 _ => return Err(ArgError::UnknownFlag(flag)),
             }
         }
@@ -277,6 +289,7 @@ impl Args {
             // name must not cost the user the sandbox.
             app_id: app_id.to_string_lossy().into_owned(),
             sandbox,
+            label,
             tools,
             cmd,
         })
@@ -348,14 +361,20 @@ impl Perms {
 /// The dialog texts stay in Russian on purpose: they are read by the user at his
 /// desktop, and this project's i18n (ROADMAP M6) has not happened yet. Cancelling
 /// means "nothing allowed" — the safe answer.
-fn ask_permissions(kdialog: &Path, app_id: &str) -> Perms {
+fn ask_permissions(kdialog: &Path, shown: &str) -> Perms {
+    // The program's name goes into the BODY, not only the title: with two
+    // programs starting at once there are two of these dialogs on the screen,
+    // and the body is what the user actually reads before answering.
+    let question = format!(
+        "Что показать программе «{shown}»? Ничего не отмечай — и она не увидит НИЧЕГО из твоих файлов: нужное сможет получить только через диалог выбора файла, по одному."
+    );
     let out = Command::new(kdialog)
         .arg("--title")
-        .arg(format!("Доступ к файлам: {app_id}"))
+        .arg(format!("Доступ к файлам: {shown}"))
         .arg("--separate-output")
         .args([
             "--checklist",
-            "Что показать программе? Ничего не отмечай — и она не увидит НИЧЕГО из твоих файлов: нужное сможет получить только через диалог выбора файла, по одному.",
+            question.as_str(),
             "downloads", "Загрузки (~/Downloads)", "off",
             "documents", "Документы (~/Documents)", "off",
             "pictures", "Изображения (~/Pictures)", "off",
@@ -849,7 +868,10 @@ pub fn run(args: Args) -> u8 {
 
     if !perm_file.is_file() {
         let perms = if has_graphics() {
-            ask_permissions(&args.tools.kdialog, &args.app_id)
+            ask_permissions(
+                &args.tools.kdialog,
+                args.label.as_deref().unwrap_or(&args.app_id),
+            )
         } else {
             Perms::default()
         };
@@ -1153,6 +1175,16 @@ mod tests {
         // A launcher that lost the value must not create a directory called "".
         let a = Args::parse(&argv(&["app", "--name", "", "--", "prog"])).unwrap();
         assert_eq!(a.sandbox, None);
+    }
+
+    #[test]
+    fn a_label_is_kept_and_an_empty_one_is_none() {
+        // The label only feeds the dialogs; the permission KEY stays the id.
+        let a = Args::parse(&argv(&["app", "--label", "Телеграм", "--", "prog"])).unwrap();
+        assert_eq!(a.app_id, "app");
+        assert_eq!(a.label.as_deref(), Some("Телеграм"));
+        let a = Args::parse(&argv(&["app", "--label", "", "--", "prog"])).unwrap();
+        assert_eq!(a.label, None);
     }
 
     #[test]

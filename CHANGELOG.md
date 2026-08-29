@@ -14,6 +14,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   and a tcpdump leak watch on the uplink. Pins are shared with the harness via
   `tests/pins.nix`.
 
+### Changed (dialogs name the program)
+- The file-access dialog of the sandbox and the "already running in another
+  network" warning now name the program with the human-readable label the
+  picker remembered (`.labels/<key>`), falling back to the raw id — and the
+  access dialog says the name in the question body, not only the window
+  title: with two programs starting at once, two anonymous dialogs are how
+  permissions get granted to the wrong one. New `--label` flag on
+  `vpn-zone-core fs-sandbox`; old invocations without it behave as before.
+
 ### Fixed (zone readiness)
 - `vpn-zone up` right after a `down` could report «поднята» before the tunnel
   existed, and the unit autostart inside `vpn-zone run` (and the picker) could
