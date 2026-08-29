@@ -69,6 +69,11 @@ let
           linger = true;
         };
 
+        # zsh, like on a real desktop: without it /share/zsh is not linked into
+        # the per-user profile and the completion assert below would test
+        # nothing.
+        programs.zsh.enable = true;
+
         home-manager.useGlobalPkgs = true;
         # Per-user profile at /etc/profiles/per-user/alice — the layout the
         # module sees on a real NixOS machine, and the path its tools manifest
@@ -164,6 +169,10 @@ let
           alice("command -v vpn-zone")
           alice("systemctl --user cat vpn-zone@.service > /dev/null")
           alice("systemctl --user cat vpn-zone-desktop-sync.timer > /dev/null")
+          machine.succeed(
+              "test -f /etc/profiles/per-user/alice"
+              "/share/zsh/site-functions/_vpn-zone"
+          )
 
       with subtest("vpn-zone add: synthetic config (wg genkey, TEST-NET endpoint)"):
           alice(
@@ -179,6 +188,10 @@ let
           alice("vpn-zone up vmsmoke")
           alice("systemctl --user is-active vpn-zone@vmsmoke.service")
           machine.succeed(f"test -f {STATE}/vmsmoke/ready")
+
+      with subtest("tab completion offers the zone where a zone is expected"):
+          out = alice("vpn-zone _complete -- vpn-zone up \"\" 3")
+          assert "vmsmoke" in out.split(), out
 
       zpid = machine.succeed(f"cat {STATE}/vmsmoke/zone.pid").strip()
       upid = machine.succeed(f"cat {STATE}/vmsmoke/uplink.pid").strip()

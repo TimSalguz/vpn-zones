@@ -295,6 +295,45 @@ let
     ln -s ${vpn-zone-rust}/bin/vpn-zone-seccomp $out/bin/vpn-zone-seccomp
   '';
 
+  # Tab-дополнение для zsh и bash — тонкие обёртки над скрытой подкомандой
+  # `vpn-zone _complete` (rust/src/completion.rs): правила и знание зон,
+  # профилей и песочниц живут в крейте рядом с самими командами и покрыты
+  # тестами, оболочка только спрашивает и подставляет. Протокол: слова
+  # командной строки + 1-based позиция курсора, кандидаты по одному на строку;
+  # специальный ответ __files__ — «дополняй файлами сам». NixOS кладёт
+  # site-functions профилей в fpath через NIX_PROFILES (/etc/zshrc), bash
+  # подхватывает completions профиля пакетом bash-completion.
+  vpn-zone-completions =
+    let
+      zshScript = pkgs.writeText "vpn-zone.zsh-completion" ''
+        #compdef vpn-zone
+        local -a candidates
+        candidates=("''${(@f)$(vpn-zone _complete -- "''${(@)words}" "$CURRENT" 2>/dev/null)}")
+        if [[ "''${candidates[1]-}" == __files__ ]]; then
+          _files
+          return
+        fi
+        [[ -n "''${candidates[1]-}" ]] && compadd -- "''${candidates[@]}"
+      '';
+      bashScript = pkgs.writeText "vpn-zone.bash-completion" ''
+        _vpn_zone() {
+          local -a reply
+          mapfile -t reply < <(vpn-zone _complete -- "''${COMP_WORDS[@]}" "$((COMP_CWORD + 1))" 2>/dev/null)
+          if [[ "''${reply[0]-}" == __files__ ]]; then
+            compopt -o default
+            COMPREPLY=()
+            return
+          fi
+          COMPREPLY=("''${reply[@]}")
+        }
+        complete -F _vpn_zone vpn-zone
+      '';
+    in
+    pkgs.runCommand "vpn-zone-completions" { } ''
+      install -Dm444 ${zshScript} $out/share/zsh/site-functions/_vpn-zone
+      install -Dm444 ${bashScript} $out/share/bash-completion/completions/vpn-zone
+    '';
+
   # --- ЧАСТЬ 3б: ПИКЕР СЕТИ ---
   # Спрашивает при запуске, куда пустить программу. Вызывается из перехваченных
   # ярлыков (режим picker).
@@ -388,6 +427,7 @@ in
     # нет намеренно: его зовут только .desktop-записи,
     # своим store-путём и со своим VPN_ZONE_TOOLS.
     vpn-zone-helpers
+    vpn-zone-completions # Tab-дополнение zsh/bash (см. определение выше)
     pkgs.passt # userspace-сеть для зон
     pkgs.kdePackages.kdialog # файлпикер в стиле остального десктопа
   ];

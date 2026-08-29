@@ -101,6 +101,9 @@ pub fn main() -> ExitCode {
         b"default" => default_network(&tools, rest),
         b"pins" => pins(&tools),
         b"forget" => forget(&tools, rest),
+        // Hidden: the tab-completion scripts call it (rust/src/completion.rs).
+        // Not in USAGE — a protocol verb, not a command for humans.
+        b"_complete" => crate::completion::run(&tools, rest),
         _ => {
             eprintln!("неизвестная команда: {}", verb.to_string_lossy());
             print!("{USAGE}");

@@ -14,6 +14,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   and a tcpdump leak watch on the uplink. Pins are shared with the harness via
   `tests/pins.nix`.
 
+### Added (shell completion)
+- Tab completion for zsh and bash, installed by the module. Context-aware:
+  zone names where a zone is expected, profile/sandbox names after
+  `--profile`/`--sandbox`, subcommands, pinned programs for `forget`, file
+  completion where a path belongs. The rules live in the crate as the hidden
+  `vpn-zone _complete` verb (a pure, tested function); the shell scripts only
+  ask and insert.
+
 ### Changed (dialogs name the program)
 - The file-access dialog of the sandbox and the "already running in another
   network" warning now name the program with the human-readable label the
