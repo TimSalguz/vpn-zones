@@ -156,8 +156,11 @@ The subtleties that took the most time are commented in detail in
   storage directories;
 - `mount(8)` does not work as non-root even with `CAP_SYS_ADMIN`, so mounting
   is done by calling `libc.mount` directly;
-- NixOS runs `nsncd`, and without hiding it names resolve past the tunnel — a
-  classic DNS leak;
+- name resolution goes to a daemon over a **unix socket**, which no route and
+  no packet filter can stop: NixOS runs `nsncd`, and with `systemd-resolved`
+  enabled glibc asks it first of all (`resolve` stands before `dns` in
+  `nsswitch.conf`). Both sockets are hidden inside a zone — without that,
+  names resolve past the tunnel and a leak test names your real ISP;
 - Amnezia configs come in CRLF, and recent ones also with empty `I1`–`I5`
   parameters, on which `awg setconf` rejects the whole file.
 

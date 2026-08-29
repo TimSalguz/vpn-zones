@@ -61,8 +61,14 @@
 //!   `xdg-open` picks a handler by itself: Discord's login link opened in Chrome
 //!   although the default browser was zen. The file is tiny and holds no
 //!   secrets.
-//! * **Names do not resolve without `/run/systemd/resolve`.** `/etc/resolv.conf`
-//!   is a symlink into it and `/run` itself is not passed in.
+//! * **The resolv.conf goes in as a FILE, never as its directory.**
+//!   `/etc/resolv.conf` is a symlink chain ending outside `/etc` — on NixOS in
+//!   `/run/systemd/resolve` — and `/run` itself is not passed in, so without
+//!   that one file names do not resolve inside at all. The directory it lives
+//!   in must stay out: next to the file sits the varlink socket of the host's
+//!   systemd-resolved, and nss-resolve would use it to resolve names in the
+//!   HOST's network, around the zone's tunnel. That is a measured DNS leak, not
+//!   a theoretical one (`docs/GOTCHAS.md` §3).
 //! * **The permission dialog is not shown without a graphical session**: there
 //!   would be nowhere to show it and nobody to answer, and the program would
 //!   simply hang (measured). Then the answer is "nothing is allowed".
@@ -414,6 +420,11 @@ pub struct Layout {
     pub sandbox_home: Option<PathBuf>,
     /// `~/.config/mimeapps.list`, when it exists.
     pub mimeapps: Option<PathBuf>,
+    /// The file `/etc/resolv.conf` really is, when that is outside `/etc`.
+    /// `None` when `/etc` already contains it, or when there is nothing there
+    /// to bind — inside a zone whose resolver directory has just been hidden,
+    /// for one.
+    pub resolv: Option<PathBuf>,
     /// `/dev/dri` and the `/dev/nvidia*` nodes that exist.
     pub dev_nodes: Vec<PathBuf>,
     /// The compositor's socket — already the restricted one built by
@@ -463,9 +474,14 @@ pub fn bwrap_args(layout: &Layout, cmd: &[OsString]) -> Vec<OsString> {
     bind_same(&mut a, "--ro-bind-try", Path::new("/run/opengl-driver-32"));
     bind_same(&mut a, "--ro-bind", Path::new("/etc"));
     bind_same(&mut a, "--ro-bind-try", Path::new("/sys"));
-    // /etc/resolv.conf is a symlink into /run/systemd/resolve, and /run itself
-    // is not passed in: without this line names do not resolve inside.
-    bind_same(&mut a, "--ro-bind-try", Path::new("/run/systemd/resolve"));
+    // The FILE behind /etc/resolv.conf, and never the directory it lives in:
+    // /run is not passed in, so without this names do not resolve inside — and
+    // with the directory instead of the file the sandbox would also get the
+    // varlink socket of the host's systemd-resolved, i.e. a resolver in the
+    // host's network, around the tunnel. (`docs/GOTCHAS.md` §3)
+    if let Some(resolv) = &layout.resolv {
+        bind_same(&mut a, "--ro-bind-try", resolv);
+    }
     push(&mut a, "--dev");
     push(&mut a, "/dev");
     for node in &layout.dev_nodes {
@@ -587,6 +603,22 @@ pub fn bwrap_args(layout: &Layout, cmd: &[OsString]) -> Vec<OsString> {
     push(&mut a, "--");
     a.extend(cmd.iter().cloned());
     a
+}
+
+/// The real file behind `/etc/resolv.conf`, when it is not inside `/etc`.
+///
+/// `/etc` is bound into the sandbox whole, so a plain file there needs nothing
+/// from here. On a systemd machine the path is a chain of symlinks ending in
+/// `/run/systemd/resolve`, which is not passed in — that file has to be named
+/// explicitly or the sandbox resolves nothing at all.
+///
+/// Inside a zone the chain ends at the resolv.conf the zone bound there, i.e.
+/// at the servers of the tunnel; the socket that used to sit beside it is gone,
+/// covered by the zone's tmpfs. Nothing to bind then means exactly that:
+/// `None`, and `bwrap` is not asked for a source that is not there.
+fn resolv_file() -> Option<PathBuf> {
+    let target = crate::sys::link_target(Path::new("/etc/resolv.conf"));
+    (!target.starts_with("/etc") && target.is_file()).then_some(target)
 }
 
 /// The `/.flatpak-info` a toolkit looks at to decide it is sandboxed.
@@ -970,6 +1002,7 @@ pub fn run(args: Args) -> u8 {
         perms,
         sandbox_home,
         mimeapps: home.join(MIMEAPPS).is_file().then(|| home.join(MIMEAPPS)),
+        resolv: resolv_file(),
         dev_nodes: dev_nodes(Path::new("/dev")),
         // An absolute WAYLAND_DISPLAY is legal (libwayland accepts one) and is
         // then bound at its own path; the shell glued it onto the runtime
@@ -1317,6 +1350,7 @@ mod tests {
             perms: Perms::default(),
             sandbox_home: None,
             mimeapps: None,
+            resolv: Some(PathBuf::from("/run/systemd/resolve/stub-resolv.conf")),
             dev_nodes: Vec::new(),
             wayland: None,
             pipewire: None,
@@ -1348,10 +1382,39 @@ mod tests {
         "--ro-bind-try",
         "/sys",
         "/sys",
+        // The resolv.conf FILE. The directory around it holds the host
+        // resolver's socket and must never appear in this list.
         "--ro-bind-try",
-        "/run/systemd/resolve",
-        "/run/systemd/resolve",
+        "/run/systemd/resolve/stub-resolv.conf",
+        "/run/systemd/resolve/stub-resolv.conf",
     ];
+
+    /// The host resolver's socket lives in /run/systemd/resolve, and a
+    /// sandbox that can reach it resolves names in the HOST's network however
+    /// hermetic the zone around it is (`docs/GOTCHAS.md` §3). The file may go
+    /// in; the directory may not, and a missing file costs the sandbox its
+    /// names rather than the zone its hermeticity.
+    #[test]
+    fn the_directory_of_the_host_resolver_never_goes_into_the_sandbox() {
+        let got = strs(&bwrap_args(&layout(), &argv(&["prog"])));
+        assert!(
+            !got.iter().any(|a| a == "/run/systemd/resolve"),
+            "the host resolver's directory is in the sandbox: {got:?}"
+        );
+        assert!(got
+            .iter()
+            .any(|a| a == "/run/systemd/resolve/stub-resolv.conf"));
+
+        let bare = Layout {
+            resolv: None,
+            ..layout()
+        };
+        let got = strs(&bwrap_args(&bare, &argv(&["prog"])));
+        assert!(
+            !got.iter().any(|a| a.starts_with("/run/systemd/resolve")),
+            "nothing of the resolver may be bound when there is no file: {got:?}"
+        );
+    }
 
     #[test]
     fn the_default_sandbox_shows_nothing_of_the_home() {

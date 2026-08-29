@@ -11,7 +11,13 @@ use std::ffi::{CString, OsStr};
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// How many symlinks [`link_target`] follows before it gives up. The kernel's
+/// own limit is 40; a resolv.conf hidden behind more than a handful of links is
+/// a broken system, and any cap at all stops a symlink cycle from spinning here
+/// forever.
+const MAX_LINK_HOPS: usize = 8;
 
 /// `mount(2)`.
 ///
@@ -77,6 +83,63 @@ fn cstring(bytes: &[u8]) -> io::Result<CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "argument contains a NUL byte"))
 }
 
+/// Where a path really ends once every symlink on the way has been followed.
+///
+/// Two callers need this and both need it for the same reason: `mount(2)`
+/// resolves symlinks in its TARGET, and on NixOS `/etc/resolv.conf` is a chain
+/// of them (`/etc/static/resolv.conf` → `/run/systemd/resolve/stub-resolv.conf`).
+/// So the zone's bind mount does not land where it says it does, and the
+/// filesystem sandbox has to pass in a file that is not where it looks like it
+/// is. (`docs/GOTCHAS.md` §3)
+///
+/// `fs::canonicalize` cannot do this: it insists that every component exists,
+/// and the interesting case is exactly the one where the last link dangles —
+/// the zone has just covered the directory it points into with a tmpfs. A chain
+/// that leads nowhere therefore comes back as the path it leads to, not as an
+/// error; whether anything is there is the caller's question to ask.
+///
+/// The result carries no `..` left over from a relative link. The kernel would
+/// have resolved those itself, but a CALLER cannot: `/etc/../run/systemd/…` —
+/// which is what Ubuntu's `../run/systemd/resolve/stub-resolv.conf` expands to
+/// — starts with `/etc` for anyone asking `starts_with`, and the sandbox asks
+/// exactly that.
+pub fn link_target(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_LINK_HOPS {
+        let Ok(next) = std::fs::read_link(&current) else {
+            // Not a symlink, or not there at all: this is the end of the chain.
+            break;
+        };
+        current = normalize(match current.parent() {
+            // A relative link is relative to the directory the LINK is in.
+            Some(dir) if next.is_relative() => dir.join(next),
+            _ => next,
+        });
+    }
+    current
+}
+
+/// Fold `.` and `..` away without touching the filesystem.
+///
+/// Lexical, and that is a deliberate simplification: it differs from the
+/// kernel's answer only when the component before a `..` is itself a symlink to
+/// somewhere else, and the paths this is used on (`/etc`, `/run`) are ordinary
+/// directories on every system the project runs on.
+fn normalize(path: PathBuf) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// `rm -rf` that copes with what overlayfs leaves behind.
 ///
 /// The kernel creates `work/work` inside every overlay workdir with mode 000.
@@ -137,5 +200,49 @@ mod remove_tree_tests {
         std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o000)).unwrap();
         remove_tree(&root).unwrap();
         assert!(!root.exists());
+    }
+}
+
+#[cfg(test)]
+mod link_target_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn a_chain_is_followed_to_the_end_even_when_the_end_is_missing() {
+        let root = std::env::temp_dir().join(format!("vpn-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("etc/static")).unwrap();
+        std::fs::create_dir_all(root.join("run")).unwrap();
+        // The NixOS shape, seen from inside a zone that has just hidden the
+        // resolver's directory: a relative link, then an absolute one, then
+        // nothing at all where the chain ends.
+        symlink("static/resolv.conf", root.join("etc/resolv.conf")).unwrap();
+        symlink(
+            root.join("run/stub.conf"),
+            root.join("etc/static/resolv.conf"),
+        )
+        .unwrap();
+        assert_eq!(
+            link_target(&root.join("etc/resolv.conf")),
+            root.join("run/stub.conf")
+        );
+        // An ordinary file is its own target, and so is a path with nothing
+        // behind it: neither is a link.
+        std::fs::write(root.join("run/plain.conf"), b"nameserver 10.0.0.1\n").unwrap();
+        assert_eq!(
+            link_target(&root.join("run/plain.conf")),
+            root.join("run/plain.conf")
+        );
+        assert_eq!(link_target(&root.join("run/none")), root.join("run/none"));
+        // Ubuntu's shape: a link out of /etc and back down through `..`. The
+        // `..` must not survive, or a caller asking "is this inside /etc?"
+        // gets the wrong answer.
+        symlink("../run/stub.conf", root.join("etc/up.conf")).unwrap();
+        assert_eq!(
+            link_target(&root.join("etc/up.conf")),
+            root.join("run/stub.conf")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -95,6 +95,31 @@ let
           home.stateVersion = "26.05";
         };
 
+        # systemd-resolved, exactly as a real desktop runs it — and this is
+        # what makes the DNS leak test below possible at all. Enabling it puts
+        # `resolve [!UNAVAIL=return]` into /etc/nsswitch.conf BEFORE `dns`,
+        # turns /etc/resolv.conf into a symlink chain ending in
+        # /run/systemd/resolve/stub-resolv.conf, and puts the varlink socket
+        # nss-resolve talks to (io.systemd.Resolve) in that same directory. A
+        # zone that leaves that socket in reach resolves every name through the
+        # HOST's resolver, around the tunnel, however hermetic its namespace is
+        # (`docs/GOTCHAS.md` §3).
+        #
+        # Its only DNS server is a dnsmasq on loopback that the test starts,
+        # answering the one name with an address the tunnel's resolver never
+        # returns — so a single lookup says which resolver answered it.
+        services.resolved = {
+          enable = true;
+          settings.Resolve = {
+            DNS = [ "127.0.0.1:5353" ];
+            # No way out but that one server: an upstream fallback would make
+            # "the host answered" ambiguous.
+            FallbackDNS = [ ];
+            # Route every lookup to it, search domains or not.
+            Domains = [ "~." ];
+          };
+        };
+
         # The out-of-tree AmneziaWG module, built against this VM's kernel.
         # With it present the holder takes its ORDINARY branch for every zone
         # here: `ip link add awg0 type amneziawg`, configured by `awg`. The
@@ -127,6 +152,9 @@ let
           pkgs.socat
           pkgs.dnsutils
           pkgs.tcpdump
+          # The host's own resolver for the DNS leak test — the one whose
+          # answer must never appear inside a zone.
+          pkgs.dnsmasq
         ];
 
         virtualisation.cores = 4;
@@ -209,6 +237,23 @@ let
               "test -f /etc/profiles/per-user/alice"
               "/share/zsh/site-functions/_vpn-zone"
           )
+
+      # The DNS leak test needs two resolvers that disagree: the HOST's, which
+      # a zone must never reach, and the tunnel's own further down. One lookup
+      # then names whoever answered it. This one is the host's.
+      with subtest("the host has a resolver of its own, and it answers"):
+          machine.succeed(
+              "systemd-run --unit=hostdns dnsmasq -k --port=5353 --bind-interfaces "
+              "--listen-address=127.0.0.1 --no-resolv "
+              "--address=/leaktest.internal/10.66.66.66"
+          )
+          # resolved may have written the server off while dnsmasq was not
+          # there yet; a restart makes "it answers" mean what it says.
+          machine.succeed("systemctl restart systemd-resolved")
+          machine.wait_until_succeeds(
+              "getent ahostsv4 leaktest.internal | grep -q 10.66.66.66"
+          )
+          machine.succeed("test -S /run/systemd/resolve/io.systemd.Resolve")
 
       with subtest("vpn-zone add: synthetic config (wg genkey, TEST-NET endpoint)"):
           alice(
@@ -333,6 +378,16 @@ let
               "systemctl --user is-active vpn-zone@offline.service || true"
           ).strip()
           assert status == "active", f"picker did not start the offline unit: {status}"
+
+      # "Offline" has to mean offline for NAMES too. A unix socket is not an
+      # interface: without the hiding, a program in a zone with nothing but
+      # loopback could still have any name looked up by the host's resolver —
+      # which tells the outside world what it wants and carries out with it
+      # anything that can be spelled into a hostname.
+      with subtest("an offline zone cannot reach the host's resolver either"):
+          opid = machine.succeed(f"cat {STATE}/offline/zone.pid").strip()
+          in_zone(opid, "test ! -e /run/systemd/resolve/io.systemd.Resolve")
+          in_zone(opid, "sh -c '! getent ahostsv4 leaktest.internal'")
           alice("vpn-zone down offline")
 
       # --- The real tunnel: an actual WireGuard peer on the second VM -------
@@ -420,6 +475,27 @@ let
           assert "nameserver 10.99.0.1" in out, out
           out = in_zone(rzpid, "dig +time=5 +tries=2 +short leaktest.internal @10.99.0.1")
           assert "10.99.0.9" in out, f"DNS through the tunnel failed: {out}"
+
+      # THE DNS LEAK TEST. Everything above went through resolv.conf; this is
+      # the path programs actually take — glibc's NSS, where `resolve` stands
+      # ahead of `dns` and talks varlink to the host's resolved over a unix
+      # socket. That is how a browser in a zone reported the user's real ISP as
+      # its resolver while `curl ifconfig.me` in the same zone correctly showed
+      # the VPN's address (`docs/GOTCHAS.md` §3).
+      with subtest("no DNS leak: the NSS path stays inside the tunnel"):
+          # The socket is gone in the zone and untouched outside it: the tmpfs
+          # lives in the zone's mount namespace and nowhere else.
+          in_zone(rzpid, "test ! -e /run/systemd/resolve/io.systemd.Resolve")
+          machine.succeed("test -S /run/systemd/resolve/io.systemd.Resolve")
+          # getent and not dig, and that is the whole point: dig reads
+          # resolv.conf itself and would have answered correctly while every
+          # program on the machine was leaking.
+          out = in_zone(rzpid, "getent ahostsv4 leaktest.internal")
+          assert "10.66.66.66" not in out, f"DNS LEAK: the host's resolver answered inside the zone: {out}"
+          assert "10.99.0.9" in out, f"the zone resolved nothing through the tunnel: {out}"
+          # And the host still resolves as it did before the zone came up.
+          out = machine.succeed("getent ahostsv4 leaktest.internal")
+          assert "10.66.66.66" in out, f"the zone broke the host's own resolver: {out}"
 
       with subtest("vpn-zone check reports a live tunnel"):
           # The status mirror refreshes every 5 seconds from inside the zone;

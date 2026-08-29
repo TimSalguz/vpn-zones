@@ -129,6 +129,27 @@ const READY: &str = "ready";
 const STATUS: &str = "status";
 const STATUS_TMP: &str = "status.tmp";
 const RESOLV: &str = "resolv.conf";
+/// What the zone's own resolv.conf is bound over. A path and not a file name:
+/// on NixOS it is a chain of symlinks and the mount lands at the end of it
+/// (`sys::link_target`).
+const ETC_RESOLV: &str = "/etc/resolv.conf";
+/// Directories holding a unix socket through which a daemon in the HOST's
+/// network answers name lookups. Every one of them is covered by a tmpfs inside
+/// the zone — see `hide_host_resolvers`, where the reason is written down.
+///
+/// Grouped, because the first entry is a pair: `/var/run` is a symlink to
+/// `/run` on any modern system, so hiding either name hides the one directory
+/// and there is nothing left to do in that group. The groups themselves are
+/// independent and each is hidden on its own.
+const RESOLVER_DIRS: [&[&str]; 3] = [
+    // nscd, or the nsncd NixOS runs in its place.
+    &["/run/nscd", "/var/run/nscd"],
+    // systemd-resolved: `io.systemd.Resolve`, the varlink socket nss-resolve
+    // talks to, and `io.systemd.Resolve.Monitor` next to it.
+    &["/run/systemd/resolve"],
+    // avahi, i.e. nss-mdns — it would put the name onto the host's LAN.
+    &["/run/avahi-daemon"],
+];
 /// The config with the wg-quick directives taken out and every `Endpoint`
 /// turned into a literal address, i.e. what `setconf` gets.
 const STRIPPED: &str = ".stripped.conf";
@@ -1147,6 +1168,15 @@ fn zone_setup(zone: &Zone, links: Option<ZoneLinks<'_>>) -> Result<(), String> {
         .map_err(|e| format!("cannot write {PID}: {e}"))?;
     zone.ip(&["link", "set", "lo", "up"])?;
 
+    // BEFORE the offline branch, and deliberately so: an "offline" zone that
+    // still sees the host's resolver sockets is not offline at all. A program
+    // in it cannot open a connection, but it can have any name looked up by a
+    // daemon in the HOST's network — which tells the outside world what it is
+    // looking for and carries out with it anything that can be spelled into a
+    // hostname. The policy "an unknown program gets no network" is only true
+    // once these are gone.
+    hide_host_resolvers(zone)?;
+
     let Some(ZoneLinks {
         cfg,
         ready_w,
@@ -1156,6 +1186,11 @@ fn zone_setup(zone: &Zone, links: Option<ZoneLinks<'_>>) -> Result<(), String> {
         // An offline zone gets no rules, and needs none: loopback is the only
         // interface there will ever be, and `oifname "lo" accept` over an empty
         // namespace would say nothing that the empty namespace does not.
+        //
+        // Nor does it get a resolv.conf of its own: with the sockets above
+        // hidden, whatever the host's file names is unreachable from a
+        // namespace that has only loopback, and a name here simply does not
+        // resolve. Which is what offline has to mean.
         touch(&zone.path(READY)).map_err(|e| format!("cannot create {READY}: {e}"))?;
         println!("zone {}: no network (loopback only)", zone.name());
         return Ok(());
@@ -1272,12 +1307,11 @@ fn zone_setup(zone: &Zone, links: Option<ZoneLinks<'_>>) -> Result<(), String> {
         }
     }
 
-    hide_nscd(zone);
-
     // --- THE ZONE'S DNS ---
-    // Without this the queries would go to the host's resolver around the
-    // tunnel — the most common leak of all. The bind mount is visible inside
-    // the zone only: the rest of the system keeps its own /etc/resolv.conf.
+    // The other half of `hide_host_resolvers`: with no daemon left to ask,
+    // glibc goes to the servers named here — and they are reachable only
+    // through the tunnel. The bind mount is visible inside the zone only: the
+    // rest of the system keeps its own /etc/resolv.conf.
     let (text, defaulted) = resolv_conf(&cfg.dns());
     if defaulted {
         println!(
@@ -1288,14 +1322,26 @@ fn zone_setup(zone: &Zone, links: Option<ZoneLinks<'_>>) -> Result<(), String> {
     }
     let resolv = zone.path(RESOLV);
     fs::write(&resolv, &text).map_err(|e| format!("cannot write {RESOLV}: {e}"))?;
-    sys::mount(
-        resolv.as_os_str(),
-        Path::new("/etc/resolv.conf"),
-        "",
-        libc::MS_BIND,
-        "",
-    )
-    .map_err(|e| format!("cannot bind-mount {RESOLV} over /etc/resolv.conf: {e}"))?;
+    // WHERE the mount lands is not /etc/resolv.conf. `mount(2)` follows the
+    // symlinks in its target, and on NixOS that path is a chain ending in
+    // /run/systemd/resolve/stub-resolv.conf — inside the tmpfs that has just
+    // hidden the host's resolved. The last link then dangles, so the file has
+    // to be created before anything can be mounted over it; the old code
+    // mounted onto whatever the chain happened to point at and would have
+    // failed here with a bare ENOENT.
+    let target = sys::link_target(Path::new(ETC_RESOLV));
+    if !target.exists() {
+        if let Some(dir) = target.parent() {
+            fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+        touch(&target).map_err(|e| format!("cannot create {}: {e}", target.display()))?;
+    }
+    sys::mount(resolv.as_os_str(), &target, "", libc::MS_BIND, "").map_err(|e| {
+        format!(
+            "cannot bind-mount {RESOLV} over {ETC_RESOLV} ({}): {e}",
+            target.display()
+        )
+    })?;
 
     // THE PROFILE IS NOT MOUNTED HERE, AND THAT MATTERS. The first version
     // stacked the data layer right here, over the whole zone — and the profile
@@ -1351,34 +1397,76 @@ fn start_status_mirror(zone: &Zone, wgtool: &Path) {
     });
 }
 
-/// Close the host's caching resolver off from the zone.
+/// Close every resolver of the HOST off from the zone.
 ///
-/// This is not theory: NixOS runs nsncd (socket `/run/nscd/socket`) and glibc
-/// asks it for names instead of the servers in resolv.conf. The daemon lives in
-/// the HOST's network, so names inside the zone used to be resolved around the
-/// tunnel — verified on a live zone, where `getent` answered while awg0 still
-/// had RX=0. A classic DNS leak, and swapping resolv.conf does not cure it, nor
-/// does the gateway layout: a unix socket is not an interface and has no route
-/// to remove.
+/// The topology cannot do this one. A name is resolved by asking a daemon over
+/// a UNIX SOCKET, and a socket is not an interface: it has no route to remove,
+/// no interface to leave by and no packet for a filter to see. The daemon on
+/// the other end sits in the host's network and answers from there — so with
+/// the socket in reach, `getaddrinfo` inside a zone goes around the tunnel no
+/// matter how hermetic the namespace is, and swapping resolv.conf does not cure
+/// it either.
 ///
-/// A tmpfs over the directory hides the socket inside the zone only: glibc does
-/// not find it and goes straight to the servers in resolv.conf, i.e. through
-/// the tunnel. For the rest of the system nsncd keeps working as before.
-/// (`docs/GOTCHAS.md` §3)
-fn hide_nscd(zone: &Zone) {
-    for dir in ["/run/nscd", "/var/run/nscd"] {
+/// Both known leaks are real, both were measured on a live zone:
+///
+/// * **nsncd** (`/run/nscd/socket`), which NixOS runs: `getent` answered while
+///   awg0 still had RX=0 — the query had never touched the tunnel.
+/// * **systemd-resolved** (`/run/systemd/resolve/io.systemd.Resolve`), which
+///   nss-resolve talks varlink to. NixOS puts `resolve` FIRST in
+///   `/etc/nsswitch.conf`, ahead of `dns`, so with resolved enabled EVERY
+///   lookup in the zone went to the host's resolver: a leak test run in a
+///   browser inside a zone named the user's real ISP as the resolver, while
+///   `curl ifconfig.me` in the same zone correctly showed the VPN's address.
+///   `resolvectl status` from inside the zone answering at all is the tell.
+///
+/// avahi (nss-mdns) is here for the same reason before anyone measures it: it
+/// would put the name onto the host's LAN.
+///
+/// A tmpfs over the directory hides the socket inside the zone only, and the
+/// zone's mount tree is private — the daemons keep serving the rest of the
+/// system exactly as before. glibc then finds nothing to ask, nss-resolve
+/// answers UNAVAIL (which is precisely the case `[!UNAVAIL=return]` in
+/// nsswitch.conf falls through) and the `dns` module goes to the servers in the
+/// zone's own resolv.conf — through the tunnel.
+///
+/// A failure here is fatal to the zone, and that is the fail-closed rule: a
+/// zone that comes up while its programs resolve names in the host's network is
+/// worse than no zone, because it looks exactly like a working one.
+/// (`docs/GOTCHAS.md` §3, `docs/LEAK-MODEL.md`)
+fn hide_host_resolvers(zone: &Zone) -> Result<(), String> {
+    let mut hidden: Vec<&str> = Vec::new();
+    for group in RESOLVER_DIRS {
+        if let Some(dir) = hide_first(group)? {
+            hidden.push(dir);
+        }
+    }
+    // One line, and it is worth its place in the journal: this is where the
+    // question "could a name have gone around the tunnel?" is answered.
+    println!(
+        "zone {}: host resolvers hidden ({})",
+        zone.name(),
+        if hidden.is_empty() {
+            "none running".to_string()
+        } else {
+            hidden.join(", ")
+        }
+    );
+    Ok(())
+}
+
+/// Cover the first of `dirs` that exists with an empty tmpfs, and say which.
+fn hide_first<'a>(dirs: &[&'a str]) -> Result<Option<&'a str>, String> {
+    for &dir in dirs {
         let path = Path::new(dir);
         if !path.is_dir() {
             continue;
         }
-        if let Err(e) = sys::mount(OsStr::new("tmpfs"), path, "tmpfs", 0, "mode=0755,size=64k") {
-            eprintln!(
-                "zone {}: could not hide {dir} ({e}) — a DNS leak is possible",
-                zone.name()
-            );
-        }
-        break;
+        sys::mount(OsStr::new("tmpfs"), path, "tmpfs", 0, "mode=0755,size=64k").map_err(|e| {
+            format!("cannot hide the host's resolver at {dir}: {e} — the zone would leak DNS")
+        })?;
+        return Ok(Some(dir));
     }
+    Ok(None)
 }
 
 // --- PURE HELPERS (the testable half) ----------------------------------------
@@ -1872,6 +1960,30 @@ mod tests {
         // A DNS= line of nothing but separators is the same as no line at all.
         let (_, defaulted) = resolv_conf(&[String::new()]);
         assert!(defaulted);
+    }
+
+    /// A guard over a security invariant rather than over an algorithm: every
+    /// entry in this table is a measured DNS leak (`docs/GOTCHAS.md` §3), and
+    /// dropping one gives every program in every zone a resolver in the host's
+    /// network back. The behaviour itself is asserted where it can be — inside
+    /// a VM with systemd-resolved running (`tests/vm.nix`).
+    #[test]
+    fn every_known_host_resolver_socket_is_in_the_table() {
+        let all: Vec<&str> = RESOLVER_DIRS
+            .iter()
+            .flat_map(|g| g.iter().copied())
+            .collect();
+        for must in [
+            // nsncd, what NixOS runs.
+            "/run/nscd",
+            // systemd-resolved's varlink socket: nss-resolve, and `resolve`
+            // comes BEFORE `dns` in nsswitch.conf.
+            "/run/systemd/resolve",
+            // nss-mdns.
+            "/run/avahi-daemon",
+        ] {
+            assert!(all.contains(&must), "{must} is no longer hidden from zones");
+        }
     }
 
     #[test]

@@ -5,6 +5,38 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
 
 ## [Unreleased]
 
+### Fixed (DNS leak: the host's resolvers were reachable from inside a zone)
+- **Every name looked up inside a zone could be resolved by the HOST's
+  systemd-resolved, around the tunnel.** nss-resolve talks varlink over
+  `/run/systemd/resolve/io.systemd.Resolve`, a unix socket that no route and
+  no packet filter can stop, and NixOS puts `resolve` ahead of `dns` in
+  `nsswitch.conf` — so with resolved enabled this was the path of every
+  lookup, while the traffic itself correctly went through the tunnel. Measured
+  on a live zone: a browser leak test named the user's real ISP as the
+  resolver while `curl ifconfig.me` in the same zone showed the VPN's address.
+  The zone now hides every directory holding a host resolver's socket behind
+  an empty tmpfs of its own — nscd/nsncd (as before), systemd-resolved and
+  avahi (nss-mdns) — and a failure to do so takes the zone down instead of
+  bringing it up leaking (`rust/src/zone.rs`, `hide_host_resolvers`).
+- The hiding now happens **before** the offline branch: an offline zone used
+  to keep the host's resolver sockets, which is a way out of a zone whose
+  entire point is that there is none — a name is a channel, and data can be
+  spelled into one.
+- The zone's `resolv.conf` bind mount follows the symlink chain by hand and
+  creates the file it lands on when it is missing. On NixOS the target is
+  `/run/systemd/resolve/stub-resolv.conf`, i.e. inside the tmpfs that has just
+  hidden resolved: without this the mount would fail with a bare ENOENT and
+  take the zone with it (`sys::link_target`).
+- The filesystem sandbox passes in the resolv.conf **file** and no longer its
+  directory: `--ro-bind-try /run/systemd/resolve` handed every sandboxed
+  program the host resolver's socket. Names still resolve inside; the socket
+  does not come with them (`rust/src/fs_sandbox.rs`).
+- Regression coverage in the VM test: the machine now runs systemd-resolved
+  with a resolver of its own answering `leaktest.internal` with an address the
+  tunnel's resolver never returns, so one `getent` inside the zone says whose
+  resolver answered. Asserted for a live tunnel and for an offline zone, plus
+  "the host's own resolution is untouched".
+
 ### Added
 - A NixOS VM test (`tests/vm.nix`): a qemu machine with a real systemd user
   session and the home-manager module, plus a second VM acting as a live
