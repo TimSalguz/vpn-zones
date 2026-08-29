@@ -133,17 +133,27 @@ pub fn zone_pid(state: &Path, name: &OsStr) -> Option<i32> {
     proc_is_alive(pid).then_some(pid)
 }
 
-/// Wait for the zone's `ready` file, ten seconds at most. Returns whether it
-/// appeared.
+/// Wait for the zone to come up, ten seconds at most: the `ready` marker AND
+/// a live zone process.
+///
+/// The bare file is not enough. Stale state (`ready`, `zone.pid`) survives a
+/// stop: the holder removes leftovers, but only when the NEXT one starts, and
+/// between `systemctl start` and that cleanup the old `ready` is still on
+/// disk. Trusting it made `up` after a `down` report "поднята" before the
+/// tunnel existed, and made the autostart inside `run` (and the picker) fail
+/// instantly — stale `ready`, dead `zone.pid`, «зона не поднимается». Caught
+/// by tests/vm.nix on the first run of the systemd path; the smoke test
+/// cannot see it (no `systemctl --user` on the CI runner).
 pub fn wait_ready(state: &Path, name: &OsStr) -> bool {
     let ready = state.join(name).join("ready");
+    let up = || ready.is_file() && zone_pid(state, name).is_some();
     for _ in 0..READY_TRIES {
-        if ready.is_file() {
+        if up() {
             return true;
         }
         std::thread::sleep(READY_STEP);
     }
-    ready.is_file()
+    up()
 }
 
 /// `systemctl --user <verb> vpn-zone@<name>.service`, waited for.

@@ -5,6 +5,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
 
 ## [Unreleased]
 
+### Added
+- A NixOS VM test (`tests/vm.nix`): a qemu machine with a real systemd user
+  session and the home-manager module, plus a second VM acting as a live
+  WireGuard peer. Covers what the CI smoke cannot — `vpn-zone up/down` through
+  the `vpn-zone@` unit, the unit autostart inside `vpn-zone run`, the picker's
+  offline branch, a real handshake/`vpn-zone check`, DNS through the tunnel,
+  and a tcpdump leak watch on the uplink. Pins are shared with the harness via
+  `tests/pins.nix`.
+
+### Fixed (zone readiness)
+- `vpn-zone up` right after a `down` could report «поднята» before the tunnel
+  existed, and the unit autostart inside `vpn-zone run` (and the picker) could
+  fail instantly with «зона не поднимается»: readiness was judged by the bare
+  `ready` file, which survives a stop until the NEXT holder start cleans it
+  up. Readiness now requires the marker AND a live zone process. Found by the
+  VM test on its first pass over the systemd path.
+
 ### Fixed (launch-flow audit of the picker and `run`)
 - Pinned sandboxes ("… — always" with a named or per-app sandbox) were erased
   by pin validation on the very next launch.
