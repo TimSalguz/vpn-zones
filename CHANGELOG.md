@@ -13,6 +13,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   offline branch, a real handshake/`vpn-zone check`, DNS through the tunnel,
   and a tcpdump leak watch on the uplink. Pins are shared with the harness via
   `tests/pins.nix`.
+- AmneziaWG coverage in the VM test: both VMs now load the out-of-tree
+  `amneziawg` kernel module, so the zone holder takes its ordinary `ip link
+  add … type amneziawg` branch instead of the wireguard fallback (which stays
+  covered by the CI smoke, whose runner has no such module). Asserted on a
+  plain config against a stock WireGuard peer (wire compatibility), and on a
+  new zone with real obfuscation — Jc/Jmin/Jmax, S1/S2, H1–H4 — against a
+  second server interface carrying the same parameters: handshake seen by
+  `vpn-zone check`, TCP through the tunnel, and an empty leak capture.
 
 ### Added (shell completion)
 - Tab completion for zsh and bash, installed by the module. Context-aware:
