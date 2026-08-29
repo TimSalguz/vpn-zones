@@ -143,7 +143,13 @@ pub fn candidates(words: &[String], cursor: usize, snap: &Snapshot) -> Vec<Strin
                     _ if pos == 2 => owned(&mut out, &snap.zones),
                     _ => strs(
                         &mut out,
-                        &["--profile", "--sandbox", "--fs-sandbox", "--tmp-profile", "--"],
+                        &[
+                            "--profile",
+                            "--sandbox",
+                            "--fs-sandbox",
+                            "--tmp-profile",
+                            "--",
+                        ],
                     ),
                 }
             }
@@ -229,9 +235,14 @@ mod tests {
     #[test]
     fn the_first_word_offers_verbs_and_respects_the_prefix() {
         assert!(complete(&["vpn-zone", ""], 2).contains(&"up".to_string()));
-        assert_eq!(complete(&["vpn-zone", "de"], 2), ["default", "default-profile"]);
+        assert_eq!(
+            complete(&["vpn-zone", "de"], 2),
+            ["default", "default-profile"]
+        );
         // The hidden verb stays hidden.
-        assert!(!complete(&["vpn-zone", "_"], 2).iter().any(|c| c == "_complete"));
+        assert!(!complete(&["vpn-zone", "_"], 2)
+            .iter()
+            .any(|c| c == "_complete"));
     }
 
     #[test]
@@ -247,11 +258,20 @@ mod tests {
     fn run_understands_its_flags() {
         let flags = complete(&["vpn-zone", "run", "nl", ""], 4);
         assert!(flags.contains(&"--profile".to_string()));
-        assert_eq!(complete(&["vpn-zone", "run", "nl", "--profile", ""], 5), ["work"]);
+        assert_eq!(
+            complete(&["vpn-zone", "run", "nl", "--profile", ""], 5),
+            ["work"]
+        );
         assert_eq!(complete(&["vpn-zone", "run", "nl", "-p", ""], 5), ["work"]);
-        assert_eq!(complete(&["vpn-zone", "run", "nl", "--sandbox", ""], 5), ["dev"]);
+        assert_eq!(
+            complete(&["vpn-zone", "run", "nl", "--sandbox", ""], 5),
+            ["dev"]
+        );
         // After the `--` it is the program's command line: files, not ours.
-        assert_eq!(complete(&["vpn-zone", "run", "nl", "--", "fire"], 5), [FILES]);
+        assert_eq!(
+            complete(&["vpn-zone", "run", "nl", "--", "fire"], 5),
+            [FILES]
+        );
     }
 
     #[test]
@@ -267,10 +287,7 @@ mod tests {
             complete(&["vpn-zone", "forget", ""], 3),
             ["firefox", "--all"]
         );
-        assert_eq!(
-            complete(&["vpn-zone", "default", "o"], 3),
-            ["offline"]
-        );
+        assert_eq!(complete(&["vpn-zone", "default", "o"], 3), ["offline"]);
         assert_eq!(complete(&["vpn-zone", "add", "name", ""], 4), [FILES]);
     }
 

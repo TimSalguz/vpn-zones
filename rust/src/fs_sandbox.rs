@@ -375,11 +375,21 @@ fn ask_permissions(kdialog: &Path, shown: &str) -> Perms {
         .args([
             "--checklist",
             question.as_str(),
-            "downloads", "Загрузки (~/Downloads)", "off",
-            "documents", "Документы (~/Documents)", "off",
-            "pictures", "Изображения (~/Pictures)", "off",
-            "x11", "Свой X-сервер (нужен Wine и старым программам)", "off",
-            "home", "ВЕСЬ домашний каталог — файловой изоляции не будет", "off",
+            "downloads",
+            "Загрузки (~/Downloads)",
+            "off",
+            "documents",
+            "Документы (~/Documents)",
+            "off",
+            "pictures",
+            "Изображения (~/Pictures)",
+            "off",
+            "x11",
+            "Свой X-сервер (нужен Wine и старым программам)",
+            "off",
+            "home",
+            "ВЕСЬ домашний каталог — файловой изоляции не будет",
+            "off",
         ])
         .stderr(Stdio::null())
         .output();
