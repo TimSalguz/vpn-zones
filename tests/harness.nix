@@ -1,12 +1,8 @@
 # Автономная тестовая обвязка: собирает home-manager-конфигурацию с модулем
 # vpn-zones БЕЗ flake-инпутов (у flake.nix их нет намеренно). nixpkgs и
-# home-manager пинуются здесь, по конкретному коммиту стабильной ветки с явным
-# sha256 — сборка воспроизводима и не едет вслед за веткой.
-#
-# Обновление пинов:
-#   git ls-remote https://github.com/NixOS/nixpkgs refs/heads/nixos-XX.YY
-#   nix-prefetch-url --unpack https://github.com/NixOS/nixpkgs/archive/<rev>.tar.gz
-#   (и то же для home-manager, ветка release-XX.YY)
+# home-manager пинуются в tests/pins.nix — конкретный коммит стабильной ветки с
+# явным sha256, сборка воспроизводима и не едет вслед за веткой. Оттуда же пины
+# берёт и VM-тест (tests/vm.nix).
 #
 # Использование:
 #   nix-instantiate tests/harness.nix -A activationPackage        # только eval
@@ -20,19 +16,9 @@
 }:
 
 let
-  # nixpkgs, ветка nixos-26.05
-  nixpkgsSrc = builtins.fetchTarball {
-    name = "nixpkgs-nixos-26.05-062346a6";
-    url = "https://github.com/NixOS/nixpkgs/archive/062346a6d85bc4b49dfaa61c986e9c5be21217d1.tar.gz";
-    sha256 = "063ximydq4y927a6vq6aajvznf0mdyxnv4z29q8j09jiss5q5585";
-  };
-
-  # home-manager, ветка release-26.05 (в пару к nixpkgs выше)
-  homeManagerSrc = builtins.fetchTarball {
-    name = "home-manager-release-26.05-65258d5c";
-    url = "https://github.com/nix-community/home-manager/archive/65258d5c65a250189fde2e35f490d15e064c4c62.tar.gz";
-    sha256 = "1qsx6l8z2v2rzr47chfqvmr9585lcrb2wihixbklmz63nhsba6sb";
-  };
+  pins = import ./pins.nix;
+  nixpkgsSrc = pins.nixpkgs;
+  homeManagerSrc = pins.home-manager;
 
   pkgs = import nixpkgsSrc {
     inherit system;

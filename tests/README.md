@@ -2,9 +2,12 @@
 
 ## Что здесь лежит
 
+- **`pins.nix`** — пины nixpkgs (`nixos-26.05`) и home-manager
+  (`release-26.05`): конкретные коммиты стабильных веток с явными `sha256`.
+  Общие для `harness.nix` и `vm.nix`.
+
 - **`harness.nix`** — автономная обвязка без flake-инпутов (у `flake.nix` их
-  нет намеренно). Пинует nixpkgs (`nixos-26.05`) и home-manager
-  (`release-26.05`) по конкретным коммитам с явными `sha256`, собирает
+  нет намеренно). Собирает
   home-manager-конфигурацию с `programs.vpn-zones.enable = true` и отдаёт:
   - `activationPackage` — вся конфигурация (для проверки eval);
   - `scripts.<имя>` — каждая script-деривация модуля адресно. Их осталось
@@ -29,6 +32,23 @@
 
 - **`integration/smoke.sh`** — смоук: поднимает настоящую зону в
   непривилегированном userns и проверяет её изнутри через `nsenter`.
+
+- **`vm.nix`** — VM-тест на фреймворке NixOS-тестов: qemu-машина с настоящим
+  systemd, пользователем и home-manager-модулем. Проверяет ровно то, до чего
+  смоук не дотягивается — на раннере нет сессионного systemd: `vpn-zone
+  up/down` через юнит `vpn-zone@`, автоподъём юнита внутри `vpn-zone run`,
+  offline-ветку пикера (она поднимает зону через `systemctl --user`) — плюс
+  повторяет главные ассерты герметичности через системный путь. Второй эшелон
+  здесь проверяется СТРОГО: ядро VM грузит `nf_tables` заранее, ветка
+  деградации смоука сработать не имеет права.
+
+  ```sh
+  nix-build tests/vm.nix -A driver && ./result/bin/nixos-test-driver
+  ```
+
+  Хосту ничего не делается: всё происходит внутри VM, каталоги состояния — её
+  собственные. Без `/dev/kvm` qemu откатывается на эмуляцию TCG (на порядок
+  медленнее, но работает).
 
 ## Что гоняет CI (`.github/workflows/ci.yml`)
 
@@ -172,5 +192,5 @@ tests/integration/smoke.sh
 git ls-remote https://github.com/NixOS/nixpkgs refs/heads/nixos-XX.YY
 nix-prefetch-url --unpack https://github.com/NixOS/nixpkgs/archive/<rev>.tar.gz
 # то же для home-manager (ветка release-XX.YY), затем вписать rev+sha256
-# в tests/harness.nix и поправить home.stateVersion под ветку.
+# в tests/pins.nix и поправить home.stateVersion в harness.nix и vm.nix.
 ```
