@@ -118,6 +118,33 @@ jobs:
       - name: cargo test
         run: nix-shell ../tests/harness.nix -A rustShell --run 'cargo test'
 
+  # VM-тест (tests/vm.nix): qemu-машина с настоящим systemd и модулем + вторая
+  # VM как живой WireGuard-пир. Закрывает то, до чего смоук не дотягивается
+  # (нет systemctl --user на раннере): юнит vpn-zone@, автоподъём в run,
+  # offline-ветку пикера — и первый leak-тест: tcpdump на физическом интерфейсе
+  # клиента обязан остаться пустым. У раннеров GitHub есть /dev/kvm, но узел
+  # по умолчанию закрыт для непривилегированных — правило udev из документации
+  # GitHub открывает его; без KVM драйвер откатился бы на медленный TCG,
+  # поэтому наличие узла проверяется явно.
+  vm:
+    name: vm (NixOS test, real tunnel)
+    runs-on: ubuntu-24.04
+    needs: eval
+    steps:
+      - uses: actions/checkout@v4
+      - name: Включить KVM для раннера
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -c /dev/kvm
+      - uses: cachix/install-nix-action@v31
+      - name: Собрать драйвер VM-теста
+        run: nix-build tests/vm.nix -A driver -o vm-driver
+      - name: Прогнать VM-тест
+        run: ./vm-driver/bin/nixos-test-driver
+
   # Смоук: поднять настоящую зону в непривилегированном userns и проверить её
   # изнутри. Требует fallback на ядерный wireguard (amneziawg-модуля на
   # раннере нет) — см. tests/integration/smoke.sh.

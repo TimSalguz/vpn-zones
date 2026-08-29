@@ -118,6 +118,9 @@
 4. **integration** — подготовка раннера (снять AppArmor-запрет на userns,
    `modprobe wireguard`, `uidmap` + диапазоны в `/etc/subuid`/`subgid`) и
    запуск `tests/integration/smoke.sh`.
+5. **vm** — VM-тест `tests/vm.nix` (см. выше): правило udev открывает
+   `/dev/kvm` раннеру, `nix-build -A driver` и запуск драйвера. Это
+   единственный job, где есть сессионный systemd и живой WireGuard-сервер.
 
 ## Что проверяет смоук
 
