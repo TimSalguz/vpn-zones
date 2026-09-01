@@ -31,6 +31,11 @@
 //! * [`config`] — WireGuard/AmneziaWG config parsing, the behaviour of the
 //!   `sed`/`grep` pipeline the zones used to run, written down as code and
 //!   tests (`docs/GOTCHAS.md` §4);
+//! * [`openconnect`] — the second kind of zone: a userspace client
+//!   (Cisco AnyConnect/ocserv, and through `--protocol` GlobalProtect and
+//!   Pulse) in the uplink namespace, whose tun moves down into the app
+//!   namespace. The `[OpenConnect]` config section, the vpnc-script contract as
+//!   a pure function, and `vpn-zone-core oc-script` (`docs/GOTCHAS.md` §2a);
 //! * [`fs_sandbox`] — the filesystem sandbox: bwrap, the permissions, the
 //!   `/.flatpak-info` that switches toolkits over to the portals, the filtered
 //!   session bus and the sandbox's own X server (`docs/GOTCHAS.md` §6, §8, §9);
@@ -61,6 +66,7 @@ pub mod dialog;
 pub mod fs_sandbox;
 pub mod gui;
 pub mod launch;
+pub mod openconnect;
 pub mod picker;
 pub mod profile;
 pub mod registry;

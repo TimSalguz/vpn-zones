@@ -32,6 +32,19 @@
 //! configured there — the encrypted packets are born in the uplink and leave
 //! through pasta, while the app namespace never sees the endpoint at all.
 //!
+//! **Two kinds of tunnel, one contour.** A zone is either a kernel
+//! WireGuard/AmneziaWG one (its config has an `[Interface]` section) or an
+//! OpenConnect one (`[OpenConnect]`, [`crate::openconnect`]). The wall stands in
+//! the same place either way — what changes is only what stays behind it. With
+//! WireGuard it is a UDP socket; with OpenConnect it is a whole client process:
+//! the TLS session, the gateway's address and every packet still wrapped in it
+//! live one namespace up, and what arrives in the app namespace is a bare tun
+//! device with an address on it. Who creates and moves that device is the other
+//! difference: the uplink itself for WireGuard, the client's `--script` — which
+//! is us, `vpn-zone-core oc-script` — for OpenConnect. A tun device and the
+//! descriptor attached to it are separate things, so the client goes on reading
+//! and writing packets from the uplink after the interface has left it.
+//!
 //! **The endpoint is resolved before either namespace exists.** `wg setconf`
 //! resolves `Endpoint` itself, through `getaddrinfo`, and retries for a minute
 //! and a half before giving up — in the app namespace, where there is no
@@ -103,6 +116,7 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -110,6 +124,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::config::{Endpoint, EndpointHost, Family, WgConfig};
+use crate::openconnect::{self, OcConfig};
 use crate::profile::{exit_code_of, home_dir};
 use crate::sys;
 
@@ -154,8 +169,14 @@ const RESOLVER_DIRS: [&[&str]; 3] = [
 /// turned into a literal address, i.e. what `setconf` gets.
 const STRIPPED: &str = ".stripped.conf";
 
-/// The tunnel is always called `awg0`, whichever kernel module carries it:
-/// `vpn-zone status`, `vpn-zone check` and the smoke test look for that name.
+/// The tunnel is always called `awg0`, whatever carries it — either kernel
+/// module, or the OpenConnect client, which is told the name with
+/// `--interface`. `vpn-zone status`, `vpn-zone check`, the smoke test and, more
+/// importantly, the app namespace's own `oifname "awg0" accept` rule all look
+/// for that one name; the rule is loaded BEFORE the tunnel arrives, so a
+/// backend that brought its own name would have its packets dropped by the
+/// second echelon. One name for every kind of zone is the invariant, and the
+/// name is historical rather than descriptive.
 const TUN_IFACE: &str = "awg0";
 /// Name of pasta's interface inside the uplink namespace. Given explicitly
 /// because pasta otherwise copies the name of the host's outbound interface —
@@ -191,6 +212,17 @@ const SYNC_FAIL: u8 = b'0';
 /// time it hears about it — so the uplink says which of the two it got.
 const TOOL_AWG: u8 = b'a';
 const TOOL_WG: u8 = b'w';
+/// The tunnel came from the OpenConnect client: the interface is already in the
+/// app namespace and the facts about it are in the plan file the client's
+/// script wrote. (`crate::openconnect`)
+const TOOL_OC: u8 = b'o';
+
+/// How long the uplink waits for the OpenConnect client to authenticate and
+/// hand the tunnel over: two minutes in 0.1 s steps. Long, and deliberately so
+/// — a corporate gateway with a slow authentication step is ordinary, and
+/// giving up on a connection that was about to succeed costs the user the zone.
+/// The wait ends early the moment the client exits.
+const OC_CONNECT_STEPS: u32 = 1200;
 
 /// Absolute paths of the tools the zone drives. Absolute because part of this
 /// code runs inside a namespace where `PATH` can be anything; Nix substitutes
@@ -204,6 +236,9 @@ pub struct Tools {
     /// The second echelon (`docs/LEAK-MODEL.md`). Optional in the sense that a
     /// zone without it still comes up — loudly, and on its topology alone.
     pub nft: PathBuf,
+    /// The userspace client of an `[OpenConnect]` zone. Only such a zone runs
+    /// it; a WireGuard one never looks at this path.
+    pub openconnect: PathBuf,
 }
 
 impl Default for Tools {
@@ -216,6 +251,7 @@ impl Default for Tools {
             wg: PathBuf::from("wg"),
             pasta: PathBuf::from("pasta"),
             nft: PathBuf::from("nft"),
+            openconnect: PathBuf::from("openconnect"),
         }
     }
 }
@@ -255,7 +291,8 @@ impl std::fmt::Display for ArgError {
 impl std::error::Error for ArgError {}
 
 impl Args {
-    /// Parse `[--ip P] [--awg P] [--wg P] [--pasta P] [--nft P] <name>`.
+    /// Parse `[--ip P] [--awg P] [--wg P] [--pasta P] [--nft P]
+    /// [--openconnect P] <name>`.
     ///
     /// Only `--`-prefixed words are flags, so a zone name is free to start with
     /// a single dash. The order does not matter, but the unit puts the tool
@@ -280,6 +317,7 @@ impl Args {
                 "--wg" => &mut tools.wg,
                 "--pasta" => &mut tools.pasta,
                 "--nft" => &mut tools.nft,
+                "--openconnect" => &mut tools.openconnect,
                 _ => return Err(ArgError::UnknownFlag(flag)),
             };
             let value = rest
@@ -740,18 +778,67 @@ fn holder(zone: &Zone, unshared_w: OwnedFd, mapped_r: OwnedFd) -> u8 {
     }
 }
 
-/// What the app namespace is handed: the config, the pipe it reports its own
+/// Which kind of tunnel this zone carries, decided once by [`prepare`] and read
+/// by both namespaces afterwards.
+///
+/// The decision itself is one question asked of the config file: is there an
+/// `[OpenConnect]` section? The two shapes cannot be confused — a WireGuard
+/// config has no such section, and a file that has one but does not parse is
+/// refused by `vpn-zone add` before a zone exists at all.
+pub enum Backend {
+    /// Kernel WireGuard or AmneziaWG. The uplink creates the interface itself
+    /// and hands it down; the transport socket stays where it was created.
+    Wg(WgConfig),
+    /// A userspace OpenConnect client running in the uplink. It creates the
+    /// interface and its own `--script` hands it down; the TLS session stays
+    /// with the process, which never leaves the uplink.
+    Oc(Box<OcZone>),
+}
+
+/// An OpenConnect zone, ready to be started.
+pub struct OcZone {
+    pub cfg: OcConfig,
+    /// The gateway's address, resolved in the HOST's network before either
+    /// namespace exists — the same rule the WireGuard endpoint follows, and for
+    /// the same two reasons: the uplink has no resolver of its own, and its
+    /// filter would not let a lookup out even if it had one. The client is then
+    /// told the answer with `--resolve`, so it never asks either.
+    pub addr: IpAddr,
+}
+
+impl Backend {
+    /// What the uplink's filter may talk to.
+    ///
+    /// For WireGuard this is every endpoint of the config, with its port. For
+    /// OpenConnect it is the gateway's address and NO port, which is one
+    /// dimension wider on purpose: the transport is TLS on the configured port
+    /// but the client also tries DTLS on whatever UDP port the server
+    /// advertises, and that number is not known until the session exists. The
+    /// rule that matters is unchanged — this namespace may talk to the VPN
+    /// gateway and to nothing else in the world.
+    fn sockets(&self) -> Vec<EndpointSocket> {
+        match self {
+            Self::Wg(cfg) => endpoint_sockets(cfg),
+            Self::Oc(oc) => vec![EndpointSocket {
+                addr: oc.addr,
+                port: None,
+            }],
+        }
+    }
+}
+
+/// What the app namespace is handed: the backend, the pipe it reports its own
 /// existence on, and the pipe the tunnel arrives through.
 struct ZoneLinks<'a> {
-    cfg: &'a WgConfig,
+    backend: &'a Backend,
     ready_w: OwnedFd,
     moved_r: OwnedFd,
 }
 
-/// What the uplink is handed: the config (for the obfuscation check), the host
-/// pid of the app namespace to hand the interface to, and its three pipe ends.
+/// What the uplink is handed: the backend, the host pid of the app namespace to
+/// hand the interface to, and its three pipe ends.
 struct UplinkLinks<'a> {
-    cfg: &'a WgConfig,
+    backend: &'a Backend,
     zone_pid: libc::pid_t,
     ready_w: OwnedFd,
     zone_up_r: OwnedFd,
@@ -792,8 +879,8 @@ fn supervise(zone: &Zone) -> Result<u8, String> {
         drop(uplink_up_w);
         drop(zone_up_r);
         drop(moved_w);
-        let links = cfg.as_ref().map(|cfg| ZoneLinks {
-            cfg,
+        let links = cfg.as_ref().map(|backend| ZoneLinks {
+            backend,
             ready_w: zone_up_w,
             moved_r,
         });
@@ -816,7 +903,7 @@ fn supervise(zone: &Zone) -> Result<u8, String> {
 
     let mut uplink_pid = 0;
     let mut pasta: Option<Child> = None;
-    if let Some(cfg) = cfg.as_ref() {
+    if let Some(backend) = cfg.as_ref() {
         // SAFETY: as above.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
@@ -831,7 +918,7 @@ fn supervise(zone: &Zone) -> Result<u8, String> {
             let code = uplink_main(
                 zone,
                 UplinkLinks {
-                    cfg,
+                    backend,
                     zone_pid,
                     ready_w: uplink_up_w,
                     zone_up_r,
@@ -925,9 +1012,12 @@ fn supervise(zone: &Zone) -> Result<u8, String> {
 /// the note on `getaddrinfo` in the module docs. A name that does not resolve
 /// is fatal on purpose — the alternative is `wg setconf` retrying DNS for a
 /// minute and a half inside a namespace that has none, and then failing anyway.
-fn prepare(zone: &Zone) -> Result<WgConfig, String> {
+fn prepare(zone: &Zone) -> Result<Backend, String> {
     let raw = fs::read(zone.path(CONFIG)).map_err(|e| format!("cannot read {CONFIG}: {e}"))?;
     let mut cfg = WgConfig::parse(&raw).map_err(|e| format!("{CONFIG}: {e}"))?;
+    if openconnect::is_openconnect(&cfg) {
+        return prepare_openconnect(zone, &cfg);
+    }
     if !cfg.dropped_empty.is_empty() {
         // Recent Amnezia writes junk-packet parameters and fills only some of
         // them; `setconf` rejects the whole file on such a line. Dropping them
@@ -962,16 +1052,107 @@ fn prepare(zone: &Zone) -> Result<WgConfig, String> {
     // 0600: it carries the private key.
     write_private(&zone.path(STRIPPED), cfg.to_setconf().as_bytes())
         .map_err(|e| format!("cannot write {STRIPPED}: {e}"))?;
-    Ok(cfg)
+    Ok(Backend::Wg(cfg))
+}
+
+/// The same work for an `[OpenConnect]` zone: check the config, check the
+/// password file, resolve the gateway — all of it here, in the host's network,
+/// before a namespace exists.
+///
+/// **Why the gateway is resolved here and not by the client.** The uplink has
+/// the host's `/etc/resolv.conf` but not the host's network: its filter lets
+/// out packets to the gateway and nothing else, so a lookup from in there would
+/// be dropped, and a lookup that somehow got through a host resolver's socket
+/// would be a leak of exactly the kind this project measures. The client is
+/// therefore told the answer with `--resolve` and never asks — the same trick,
+/// with the same reasoning, as writing literal addresses into the text
+/// `wg setconf` gets.
+fn prepare_openconnect(zone: &Zone, ini: &WgConfig) -> Result<Backend, String> {
+    let cfg = OcConfig::from_ini(ini).map_err(|e| format!("{CONFIG}: {e}"))?;
+    // Checked, not read: the password itself is read once, in the uplink, right
+    // before it is handed to the client (`spawn_openconnect`).
+    cfg.check_password_file()
+        .map_err(|e| format!("{CONFIG}: {e}"))?;
+
+    let addr = match cfg.server_literal() {
+        Some(addr) => addr,
+        None => {
+            let port = cfg.port.unwrap_or(443);
+            let addrs: Vec<IpAddr> = (cfg.server.as_str(), port)
+                .to_socket_addrs()
+                .map_err(|e| {
+                    format!(
+                        "cannot resolve the gateway {} ({e}) — it has to be an address by the \
+                         time the zone starts, because the uplink has no resolver of its own",
+                        cfg.server
+                    )
+                })?
+                .map(|a| a.ip())
+                .collect();
+            // v4 first, as everywhere else in this file. A name that resolves
+            // ONLY to IPv6 is refused rather than half-supported: `--resolve`
+            // takes `HOST:IP` and cannot express a v6 address unambiguously, so
+            // the client would be handed a mangled one. Writing the literal
+            // into `Server =` works and is what the message asks for.
+            match addrs.iter().copied().find(IpAddr::is_ipv4) {
+                Some(addr) => addr,
+                None if addrs.is_empty() => {
+                    return Err(format!("the gateway {} resolved to nothing", cfg.server))
+                }
+                None => {
+                    return Err(format!(
+                        "the gateway {} resolves only to IPv6; write that address into Server = \
+                         instead — `--resolve` cannot carry one unambiguously",
+                        cfg.server
+                    ))
+                }
+            }
+        }
+    };
+
+    // A plan left over from a previous run would make the uplink believe the
+    // tunnel is already up the moment it looks.
+    let _ = fs::remove_file(zone.path(openconnect::PLAN_FILE));
+    Ok(Backend::Oc(Box::new(OcZone { cfg, addr })))
 }
 
 // --- PROCESS 3: THE UPLINK ---------------------------------------------------
 
 /// The uplink: pasta's namespace, and the namespace the tunnel is born in.
+///
+/// A WireGuard zone parks here forever, because the tunnel is a kernel object
+/// and there is nothing left to supervise. An OpenConnect zone waits on the
+/// client instead: the client's exit becomes this process's exit, the holder
+/// sees the uplink die and takes the whole zone down with it. No retry, no
+/// fallback, nothing to fall back TO — the app namespace has one interface and
+/// it is about to disappear.
 fn uplink_main(zone: &Zone, links: UplinkLinks<'_>) -> u8 {
     default_signals();
     match uplink_setup(zone, links) {
-        Ok(()) => park(),
+        Ok(None) => park(),
+        Ok(Some(mut client)) => {
+            let code = match client.wait() {
+                Ok(status) => {
+                    eprintln!(
+                        "zone {}: the openconnect client exited ({status}) — the tunnel is gone",
+                        zone.name()
+                    );
+                    status.code().map_or(1, |c| c as u8)
+                }
+                Err(e) => {
+                    eprintln!("zone {}: cannot wait for openconnect: {e}", zone.name());
+                    1
+                }
+            };
+            // A client that quit on its own leaves a zone that cannot work,
+            // whatever it thought of its own exit — this path is never reached
+            // on a `systemctl stop`, which signals us straight to death.
+            if code == 0 {
+                1
+            } else {
+                code
+            }
+        }
         Err(e) => {
             eprintln!("zone {}: uplink: {e}", zone.name());
             1
@@ -979,9 +1160,11 @@ fn uplink_main(zone: &Zone, links: UplinkLinks<'_>) -> u8 {
     }
 }
 
-fn uplink_setup(zone: &Zone, links: UplinkLinks<'_>) -> Result<(), String> {
+/// Bring the uplink up; the answer is the process this namespace now lives as
+/// long as, if there is one.
+fn uplink_setup(zone: &Zone, links: UplinkLinks<'_>) -> Result<Option<Child>, String> {
     let UplinkLinks {
-        cfg,
+        backend,
         zone_pid,
         ready_w,
         zone_up_r,
@@ -1019,11 +1202,11 @@ fn uplink_setup(zone: &Zone, links: UplinkLinks<'_>) -> Result<(), String> {
     // netlink, which no filter hook of the `inet` family ever sees.
     //
     // What it buys: this namespace may send exactly the tunnel's own packets to
-    // the endpoint, and nothing else. Should a userspace VPN client ever run
-    // here (ROADMAP M4), or should any code of ours grow a DNS lookup or a
-    // "quick check" against the network, it does not get out — the endpoint is
-    // all this namespace is for.
-    zone.seal("uplink", &uplink_ruleset(&endpoint_sockets(cfg)));
+    // the endpoint, and nothing else. That mattered in theory while only the
+    // kernel ran here; with an OpenConnect zone a whole third-party client runs
+    // in this namespace, and the rule is what says it may talk to its gateway
+    // and to nowhere else — no DNS, no update check, no second server.
+    zone.seal("uplink", &uplink_ruleset(&backend.sockets()));
 
     // The holder is waiting for this to attach pasta to us.
     let mut ready = File::from(ready_w);
@@ -1055,39 +1238,239 @@ fn uplink_setup(zone: &Zone, links: UplinkLinks<'_>) -> Result<(), String> {
     };
 
     // --- THE TUNNEL IS BORN HERE, AND THAT IS THE WHOLE POINT ---
-    // A WireGuard interface keeps its UDP socket in the namespace it was
-    // CREATED in, whatever namespace it is moved to afterwards. Creating it
-    // here is what puts the encrypted traffic on this side of the wall: the app
+    // Whichever backend builds it. A WireGuard interface keeps its UDP socket
+    // in the namespace it was CREATED in, whatever namespace it is moved to
+    // afterwards; an OpenConnect tun keeps its whole client. Either way the app
     // namespace gets an interface whose packets leave through pasta, and needs
-    // neither a route to the endpoint nor any interface besides the tunnel.
-    let tool = create_tunnel(zone, cfg)?;
-    println!(
-        "zone {}: uplink is up (default dev {dev}), tunnel created",
-        zone.name()
-    );
+    // neither a route to the gateway nor any interface besides the tunnel.
+    match backend {
+        Backend::Wg(cfg) => {
+            let tool = create_tunnel(zone, cfg)?;
+            println!(
+                "zone {}: uplink is up (default dev {dev}), tunnel created",
+                zone.name()
+            );
 
-    // The interface can only be handed to a namespace that exists.
+            // The interface can only be handed to a namespace that exists.
+            wait_for_app_namespace(zone_up_r)?;
+
+            // A host pid, because no pid namespace is created anywhere; `ip`
+            // opens /proc/<pid>/ns/net behind it. Both namespaces belong to our
+            // user namespace, where we are uid 0 — which is what makes the move
+            // allowed.
+            let target = zone_pid.to_string();
+            zone.ip(&["link", "set", TUN_IFACE, "netns", target.as_str()])?;
+
+            // Now the app namespace may configure it — and it has to be told
+            // which of the two tools speaks to what we built.
+            tell_the_zone(moved_w, tool)?;
+            Ok(None)
+        }
+        Backend::Oc(oc) => {
+            // Same barrier, read EARLIER than on the WireGuard path: there the
+            // interface exists before the app namespace does, here the client's
+            // script moves it the moment the client connects, so the target has
+            // to be waiting before the client is even started.
+            wait_for_app_namespace(zone_up_r)?;
+            println!(
+                "zone {}: uplink is up (default dev {dev}), starting openconnect to {}",
+                zone.name(),
+                oc.cfg.server
+            );
+
+            let mut client = spawn_openconnect(zone, oc, zone_pid)?;
+            if let Err(e) = wait_for_plan(zone, &mut client) {
+                // Nothing may outlive a failed setup: an orphaned client would
+                // hold this namespace open with a live session in it.
+                let _ = client.kill();
+                let _ = client.wait();
+                return Err(e);
+            }
+            tell_the_zone(moved_w, TOOL_OC)?;
+            Ok(Some(client))
+        }
+    }
+}
+
+/// Wait for the app namespace to say it exists.
+fn wait_for_app_namespace(zone_up_r: OwnedFd) -> Result<(), String> {
     let mut zone_up = File::from(zone_up_r);
     let mut byte = [0u8; 1];
     if zone_up.read_exact(&mut byte).is_err() || byte[0] != SYNC_OK {
         return Err("the app namespace never came up".to_string());
     }
-    drop(zone_up);
+    Ok(())
+}
 
-    // A host pid, because no pid namespace is created anywhere; `ip` opens
-    // /proc/<pid>/ns/net behind it. Both namespaces belong to our user
-    // namespace, where we are uid 0 — which is what makes the move allowed.
-    let target = zone_pid.to_string();
-    zone.ip(&["link", "set", TUN_IFACE, "netns", target.as_str()])?;
-
-    // Now the app namespace may configure it — and it has to be told which of
-    // the two tools speaks to what we built.
+/// Hand the app namespace the one byte that says which backend built the
+/// tunnel it is now looking at.
+fn tell_the_zone(moved_w: OwnedFd, tool: u8) -> Result<(), String> {
     let mut moved = File::from(moved_w);
     moved
         .write_all(&[tool])
-        .map_err(|e| format!("cannot tell the zone about the tunnel: {e}"))?;
-    drop(moved);
-    Ok(())
+        .map_err(|e| format!("cannot tell the zone about the tunnel: {e}"))
+}
+
+/// Start the OpenConnect client in the uplink namespace.
+///
+/// Every argument here is either forced or checked, and that is the point: the
+/// user's config can add flags only from an allowlist
+/// ([`crate::openconnect`]), and the ones that decide where the tunnel ends up
+/// are ours.
+///
+/// * `--script` is this very binary. Replacing it would replace the only thing
+///   that puts the interface behind the wall, which is why `Args =` cannot
+///   name it.
+/// * `--interface awg0` gives every zone one interface name, so that the app
+///   namespace's `oifname "awg0" accept` — loaded long before the tunnel
+///   arrives — keeps meaning what it says.
+/// * `--non-inter` because a zone is started by a systemd unit and there is no
+///   terminal to ask anything on; a prompt would hang the zone instead of
+///   failing it.
+/// * `--no-external-auth` so that authentication never tries to open a browser
+///   OUTSIDE the zone — the exact move `docs/LEAK-MODEL.md` spends a section on.
+/// * `--disable-ipv6` because this backend does not carry IPv6 yet, and a
+///   gateway that thinks we do would route a family into a black hole. Not
+///   asking is honest; the app namespace closes the family either way.
+/// * `--resolve` hands over the address resolved in the host's network, so the
+///   client never needs a resolver in a namespace that has none.
+/// * `--passwd-on-stdin` with the password written on one line and the pipe
+///   closed. Not a command-line argument: `/proc/<pid>/cmdline` is world
+///   readable, and not an environment variable either, for the same reason.
+fn spawn_openconnect(zone: &Zone, oc: &OcZone, zone_pid: libc::pid_t) -> Result<Child, String> {
+    let cfg = &oc.cfg;
+    let password = cfg.read_password().map_err(|e| format!("{CONFIG}: {e}"))?;
+
+    // `openconnect` runs its `--script` through `/bin/sh -c`, so the string is
+    // shell-parsed. Store paths never contain anything a shell would look at,
+    // but a hand-run holder might, and a mangled script is a tunnel nobody
+    // moves anywhere.
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("cannot find my own path for --script: {e}"))?;
+    let exe = exe.to_str().ok_or_else(|| {
+        "my own path is not UTF-8, and openconnect's --script goes through a shell".to_string()
+    })?;
+    if exe.contains(|c: char| c.is_whitespace() || "'\"\\$`;&|<>()*?[]{}#~!".contains(c)) {
+        return Err(format!(
+            "my own path ({exe}) has shell characters in it, and openconnect's --script is \
+             shell-parsed"
+        ));
+    }
+
+    let mut cmd = Command::new(&zone.tools.openconnect);
+    cmd.arg(format!("--protocol={}", cfg.protocol))
+        .arg("--interface")
+        .arg(TUN_IFACE)
+        .arg("--script")
+        .arg(format!("{exe} oc-script"))
+        .arg("--non-inter")
+        .arg("--no-external-auth")
+        .arg("--disable-ipv6");
+    if cfg.server_literal().is_none() {
+        cmd.arg(format!("--resolve={}:{}", cfg.server, oc.addr));
+    }
+    if let Some(pin) = &cfg.server_cert {
+        cmd.arg(format!("--servercert={pin}"));
+    }
+    if let Some(user) = &cfg.user {
+        cmd.arg(format!("--user={user}"));
+    }
+    if let Some(group) = &cfg.authgroup {
+        cmd.arg(format!("--authgroup={group}"));
+    }
+    if password.is_some() {
+        cmd.arg("--passwd-on-stdin");
+    }
+    for extra in &cfg.extra {
+        cmd.arg(extra);
+    }
+    cmd.arg(cfg.server_arg());
+
+    // What the script needs and openconnect knows nothing about. Inherited
+    // through openconnect into the script, which is where they are read.
+    cmd.env(openconnect::ENV_DIR, &zone.dir)
+        .env(openconnect::ENV_NETNS_PID, zone_pid.to_string())
+        .env(openconnect::ENV_IP, &zone.tools.ip);
+    if let Some(mtu) = cfg.mtu {
+        cmd.env(openconnect::ENV_MTU, mtu.to_string());
+    }
+    cmd.stdin(if password.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+
+    // THE CLIENT MUST NOT OUTLIVE THIS PROCESS. The uplink is killed with a
+    // plain signal and its default disposition, so no handler of ours runs on
+    // the way out; without this the client would go on holding the uplink
+    // namespace open, with a live VPN session in it, after the zone is gone.
+    // SAFETY: pre_exec runs between fork and execve in the child; prctl with
+    // these arguments takes no pointers, allocates nothing and is
+    // async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        });
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            format!(
+                "{} is not there — an [OpenConnect] zone needs the openconnect client",
+                zone.tools.openconnect.display()
+            )
+        } else {
+            format!("cannot run {}: {e}", zone.tools.openconnect.display())
+        }
+    })?;
+    if let Some(password) = password {
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("openconnect was given no stdin to read the password from".to_string());
+        };
+        // One line, then EOF: `--non-inter` means nothing else will be asked.
+        let written = stdin.write_all(password.as_bytes()).and_then(|()| stdin.write_all(b"\n"));
+        drop(stdin);
+        if let Err(e) = written {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("cannot hand the password to openconnect: {e}"));
+        }
+    }
+    Ok(child)
+}
+
+/// Wait for the client's script to report that the tunnel is in the app
+/// namespace.
+///
+/// The plan file appearing IS the report — the script writes it by rename after
+/// the move, so its existence means the interface is already down there. The
+/// wait ends early if the client dies, which is the ordinary failure: a wrong
+/// password, a refused certificate, an unreachable gateway.
+fn wait_for_plan(zone: &Zone, client: &mut Child) -> Result<(), String> {
+    let plan = zone.path(openconnect::PLAN_FILE);
+    for _ in 0..OC_CONNECT_STEPS {
+        if plan.exists() {
+            return Ok(());
+        }
+        match client.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "openconnect exited ({status}) before the tunnel was up — the messages above \
+                     are its own"
+                ))
+            }
+            Ok(None) => {}
+            Err(e) => return Err(format!("cannot check on openconnect: {e}")),
+        }
+        thread::sleep(WAIT_STEP);
+    }
+    Err(format!(
+        "openconnect did not hand the tunnel over in time ({OC_CONNECT_STEPS} tries of {} ms)",
+        WAIT_STEP.as_millis()
+    ))
 }
 
 /// Create the tunnel interface; the answer says which tool configures it.
@@ -1178,7 +1561,7 @@ fn zone_setup(zone: &Zone, links: Option<ZoneLinks<'_>>) -> Result<(), String> {
     hide_host_resolvers(zone)?;
 
     let Some(ZoneLinks {
-        cfg,
+        backend,
         ready_w,
         moved_r,
     }) = links
@@ -1227,95 +1610,48 @@ fn zone_setup(zone: &Zone, links: Option<ZoneLinks<'_>>) -> Result<(), String> {
         return Err("the uplink died before it could hand the tunnel over".to_string());
     }
     drop(moved);
-    let wgtool: &Path = match byte[0] {
-        TOOL_AWG => zone.tools.awg.as_path(),
-        TOOL_WG => zone.tools.wg.as_path(),
+    // Both backends end here with the same two answers: what the zone's
+    // resolv.conf should say, and what its status mirror should watch. What
+    // differs is only who put the address on the interface.
+    let (dns, search, mirror) = match byte[0] {
+        TOOL_AWG | TOOL_WG => {
+            let Backend::Wg(cfg) = backend else {
+                return Err(
+                    "the uplink built a WireGuard tunnel for a zone that is not one".to_string(),
+                );
+            };
+            let wgtool: &Path = if byte[0] == TOOL_AWG {
+                zone.tools.awg.as_path()
+            } else {
+                zone.tools.wg.as_path()
+            };
+            configure_wg(zone, cfg, wgtool)?;
+            (cfg.dns(), None, Mirror::Wg(wgtool.to_path_buf()))
+        }
+        TOOL_OC => {
+            // The facts come from the file the client's script wrote, and its
+            // existence is what the uplink waited for — so by the time this
+            // byte arrives, the interface is already down here.
+            let path = zone.path(openconnect::PLAN_FILE);
+            let plan = fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))
+                .and_then(|text| openconnect::Plan::parse(&text))?;
+            configure_oc(zone, &plan)?;
+            let dns: Vec<String> = plan.dns.iter().map(ToString::to_string).collect();
+            (dns, plan.search.clone(), Mirror::Oc)
+        }
         _ => return Err("the uplink could not build the tunnel".to_string()),
     };
-
-    // Not through `run_tool`: the path of the stripped config is a path, and
-    // squeezing it through a `&str` would mangle a `$HOME` that is not UTF-8.
-    let setconf = Command::new(wgtool)
-        .arg("setconf")
-        .arg(TUN_IFACE)
-        .arg(zone.path(STRIPPED))
-        .status()
-        .map_err(|e| format!("cannot run {}: {e}", wgtool.display()))?;
-    if !setconf.success() {
-        return Err(format!("{} setconf failed ({setconf})", wgtool.display()));
-    }
-
-    // Every address, both families: a v6-only `Address` used to kill the zone
-    // on `ip -4 addr add`, and a v6 address in a mixed list used to be dropped
-    // silently — which is an IPv6 leak.
-    let mut tunnel_v6 = false;
-    for addr in cfg.addresses() {
-        let raw = addr.raw.as_str();
-        match addr.family {
-            Family::V6 => {
-                if zone
-                    .ip_quiet(&["-6", "addr", "add", raw, "dev", TUN_IFACE])
-                    .is_ok()
-                {
-                    tunnel_v6 = true;
-                } else {
-                    eprintln!(
-                        "zone {}: the v6 address {} did not apply — IPv6 will be closed here",
-                        zone.name(),
-                        addr.raw
-                    );
-                }
-            }
-            Family::V4 => zone.ip(&["-4", "addr", "add", raw, "dev", TUN_IFACE])?,
-        }
-    }
-    let mtu = cfg.mtu().unwrap_or(DEFAULT_MTU).to_string();
-    zone.ip(&["link", "set", TUN_IFACE, "mtu", mtu.as_str(), "up"])?;
-
-    // THERE IS NO ROUTE AROUND THE TUNNEL, AND THERE MUST NOT BE. The old
-    // one-namespace layout needed a /32 to the VPN server through pasta's
-    // interface, or the tunnel's own packets would have been wrapped into the
-    // tunnel — and that route was visible to the programs, together with pasta's
-    // interface and everything else reachable through it. Here the encrypted
-    // packets are born in the uplink and leave by ITS default route; this
-    // namespace has one interface besides loopback and one route, and both lead
-    // into the tunnel.
-    zone.ip(&["route", "replace", "default", "dev", TUN_IFACE])?;
-
-    // --- IPv6: INTO THE TUNNEL OR NOWHERE AT ALL ---
-    // A packet of ANY family must have no path around the tunnel
-    // (docs/LEAK-MODEL.md). Here that is the topology's doing rather than a
-    // rule's: with no other interface there is nothing to leak through even
-    // without a single route. The unreachable default is belt and braces — it
-    // turns "no route to host" into an immediate error instead of a timeout,
-    // and it costs nothing. No sysctl is touched any more: switching the family
-    // off was a way to plug a hole that no longer exists.
-    match v6_plan(Path::new("/proc/net/if_inet6").exists(), tunnel_v6) {
-        V6Plan::NoKernel => {}
-        V6Plan::IntoTunnel => zone.ip(&["-6", "route", "replace", "default", "dev", TUN_IFACE])?,
-        V6Plan::CloseDefault => {
-            // THE TYPE COMES BEFORE THE PREFIX. `ip -6 route replace default
-            // unreachable` is not a route at all: iproute2 parses "default" as
-            // the prefix, then finds a route type with nothing behind it and
-            // exits with "Command line is not complete" — measured. The old
-            // one-namespace code had the words in that order, so its v6
-            // fallback had never once worked; it went unnoticed because the
-            // sysctl branch above it usually won. Errors stay quiet: this is
-            // belt and braces over a namespace that has no second interface to
-            // leak through anyway.
-            let _ = zone.ip_quiet(&["-6", "route", "replace", "unreachable", "default"]);
-        }
-    }
 
     // --- THE ZONE'S DNS ---
     // The other half of `hide_host_resolvers`: with no daemon left to ask,
     // glibc goes to the servers named here — and they are reachable only
     // through the tunnel. The bind mount is visible inside the zone only: the
     // rest of the system keeps its own /etc/resolv.conf.
-    let (text, defaulted) = resolv_conf(&cfg.dns());
+    let (text, defaulted) = resolv_conf_with_search(&dns, search.as_deref());
     if defaulted {
         println!(
-            "zone {}: no DNS= in the config — taking {} (through the tunnel)",
+            "zone {}: nobody named a resolver — taking {} (through the tunnel)",
             zone.name(),
             DEFAULT_RESOLVERS.join(" and ")
         );
@@ -1356,45 +1692,237 @@ fn zone_setup(zone: &Zone, links: Option<ZoneLinks<'_>>) -> Result<(), String> {
         zone.ip_line(&["-br", "-4", "addr", "show", TUN_IFACE])
     );
 
-    start_status_mirror(zone, wgtool);
+    start_status_mirror(zone, mirror.clone());
 
-    // The first handshake is the sign that a config is alive — printing it to
-    // the journal answers "is this .conf still worth anything?" straight away.
-    thread::sleep(HANDSHAKE_AFTER);
-    let handshakes =
-        tool_output(wgtool, &["show", TUN_IFACE, "latest-handshakes"]).unwrap_or_default();
-    if handshake_seen(&handshakes) {
-        println!("zone {}: handshake done — the tunnel is alive", zone.name());
-    } else {
-        eprintln!(
-            "zone {}: no handshake. Either the config is dead or the server is unreachable",
-            zone.name()
-        );
+    match mirror {
+        Mirror::Wg(wgtool) => {
+            // The first handshake is the sign that a config is alive — printing
+            // it to the journal answers "is this .conf still worth anything?"
+            // straight away.
+            thread::sleep(HANDSHAKE_AFTER);
+            let handshakes = tool_output(&wgtool, &["show", TUN_IFACE, "latest-handshakes"])
+                .unwrap_or_default();
+            if handshake_seen(&handshakes) {
+                println!("zone {}: handshake done — the tunnel is alive", zone.name());
+            } else {
+                eprintln!(
+                    "zone {}: no handshake. Either the config is dead or the server is \
+                     unreachable",
+                    zone.name()
+                );
+            }
+        }
+        Mirror::Oc => {
+            // The same question, already answered: an OpenConnect zone only
+            // gets this far because the client authenticated and handed the
+            // tunnel over, and it takes the zone down with it the moment it
+            // stops.
+            println!(
+                "zone {}: the openconnect client is connected — the tunnel is alive",
+                zone.name()
+            );
+        }
     }
     Ok(())
 }
 
-/// Mirror `awg show` / `wg show` into the zone's `status` file.
+/// Put the WireGuard config onto the interface the uplink handed down.
+fn configure_wg(zone: &Zone, cfg: &WgConfig, wgtool: &Path) -> Result<(), String> {
+    // Not through `run_tool`: the path of the stripped config is a path, and
+    // squeezing it through a `&str` would mangle a `$HOME` that is not UTF-8.
+    let setconf = Command::new(wgtool)
+        .arg("setconf")
+        .arg(TUN_IFACE)
+        .arg(zone.path(STRIPPED))
+        .status()
+        .map_err(|e| format!("cannot run {}: {e}", wgtool.display()))?;
+    if !setconf.success() {
+        return Err(format!("{} setconf failed ({setconf})", wgtool.display()));
+    }
+
+    // Every address, both families: a v6-only `Address` used to kill the zone
+    // on `ip -4 addr add`, and a v6 address in a mixed list used to be dropped
+    // silently — which is an IPv6 leak.
+    let mut tunnel_v6 = false;
+    for addr in cfg.addresses() {
+        let raw = addr.raw.as_str();
+        match addr.family {
+            Family::V6 => {
+                if zone
+                    .ip_quiet(&["-6", "addr", "add", raw, "dev", TUN_IFACE])
+                    .is_ok()
+                {
+                    tunnel_v6 = true;
+                } else {
+                    eprintln!(
+                        "zone {}: the v6 address {} did not apply — IPv6 will be closed here",
+                        zone.name(),
+                        addr.raw
+                    );
+                }
+            }
+            Family::V4 => zone.ip(&["-4", "addr", "add", raw, "dev", TUN_IFACE])?,
+        }
+    }
+    let mtu = cfg.mtu().unwrap_or(DEFAULT_MTU).to_string();
+    zone.ip(&["link", "set", TUN_IFACE, "mtu", mtu.as_str(), "up"])?;
+    default_into_tunnel(zone)?;
+    close_or_tunnel_v6(zone, tunnel_v6)
+}
+
+/// Put the gateway's answer onto the tun the OpenConnect client handed down.
 ///
-/// `show` needs netlink privileges, and programs (and `vpn-zone status`) enter
-/// the zone under the ordinary uid and see nothing at all — so the state is
-/// written from in here, where the privileges are. It has to be this namespace
-/// and not the uplink: `show` reads the interface over netlink in the CURRENT
-/// namespace, and the interface lives here. The rename is what makes a reader
-/// see either the old file or the new one, never half of one.
+/// A `/32` and nothing else, which is what the upstream `vpnc-script` does with
+/// a point-to-point device too. The netmask the gateway may also have sent is
+/// deliberately unused: it would only add an on-link route for a network the
+/// default route below already covers, and the split-include list it belongs to
+/// is ignored on purpose (`crate::openconnect`).
+fn configure_oc(zone: &Zone, plan: &openconnect::Plan) -> Result<(), String> {
+    // The name is an invariant, not a detail: the app namespace's filter was
+    // loaded minutes ago and names `awg0`. A client that produced anything else
+    // would have its packets dropped by our own second echelon, silently.
+    if plan.iface != TUN_IFACE {
+        return Err(format!(
+            "the client built {} instead of {TUN_IFACE} — the app namespace's filter names \
+             {TUN_IFACE} and was loaded before the tunnel arrived",
+            plan.iface
+        ));
+    }
+    let addr = format!("{}/32", plan.address);
+    let mtu = plan.mtu.to_string();
+    zone.ip(&["-4", "addr", "replace", addr.as_str(), "dev", TUN_IFACE])?;
+    zone.ip(&["link", "set", TUN_IFACE, "mtu", mtu.as_str(), "up"])?;
+    default_into_tunnel(zone)?;
+    // This backend does not carry IPv6 yet and asks the gateway not to offer
+    // it (`--disable-ipv6`), so the family ends here — the same way it does for
+    // a WireGuard config without a v6 address.
+    close_or_tunnel_v6(zone, false)
+}
+
+/// THERE IS NO ROUTE AROUND THE TUNNEL, AND THERE MUST NOT BE.
+///
+/// The old one-namespace layout needed a /32 to the VPN server through pasta's
+/// interface, or the tunnel's own packets would have been wrapped into the
+/// tunnel — and that route was visible to the programs, together with pasta's
+/// interface and everything else reachable through it. Here the encrypted
+/// packets are born in the uplink and leave by ITS default route; this namespace
+/// has one interface besides loopback and one route, and both lead into the
+/// tunnel. For OpenConnect that is also where the gateway's split-include list
+/// goes: a zone routes everything, or it is not a zone.
+fn default_into_tunnel(zone: &Zone) -> Result<(), String> {
+    zone.ip(&["route", "replace", "default", "dev", TUN_IFACE])
+}
+
+/// --- IPv6: INTO THE TUNNEL OR NOWHERE AT ALL ---
+///
+/// A packet of ANY family must have no path around the tunnel
+/// (`docs/LEAK-MODEL.md`). Here that is the topology's doing rather than a
+/// rule's: with no other interface there is nothing to leak through even
+/// without a single route. The unreachable default is belt and braces — it
+/// turns "no route to host" into an immediate error instead of a timeout, and
+/// it costs nothing. No sysctl is touched any more: switching the family off was
+/// a way to plug a hole that no longer exists.
+fn close_or_tunnel_v6(zone: &Zone, tunnel_v6: bool) -> Result<(), String> {
+    match v6_plan(Path::new("/proc/net/if_inet6").exists(), tunnel_v6) {
+        V6Plan::NoKernel => {}
+        V6Plan::IntoTunnel => zone.ip(&["-6", "route", "replace", "default", "dev", TUN_IFACE])?,
+        V6Plan::CloseDefault => {
+            // THE TYPE COMES BEFORE THE PREFIX. `ip -6 route replace default
+            // unreachable` is not a route at all: iproute2 parses "default" as
+            // the prefix, then finds a route type with nothing behind it and
+            // exits with "Command line is not complete" — measured. The old
+            // one-namespace code had the words in that order, so its v6
+            // fallback had never once worked; it went unnoticed because the
+            // sysctl branch above it usually won. Errors stay quiet: this is
+            // belt and braces over a namespace that has no second interface to
+            // leak through anyway.
+            let _ = zone.ip_quiet(&["-6", "route", "replace", "unreachable", "default"]);
+        }
+    }
+    Ok(())
+}
+
+/// What the status mirror watches, which is the one thing the two backends do
+/// not have in common.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Mirror {
+    /// `awg show` / `wg show`, by the path of the tool that speaks to the
+    /// interface.
+    Wg(PathBuf),
+    /// There is no `show` for an OpenConnect tunnel: liveness is the interface
+    /// being there and up, and the client — which the uplink is waiting on —
+    /// still running.
+    Oc,
+}
+
+/// Mirror the tunnel's state into the zone's `status` file.
+///
+/// `wg show` needs netlink privileges, and programs (and `vpn-zone status`)
+/// enter the zone under the ordinary uid and see nothing at all — so the state
+/// is written from in here, where the privileges are. It has to be this
+/// namespace and not the uplink: `show` reads the interface over netlink in the
+/// CURRENT namespace, and the interface lives here — and for an OpenConnect zone
+/// the interface is the only thing there is to read. The rename is what makes a
+/// reader see either the old file or the new one, never half of one.
 /// (`docs/GOTCHAS.md` §4)
-fn start_status_mirror(zone: &Zone, wgtool: &Path) {
-    let tool = wgtool.to_path_buf();
+fn start_status_mirror(zone: &Zone, mirror: Mirror) {
     let status = zone.path(STATUS);
     let tmp = zone.path(STATUS_TMP);
+    let ip = zone.tools.ip.clone();
     thread::spawn(move || loop {
-        if let Ok(text) = tool_output(&tool, &["show", TUN_IFACE]) {
+        let text = match &mirror {
+            Mirror::Wg(tool) => tool_output(tool, &["show", TUN_IFACE]).ok(),
+            Mirror::Oc => Some(oc_mirror(
+                &tool_output(&ip, &["-o", "link", "show", TUN_IFACE]).unwrap_or_default(),
+                &tool_output(&ip, &["-br", "-4", "addr", "show", TUN_IFACE]).unwrap_or_default(),
+            )),
+        };
+        if let Some(text) = text {
             if fs::write(&tmp, text).is_ok() {
                 let _ = fs::rename(&tmp, &status);
             }
         }
         thread::sleep(STATUS_PERIOD);
     });
+}
+
+/// The status file of an OpenConnect zone, as a pure function of two `ip`
+/// dumps.
+///
+/// `vpn-zone check` reads this file and answers "is the tunnel alive". For
+/// WireGuard the answer is the handshake line; here it is the `connected:` line
+/// below, and it is written only when the interface is BOTH present and up —
+/// which for this backend really is the whole question, because the client
+/// dying takes the interface and then the zone with it.
+pub fn oc_mirror(link: &str, addr: &str) -> String {
+    // The flags, and only the flags. `ip -o link show` prints them between
+    // angle brackets — `<POINTOPOINT,NOARP,UP,LOWER_UP>` — and a substring
+    // search for "UP" would find LOWER_UP, NO-CARRIER and half the operstates
+    // as well.
+    let up = link
+        .split_once('<')
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .is_some_and(|(flags, _)| flags.split(',').any(|flag| flag == "UP"));
+    let mut text = format!("interface: {TUN_IFACE}\n  backend: openconnect\n");
+    if link.trim().is_empty() {
+        text.push_str("  disconnected: the tunnel interface is gone\n");
+        return text;
+    }
+    if !up {
+        text.push_str("  disconnected: the tunnel interface is down\n");
+        return text;
+    }
+    // The word `check` greps for. Deliberately not "latest handshake": there is
+    // no handshake here and pretending otherwise would be a lie in a file a
+    // human reads.
+    text.push_str("  connected: yes\n");
+    let addr = addr.split_whitespace().nth(2).unwrap_or("").trim();
+    if !addr.is_empty() {
+        text.push_str("  address: ");
+        text.push_str(addr);
+        text.push('\n');
+    }
+    text
 }
 
 /// Close every resolver of the HOST off from the zone.
@@ -1662,6 +2190,18 @@ fn output_table(rules: &[String]) -> String {
 /// cannot be reached from inside: names simply stopped resolving, and it looked
 /// like "there is internet but nothing opens". (`docs/GOTCHAS.md` §3)
 pub fn resolv_conf(dns: &[String]) -> (String, bool) {
+    resolv_conf_with_search(dns, None)
+}
+
+/// The same, plus the `search` line an OpenConnect gateway asks for.
+///
+/// A search domain is what makes a corporate zone usable at all (`wiki` has to
+/// mean `wiki.corp.example.org`), and it opens no channel: the extra query goes
+/// to the same resolvers, which are reachable only through the tunnel. What
+/// the gateway may NOT do is write a line of its own — the domain is checked
+/// for being a domain long before it gets here (`crate::openconnect`), and the
+/// resolvers are checked for being addresses.
+pub fn resolv_conf_with_search(dns: &[String], search: Option<&str>) -> (String, bool) {
     let mut servers: Vec<&str> = dns
         .iter()
         .map(String::as_str)
@@ -1675,6 +2215,11 @@ pub fn resolv_conf(dns: &[String]) -> (String, bool) {
     for server in servers {
         text.push_str("nameserver ");
         text.push_str(server);
+        text.push('\n');
+    }
+    if let Some(search) = search.filter(|s| !s.is_empty()) {
+        text.push_str("search ");
+        text.push_str(search);
         text.push('\n');
     }
     (text, defaulted)
@@ -1867,8 +2412,19 @@ mod tests {
     #[test]
     fn tool_paths_are_flags_and_the_zone_name_is_positional() {
         let parsed = Args::parse(&argv(&[
-            "--ip", "/n/ip", "--awg", "/n/awg", "--wg", "/n/wg", "--pasta", "/n/pasta", "--nft",
-            "/n/nft", "nl",
+            "--ip",
+            "/n/ip",
+            "--awg",
+            "/n/awg",
+            "--wg",
+            "/n/wg",
+            "--pasta",
+            "/n/pasta",
+            "--nft",
+            "/n/nft",
+            "--openconnect",
+            "/n/openconnect",
+            "nl",
         ]))
         .unwrap();
         assert_eq!(parsed.name, OsString::from("nl"));
@@ -1877,6 +2433,7 @@ mod tests {
         assert_eq!(parsed.tools.wg, PathBuf::from("/n/wg"));
         assert_eq!(parsed.tools.pasta, PathBuf::from("/n/pasta"));
         assert_eq!(parsed.tools.nft, PathBuf::from("/n/nft"));
+        assert_eq!(parsed.tools.openconnect, PathBuf::from("/n/openconnect"));
     }
 
     #[test]
@@ -1960,6 +2517,94 @@ mod tests {
         // A DNS= line of nothing but separators is the same as no line at all.
         let (_, defaulted) = resolv_conf(&[String::new()]);
         assert!(defaulted);
+    }
+
+    #[test]
+    fn a_gateways_search_domain_becomes_one_more_line_and_no_more() {
+        let (text, _) = resolv_conf_with_search(
+            &["10.5.0.1".to_string()],
+            Some("corp.example.org"),
+        );
+        assert_eq!(text, "nameserver 10.5.0.1\nsearch corp.example.org\n");
+
+        // No domain, no line — and an empty one is no domain.
+        let (text, _) = resolv_conf_with_search(&["10.5.0.1".to_string()], None);
+        assert_eq!(text, "nameserver 10.5.0.1\n");
+        let (text, _) = resolv_conf_with_search(&["10.5.0.1".to_string()], Some(""));
+        assert_eq!(text, "nameserver 10.5.0.1\n");
+
+        // A gateway that names no resolver at all still gets the project's
+        // default ones — reachable through the tunnel and nowhere else.
+        let (text, defaulted) = resolv_conf_with_search(&[], Some("corp.example.org"));
+        assert!(defaulted);
+        assert_eq!(
+            text,
+            "nameserver 1.1.1.1\nnameserver 9.9.9.9\nsearch corp.example.org\n"
+        );
+    }
+
+    #[test]
+    fn the_openconnect_mirror_says_connected_only_while_the_interface_is_up() {
+        let up = "5: awg0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1412 qdisc fq_codel \
+                  state UNKNOWN mode DEFAULT group default qlen 500\\    link/none";
+        let addr = "awg0             UNKNOWN        10.5.0.7/32";
+        assert_eq!(
+            oc_mirror(up, addr),
+            "interface: awg0\n  backend: openconnect\n  connected: yes\n  address: 10.5.0.7/32\n"
+        );
+
+        // Down, and gone, are different answers and neither of them says
+        // "connected" — which is the word `vpn-zone check` looks for.
+        let down = "5: awg0: <POINTOPOINT,MULTICAST,NOARP> mtu 1412 qdisc noop state DOWN mode \
+                    DEFAULT group default qlen 500\\    link/none";
+        assert!(oc_mirror(down, "").contains("disconnected: the tunnel interface is down"));
+        assert!(!oc_mirror(down, "").contains("connected: yes"));
+        assert!(oc_mirror("", "").contains("disconnected: the tunnel interface is gone"));
+
+        // LOWER_UP without UP is not up: a substring search for "UP" would have
+        // said otherwise.
+        let carrier_only = "5: awg0: <POINTOPOINT,NOARP,LOWER_UP> mtu 1412 state DOWN";
+        assert!(oc_mirror(carrier_only, "").contains("disconnected"));
+
+        // An interface that is up but has no address yet is still connected;
+        // the address line is simply absent.
+        assert_eq!(
+            oc_mirror(up, "awg0             UNKNOWN"),
+            "interface: awg0\n  backend: openconnect\n  connected: yes\n"
+        );
+    }
+
+    #[test]
+    fn an_openconnect_uplink_may_talk_to_its_gateway_and_to_nothing_else() {
+        let backend = Backend::Oc(Box::new(OcZone {
+            cfg: OcConfig::parse(b"[OpenConnect]\nServer = vpn.example.org:4443\n").unwrap(),
+            addr: "198.51.100.7".parse().unwrap(),
+        }));
+        // No port in the rule, and that is the one place this backend is wider
+        // than WireGuard's: DTLS goes to a UDP port the server picks, and the
+        // number is not known before the session exists. What the rule says is
+        // still "this gateway and nothing else in the world".
+        assert_eq!(
+            uplink_ruleset(&backend.sockets()),
+            concat!(
+                "table inet vpnzone {\n",
+                "\tchain output {\n",
+                "\t\ttype filter hook output priority filter; policy drop;\n",
+                "\t\toifname \"lo\" accept\n",
+                "\t\tip daddr 198.51.100.7 accept\n",
+                "\t}\n",
+                "}\n",
+            )
+        );
+
+        // And a WireGuard zone's rules are unchanged by any of this.
+        let wg = Backend::Wg(
+            WgConfig::parse_str(
+                "[Interface]\nPrivateKey = k\n[Peer]\nEndpoint = 198.51.100.7:51820\n",
+            )
+            .unwrap(),
+        );
+        assert!(uplink_ruleset(&wg.sockets()).contains("ip daddr 198.51.100.7 udp dport 51820"));
     }
 
     /// A guard over a security invariant rather than over an algorithm: every

@@ -11,18 +11,30 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
 
-use vpn_zone::{desktop, fs_sandbox, profile, wl_sandbox, zone};
+use vpn_zone::{desktop, fs_sandbox, openconnect, profile, wl_sandbox, zone};
 
 const USAGE: &str = "\
 vpn-zone-core — helper commands of vpn-zones
 
 Usage:
-  vpn-zone-core zone-holder [--ip P] [--awg P] [--wg P] [--pasta P] <name>
+  vpn-zone-core zone-holder [--ip P] [--awg P] [--wg P] [--pasta P] [--nft P]
+                            [--openconnect P] <name>
         Bring the zone up and hold it: a user namespace with the double id
         mapping, a net+mount namespace with the tunnel in it, and pasta as the
         way out. Runs until killed, and the zone dies with it — that is the
         kill switch. This is the ExecStart of vpn-zone@<name>.service; the tool
-        paths are substituted by Nix and default to a PATH lookup.
+        paths are substituted by Nix and default to a PATH lookup. The zone is
+        a WireGuard/AmneziaWG one or an OpenConnect one, depending on whether
+        its config has an [OpenConnect] section.
+
+  vpn-zone-core oc-script
+        The vpnc-script of an [OpenConnect] zone, and nothing else's: this is
+        what the zone's openconnect is started with as its --script. It takes
+        no arguments — openconnect passes everything in the environment, and
+        the zone adds VPN_ZONE_OC_DIR, VPN_ZONE_OC_NETNS_PID, VPN_ZONE_OC_IP
+        and VPN_ZONE_OC_MTU to it. On `connect` it moves the tunnel interface
+        into the zone's app namespace and writes down what the gateway said;
+        the app namespace does the configuring. Not meant to be run by hand.
 
   vpn-zone-core profile-run <profiledir> <zone> <ephemeral 0|1> <regdir> -- cmd...
         Stack the container's overlay layers over the XDG directories, drop the
@@ -97,6 +109,17 @@ fn main() -> ExitCode {
                 ExitCode::from(EXIT_USAGE)
             }
         },
+        Some("oc-script") => {
+            let env = openconnect::environment();
+            match openconnect::Args::from_env(&args[1..], &env) {
+                Ok(parsed) => ExitCode::from(openconnect::run(&parsed, &env)),
+                Err(e) => {
+                    eprintln!("vpn-zone-core oc-script: {e}");
+                    eprint!("{USAGE}");
+                    ExitCode::from(EXIT_USAGE)
+                }
+            }
+        }
         Some("profile-run") => match profile::Args::parse(&args[1..]) {
             Ok(parsed) => ExitCode::from(profile::run(parsed)),
             Err(e) => {

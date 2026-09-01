@@ -243,6 +243,20 @@ impl WgConfig {
             .find(|s| s.kind == SectionKind::Interface)
     }
 
+    /// First section with this name, case-insensitively.
+    ///
+    /// The type is named after its first and biggest user, but what it holds is
+    /// the project's ONE reader of `.conf` files — CRLF, comments, free spacing
+    /// and the empty-value rule are dealt with here and nowhere else. The
+    /// OpenConnect backend reads its `[OpenConnect]` section out of the same
+    /// parse ([`crate::openconnect::OcConfig::from_ini`]) rather than growing a
+    /// second parser with a second set of quirks.
+    pub fn section(&self, name: &str) -> Option<&Section> {
+        self.sections
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name))
+    }
+
     /// All `[Peer]` sections, in file order.
     pub fn peers(&self) -> impl Iterator<Item = &Section> + '_ {
         self.sections.iter().filter(|s| s.kind == SectionKind::Peer)

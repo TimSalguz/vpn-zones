@@ -93,6 +93,16 @@ let
   # namespace зоны. Зовёт его только держатель зоны, поэтому путь идёт флагом
   # ExecStart, как ip/awg/wg/pasta, а не манифестом.
   nft = "${pkgs.nftables}/bin/nft";
+  # Второй тип зоны — [OpenConnect] (Cisco AnyConnect/ocserv, а через
+  # --protocol ещё GlobalProtect и Pulse). Клиент работает В АПЛИНКЕ, его tun
+  # переезжает в зону приложений; путь идёт флагом ExecStart, как ip/awg/wg/
+  # pasta/nft, потому что зовёт его только держатель зоны.
+  #
+  # Штатный vpnc-script сюда НЕ ставится намеренно: --script держателя — это
+  # наш же vpn-zone-core oc-script, и подменить его конфигом зоны нельзя
+  # (белый список Args=, rust/src/openconnect.rs). Обычный vpnc-script
+  # настраивал бы сеть ХОСТА.
+  openconnect = "${pkgs.openconnect}/bin/openconnect";
   notify = "${pkgs.libnotify}/bin/notify-send";
   kdialog = "${pkgs.kdePackages.kdialog}/bin/kdialog";
 
@@ -270,9 +280,9 @@ let
       bwrap = "${pkgs.bubblewrap}/bin/bwrap";
       dbus-proxy = "${pkgs.xdg-dbus-proxy}/bin/xdg-dbus-proxy";
       xwayland = "${pkgs.xwayland-satellite}/bin/xwayland-satellite";
-      # awg/wg/pasta/nft здесь намеренно НЕТ: их зовёт только держатель зоны, и
-      # получает он их флагами ExecStart своего юнита. Дублировать пути в двух
-      # местах — значит однажды поменять их в одном.
+      # awg/wg/pasta/nft/openconnect здесь намеренно НЕТ: их зовёт только
+      # держатель зоны, и получает он их флагами ExecStart своего юнита.
+      # Дублировать пути в двух местах — значит однажды поменять их в одном.
     }
   );
 
@@ -453,9 +463,13 @@ in
       # туннель, в uplink-ns наружу только пакеты самого туннеля до endpoint.
       # Не поднявшийся фаерволл зону НЕ роняет: это страховка поверх топологии,
       # и держатель громко пишет об этом в журнал.
+      #
+      # --openconnect нужен только зонам с секцией [OpenConnect]; зона на
+      # WireGuard/AmneziaWG на этот путь ни разу не смотрит.
       ExecStart =
         "${vpn-zone-rust}/bin/vpn-zone-core zone-holder"
-        + " --ip ${iproute} --awg ${awg} --wg ${wg} --pasta ${pasta} --nft ${nft} %i";
+        + " --ip ${iproute} --awg ${awg} --wg ${wg} --pasta ${pasta} --nft ${nft}"
+        + " --openconnect ${openconnect} %i";
       Restart = "no";
       # KillMode=control-group по умолчанию: гасим зону — гаснет и pasta, и всё,
       # что в зоне работало, теряет сеть. Это и есть kill switch.

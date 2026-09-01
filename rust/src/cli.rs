@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use crate::config::WgConfig;
 use crate::launch;
+use crate::openconnect::{self, OcConfig};
 use crate::profile::{exec_command, proc_is_alive, EXIT_NOT_STARTED};
 use crate::registry;
 use crate::tools::Tools;
@@ -43,7 +44,7 @@ pub const EXIT_TOOLS: u8 = 2;
 const READY_TRIES: u32 = 100;
 const READY_STEP: Duration = Duration::from_millis(100);
 
-const USAGE: &str = "vpn-zone — сетевые зоны с VPN, без root\n\n  vpn-zone add <имя> <файл.conf>   создать зону из конфига AmneziaWG/WireGuard\n  vpn-zone up <имя>                поднять\n  vpn-zone down <имя>              опустить\n  vpn-zone list                    список зон и их состояние\n  vpn-zone status <имя>            подробности (адрес, handshake)\n  vpn-zone run <имя> -- <кмд>      запустить программу внутри зоны\n  vpn-zone rm <имя>                удалить зону вместе с ярлыками\n  vpn-zone sync                    пересобрать .desktop-ярлыки\n  vpn-zone mode <режим>            как ярлыки работают:\n                                     picker   — один ярлык, спрашивает сеть\n                                                при запуске (по умолчанию)\n                                     per-zone — отдельный ярлык на каждую зону\n                                     both     — и то, и другое\n                                     off      — не трогать ярлыки вовсе\n  vpn-zone default <вариант>       что предлагать в пикере для незнакомой\n                                   программы: offline (по умолчанию), direct\n                                   или имя зоны\n  vpn-zone gc                      убрать зависшие держатели зон, осиротевшую\n                                   обвязку и мёртвые записи\n  vpn-zone perms list|reset <прог.|--all>\n                                   какие доступы к файлам выданы программам\n                                   в песочнице; reset — спросить заново\n  vpn-zone sandbox create|list|rm <имя>\n                                   именованные песочницы: свой дом, общий для\n                                   всех программ, запущенных в этой песочнице\n  vpn-zone run <имя> --sandbox <п> -- <кмд>\n                                   запустить в именованной песочнице\n  vpn-zone run <имя> --fs-sandbox -- <кмд>\n                                   запустить в песочнице файловой системы:\n                                   вместо $HOME — пустой каталог, наружу\n                                   видно только разрешённое, остальное — через\n                                   диалог выбора файла (порталы)\n  vpn-zone run <имя> --tmp-profile -- <кмд>\n                                   запустить в одноразовом контейнере: слой\n                                   создаётся в /tmp и стирается по выходе\n  vpn-zone default-profile <v>     контейнер по умолчанию для всех запусков:\n                                   ask (спрашивать), main (основной),\n                                   own (своя песочница у каждой программы)\n                                   или имя контейнера\n  vpn-zone pins                    какие программы закреплены за сетями\n  vpn-zone forget <прог.|--all>    снять закрепление (снова будет спрашивать)\n  vpn-zone isolate <overlay|off>   свой слой профиля у зоны (overlay — по\n                                   умолчанию). Без него браузер откроет окно\n                                   в уже запущенном процессе, мимо VPN\n  vpn-zone reset-profile <имя>     очистить слой профиля зоны\n  vpn-zone wayland-sandbox on|off  отбирать ли у программ захват экрана,\n                                   чтение буфера в фоне и эмуляцию ввода\n                                   (по умолчанию on; исключения —\n                                   ~/.config/vpn-zones/wayland-allow)\n  vpn-zone check <имя>             прошло ли рукопожатие (жив ли конфиг)\n  vpn-zone lock|unlock <имя>       запретить/разрешить программам этой зоны\n                                   запускать что-либо в ДРУГИХ сетях\n                                   (по умолчанию разрешено)\n";
+const USAGE: &str = "vpn-zone — сетевые зоны с VPN, без root\n\n  vpn-zone add <имя> <файл.conf>   создать зону из конфига AmneziaWG/WireGuard\n                                   или OpenConnect (секция [OpenConnect])\n  vpn-zone up <имя>                поднять\n  vpn-zone down <имя>              опустить\n  vpn-zone list                    список зон и их состояние\n  vpn-zone status <имя>            подробности (адрес, handshake)\n  vpn-zone run <имя> -- <кмд>      запустить программу внутри зоны\n  vpn-zone rm <имя>                удалить зону вместе с ярлыками\n  vpn-zone sync                    пересобрать .desktop-ярлыки\n  vpn-zone mode <режим>            как ярлыки работают:\n                                     picker   — один ярлык, спрашивает сеть\n                                                при запуске (по умолчанию)\n                                     per-zone — отдельный ярлык на каждую зону\n                                     both     — и то, и другое\n                                     off      — не трогать ярлыки вовсе\n  vpn-zone default <вариант>       что предлагать в пикере для незнакомой\n                                   программы: offline (по умолчанию), direct\n                                   или имя зоны\n  vpn-zone gc                      убрать зависшие держатели зон, осиротевшую\n                                   обвязку и мёртвые записи\n  vpn-zone perms list|reset <прог.|--all>\n                                   какие доступы к файлам выданы программам\n                                   в песочнице; reset — спросить заново\n  vpn-zone sandbox create|list|rm <имя>\n                                   именованные песочницы: свой дом, общий для\n                                   всех программ, запущенных в этой песочнице\n  vpn-zone run <имя> --sandbox <п> -- <кмд>\n                                   запустить в именованной песочнице\n  vpn-zone run <имя> --fs-sandbox -- <кмд>\n                                   запустить в песочнице файловой системы:\n                                   вместо $HOME — пустой каталог, наружу\n                                   видно только разрешённое, остальное — через\n                                   диалог выбора файла (порталы)\n  vpn-zone run <имя> --tmp-profile -- <кмд>\n                                   запустить в одноразовом контейнере: слой\n                                   создаётся в /tmp и стирается по выходе\n  vpn-zone default-profile <v>     контейнер по умолчанию для всех запусков:\n                                   ask (спрашивать), main (основной),\n                                   own (своя песочница у каждой программы)\n                                   или имя контейнера\n  vpn-zone pins                    какие программы закреплены за сетями\n  vpn-zone forget <прог.|--all>    снять закрепление (снова будет спрашивать)\n  vpn-zone isolate <overlay|off>   свой слой профиля у зоны (overlay — по\n                                   умолчанию). Без него браузер откроет окно\n                                   в уже запущенном процессе, мимо VPN\n  vpn-zone reset-profile <имя>     очистить слой профиля зоны\n  vpn-zone wayland-sandbox on|off  отбирать ли у программ захват экрана,\n                                   чтение буфера в фоне и эмуляцию ввода\n                                   (по умолчанию on; исключения —\n                                   ~/.config/vpn-zones/wayland-allow)\n  vpn-zone check <имя>             прошло ли рукопожатие (жив ли конфиг)\n  vpn-zone lock|unlock <имя>       запретить/разрешить программам этой зоны\n                                   запускать что-либо в ДРУГИХ сетях\n                                   (по умолчанию разрешено)\n";
 
 /// Entry point of the `vpn-zone` binary.
 pub fn main() -> ExitCode {
@@ -351,20 +352,36 @@ fn add(tools: &Tools, args: &[OsString]) -> u8 {
     let text = strip_cr(&raw);
     // The parser the zone itself will run on, rather than a `grep` for
     // `[Interface]`: a file that cannot be parsed cannot bring a zone up, and
-    // being told so now beats a zone that refuses to start later.
-    match WgConfig::parse(&text) {
+    // being told so now beats a zone that refuses to start later. Which of the
+    // two kinds of zone this is, is one question asked of the same parse — an
+    // `[OpenConnect]` section makes it one, anything else is WireGuard.
+    let ini = match WgConfig::parse(&text) {
+        Ok(ini) => ini,
         Err(e) => {
             eprintln!(
-                "{} не похож на конфиг WireGuard/AmneziaWG: {e}",
+                "{} не похож ни на конфиг WireGuard/AmneziaWG, ни на [OpenConnect]: {e}",
                 conf.display()
             );
             return 1;
         }
-        Ok(cfg) if cfg.interface().is_none() => {
-            eprintln!("{} не похож на конфиг WireGuard/AmneziaWG", conf.display());
-            return 1;
+    };
+    if openconnect::is_openconnect(&ini) {
+        // Checked in full right here, the password file included: a zone that
+        // is created now and refuses to come up in a week, with the reason in
+        // the journal, is the worst way to learn about a typo.
+        match OcConfig::from_ini(&ini).and_then(|cfg| cfg.check_password_file().map(|()| cfg)) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("{}: {e}", conf.display());
+                return 1;
+            }
         }
-        Ok(_) => {}
+    } else if ini.interface().is_none() {
+        eprintln!(
+            "{} не похож ни на конфиг WireGuard/AmneziaWG, ни на [OpenConnect]",
+            conf.display()
+        );
+        return 1;
     }
 
     let dir = tools.state.join(name);
@@ -521,7 +538,7 @@ fn check(tools: &Tools, args: &[OsString]) -> u8 {
         println!("перезапусти её: vpn-zone down {name_text} && vpn-zone up {name_text}");
         return 3;
     };
-    match handshake_line(&mirror) {
+    match liveness_line(&mirror) {
         Some(line) => {
             println!("зона {name_text}: туннель живой ({line})");
             0
@@ -531,6 +548,24 @@ fn check(tools: &Tools, args: &[OsString]) -> u8 {
             1
         }
     }
+}
+
+/// The line of the status mirror that says the tunnel is alive, whichever
+/// backend wrote it.
+///
+/// A WireGuard zone answers with a handshake; an OpenConnect one has no
+/// handshake at all and writes `connected:` instead when its interface is there
+/// and up (`crate::zone::oc_mirror`). Writing a fake handshake line into the
+/// second kind of file would have kept `check` shorter and told the user
+/// something untrue.
+pub fn liveness_line(mirror: &str) -> Option<String> {
+    handshake_line(mirror).or_else(|| {
+        mirror
+            .lines()
+            .map(str::trim_start)
+            .find(|line| line.starts_with("connected:"))
+            .map(str::to_owned)
+    })
 }
 
 /// The "latest handshake" line of a `wg show` mirror, leading spaces trimmed.
@@ -1151,6 +1186,23 @@ mod tests {
         // A file without a trailing newline keeps not having one.
         assert_eq!(strip_cr(b"a\r\nb"), b"a\nb".to_vec());
         assert_eq!(strip_cr(b""), b"".to_vec());
+    }
+
+    #[test]
+    fn liveness_is_a_handshake_or_the_word_connected() {
+        // A WireGuard zone, unchanged.
+        let wg = "interface: awg0\n\npeer: p\n  latest handshake: now\n";
+        assert_eq!(liveness_line(wg).as_deref(), Some("latest handshake: now"));
+
+        // An OpenConnect one, whose mirror has no handshake in it at all.
+        let oc = "interface: awg0\n  backend: openconnect\n  connected: yes\n  address: 10.5.0.7/32\n";
+        assert_eq!(liveness_line(oc).as_deref(), Some("connected: yes"));
+
+        // And the two dead shapes.
+        let gone = "interface: awg0\n  backend: openconnect\n  disconnected: the tunnel interface is gone\n";
+        assert_eq!(liveness_line(gone), None);
+        assert_eq!(liveness_line("interface: awg0\n\npeer: p\n"), None);
+        assert_eq!(liveness_line(""), None);
     }
 
     #[test]
