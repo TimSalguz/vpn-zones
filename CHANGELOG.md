@@ -39,6 +39,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   `--no-system-trust` nor `--allow-insecure-crypto`; nor `--script`,
   `--csd-wrapper` or `--external-browser`, which would replace the thing that
   puts the tunnel behind the wall or run a program of the server's choosing.
+- Two more things a config cannot spell. `ServerCert` takes `pin-sha256:` or
+  `sha256:` but **not** `sha1:`, which `openconnect` itself accepts: a pin is the
+  whole trust decision for a zone that has one, and SHA-1 has not been
+  collision-resistant for years. And the client is started with an environment
+  built from scratch rather than inherited — `openconnect` honours
+  `https_proxy` and its relatives, and a zone should not be one stray session
+  variable away from talking to a proxy instead of its gateway. Four variables
+  survive, each for a written reason: `PATH`, `HOME` and
+  `SSL_CERT_FILE`/`NIX_SSL_CERT_FILE`, which is where the system CA store is.
 - `PasswordFile =` must be absolute, non-empty and readable by nobody else
   (0600, checked at `vpn-zone add` and again at start). It is read once, in the
   uplink, and handed to the client on stdin — never on a command line

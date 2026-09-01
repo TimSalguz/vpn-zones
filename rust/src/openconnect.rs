@@ -54,6 +54,7 @@
 //! thing this project refuses to have in the app namespace.
 
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
@@ -213,7 +214,9 @@ impl fmt::Display for ConfigError {
             Self::BadMtu(v) => write!(f, "MTU = {v}: not a number"),
             Self::BadServerCert(v) => write!(
                 f,
-                "ServerCert = {v}: expected pin-sha256:<base64>, sha256:<hex> or sha1:<hex>"
+                "ServerCert = {v}: expected pin-sha256:<base64> or sha256:<hex> — use the \
+                 pin-sha256 form openconnect prints. sha1: is refused on purpose: a pin is the \
+                 whole trust decision, and SHA-1 has not been collision-resistant for years"
             ),
             Self::RelativePasswordFile(p) => {
                 write!(f, "PasswordFile = {p}: the path has to be absolute")
@@ -456,8 +459,15 @@ fn split_server(raw: &str) -> Result<(String, Option<u16>), ConfigError> {
     Ok((host.to_string(), port))
 }
 
-/// `pin-sha256:<base64>`, `sha256:<hex>` or `sha1:<hex>` — the three shapes
-/// `openconnect --servercert` prints and accepts.
+/// `pin-sha256:<base64>` or `sha256:<hex>`, and nothing else.
+///
+/// `openconnect --servercert` also accepts `sha1:<hex>`, and that one is
+/// deliberately not accepted here. A pin is the whole of the trust decision for
+/// a zone that has one, and SHA-1 has not been collision-resistant for years:
+/// letting a config spell it would be a way to weaken certificate checking
+/// through this file, which is the one thing this format must not have. The
+/// client prints the `pin-sha256:` form itself, so nobody has to reach for the
+/// weaker one.
 fn is_fingerprint(pin: &str) -> bool {
     let Some((kind, rest)) = pin.split_once(':') else {
         return false;
@@ -469,7 +479,7 @@ fn is_fingerprint(pin: &str) -> bool {
         "pin-sha256" => rest
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='),
-        "sha256" | "sha1" => rest.bytes().all(|b| b.is_ascii_hexdigit() || b == b':'),
+        "sha256" => rest.bytes().all(|b| b.is_ascii_hexdigit() || b == b':'),
         _ => false,
     }
 }
@@ -828,6 +838,67 @@ pub fn environment() -> BTreeMap<String, String> {
     std::env::vars().collect()
 }
 
+// --- THE CLIENT'S ENVIRONMENT ------------------------------------------------
+
+/// The only variables of ours that survive into the client, and why each one
+/// does.
+///
+/// The client's environment is built from NOTHING rather than inherited from
+/// the uplink, and the reason is one word: proxies. `openconnect` honours
+/// `https_proxy`, `http_proxy`, `HTTPS_PROXY`, `all_proxy` and `no_proxy`, so an
+/// environment carried in from the user's session could send the client to a
+/// proxy instead of to the gateway. The uplink's filter would drop that packet
+/// — it lets nothing out but the gateway's address — but a zone should not have
+/// to be saved by its second echelon from its own start-up, and the same
+/// argument covers every future variable of that kind that we have not heard of
+/// yet. Starting empty makes the list of what can steer the client finite and
+/// visible.
+///
+/// * `PATH`: the script the client runs is named absolutely, and so is `ip`
+///   when Nix substituted it — but a holder run by hand out of a nix-shell
+///   passes neither, and both then have to be found somewhere.
+/// * `HOME`: carries no network meaning at all; it is here because libraries
+///   fail in obscure ways without it, not because anything of ours reads it.
+/// * `SSL_CERT_FILE` / `NIX_SSL_CERT_FILE`: WHERE THE SYSTEM CA STORE IS. On
+///   NixOS gnutls is patched to read them, so clearing them would leave a zone
+///   without a `ServerCert` pin unable to verify anything — the fail-closed
+///   outcome, but for the wrong reason and with a baffling message. They come
+///   from the system's own environment, not from the network, and a user who
+///   points them at a bad bundle has already done that to their whole session.
+pub const CLIENT_ENV_KEPT: [&str; 4] = ["PATH", "HOME", "SSL_CERT_FILE", "NIX_SSL_CERT_FILE"];
+
+/// Build the client's environment from scratch: what [`CLIENT_ENV_KEPT`] names,
+/// plus what the script needs and nobody else sets.
+///
+/// `OsString` throughout, because a zone directory lives under `$HOME` and a
+/// `$HOME` is bytes.
+///
+/// Note what this also does: a `VPN_ZONE_OC_*` variable inherited from
+/// whoever started the holder is filtered out with everything else, so the
+/// values the script reads are always the ones the uplink meant.
+pub fn client_env(
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    dir: &Path,
+    netns_pid: i32,
+    ip: &Path,
+    mtu: Option<u32>,
+) -> Vec<(OsString, OsString)> {
+    let mut out: Vec<(OsString, OsString)> = inherited
+        .into_iter()
+        .filter(|(key, _)| CLIENT_ENV_KEPT.iter().any(|kept| key == OsStr::new(kept)))
+        .collect();
+    out.push((OsString::from(ENV_DIR), dir.as_os_str().to_owned()));
+    out.push((
+        OsString::from(ENV_NETNS_PID),
+        OsString::from(netns_pid.to_string()),
+    ));
+    out.push((OsString::from(ENV_IP), ip.as_os_str().to_owned()));
+    if let Some(mtu) = mtu {
+        out.push((OsString::from(ENV_MTU), OsString::from(mtu.to_string())));
+    }
+    out
+}
+
 /// Run the script. The exit code is what `openconnect` sees, and a non-zero one
 /// on `connect` aborts the connection — which is the fail-closed answer to "the
 /// interface could not be put behind the wall".
@@ -1022,7 +1093,6 @@ mod tests {
         for good in [
             "pin-sha256:HXXQgxueCIU5TTLHob/bPbwcKOKw6DkfsTWYHbxbqTY=",
             "sha256:8a5e:cb:00",
-            "sha1:abcdef0123",
         ] {
             let cfg = config(&format!(
                 "[OpenConnect]\nServer = a.b\nServerCert = {good}\n"
@@ -1031,8 +1101,20 @@ mod tests {
             assert_eq!(cfg.server_cert.as_deref(), Some(good));
         }
         // Anything that is not a fingerprint is refused: there must be no way to
-        // spell "trust whatever answers" in this file.
-        for bad in ["yes", "accept", "sha256:", "md5:aabb", "--no-system-trust"] {
+        // spell "trust whatever answers" in this file. `sha1:` is in this list
+        // and not in the one above although `openconnect` itself accepts it: a
+        // pin IS the trust decision for a zone that has one, and SHA-1 has not
+        // been collision-resistant for years — spelling it here would be a way
+        // to weaken certificate checking through a config file.
+        for bad in [
+            "yes",
+            "accept",
+            "sha256:",
+            "sha1:abcdef0123",
+            "sha1:",
+            "md5:aabb",
+            "--no-system-trust",
+        ] {
             assert!(
                 matches!(
                     config(&format!(
@@ -1361,6 +1443,100 @@ mod tests {
         ] {
             assert!(Plan::parse(bad).is_err(), "{bad:?} parsed as a plan");
         }
+    }
+
+    #[test]
+    fn the_client_starts_with_an_environment_we_built_and_not_the_users() {
+        let inherited: Vec<(OsString, OsString)> = [
+            // The reason this function exists: openconnect honours every one of
+            // these, and a proxy is a way to the wrong server.
+            ("https_proxy", "http://proxy.evil.example:3128"),
+            ("http_proxy", "http://proxy.evil.example:3128"),
+            ("HTTPS_PROXY", "http://proxy.evil.example:3128"),
+            ("all_proxy", "socks5://proxy.evil.example:1080"),
+            ("no_proxy", "*"),
+            // Ordinary session noise the client has no business seeing.
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+            ("WAYLAND_DISPLAY", "wayland-1"),
+            // And a stale copy of our own contract, which must not win over
+            // what the uplink actually meant.
+            (ENV_NETNS_PID, "1"),
+            (ENV_DIR, "/somewhere/else"),
+            // The four that survive.
+            ("PATH", "/run/wrappers/bin:/usr/bin"),
+            ("HOME", "/home/u"),
+            ("SSL_CERT_FILE", "/etc/ssl/certs/ca-bundle.crt"),
+            ("NIX_SSL_CERT_FILE", "/etc/ssl/certs/ca-bundle.crt"),
+        ]
+        .iter()
+        .map(|(k, v)| (OsString::from(*k), OsString::from(*v)))
+        .collect();
+
+        let built = client_env(
+            inherited,
+            Path::new("/home/u/.local/state/vpn-zones/work"),
+            4242,
+            Path::new("/nix/store/x/bin/ip"),
+            Some(1300),
+        );
+        let by_key = |name: &str| -> Option<String> {
+            built
+                .iter()
+                .find(|(k, _)| k == OsStr::new(name))
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+
+        // Nothing that can steer the client anywhere survives.
+        for gone in [
+            "https_proxy",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "all_proxy",
+            "no_proxy",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "WAYLAND_DISPLAY",
+        ] {
+            assert_eq!(by_key(gone), None, "{gone} reached the client");
+        }
+        // The four that do, unchanged.
+        assert_eq!(
+            by_key("PATH").as_deref(),
+            Some("/run/wrappers/bin:/usr/bin")
+        );
+        assert_eq!(by_key("HOME").as_deref(), Some("/home/u"));
+        assert_eq!(
+            by_key("SSL_CERT_FILE").as_deref(),
+            Some("/etc/ssl/certs/ca-bundle.crt")
+        );
+        assert_eq!(
+            by_key("NIX_SSL_CERT_FILE").as_deref(),
+            Some("/etc/ssl/certs/ca-bundle.crt")
+        );
+        // And ours, which beat the stale copies rather than losing to them.
+        assert_eq!(
+            by_key(ENV_DIR).as_deref(),
+            Some("/home/u/.local/state/vpn-zones/work")
+        );
+        assert_eq!(by_key(ENV_NETNS_PID).as_deref(), Some("4242"));
+        assert_eq!(by_key(ENV_IP).as_deref(), Some("/nix/store/x/bin/ip"));
+        assert_eq!(by_key(ENV_MTU).as_deref(), Some("1300"));
+        // A stale value must not survive even as an earlier duplicate: the
+        // whole vector goes to `Command::envs`, and there a later entry wins,
+        // so the count is the assertion.
+        assert_eq!(
+            built
+                .iter()
+                .filter(|(k, _)| k == OsStr::new(ENV_NETNS_PID))
+                .count(),
+            1
+        );
+        assert_eq!(built.len(), CLIENT_ENV_KEPT.len() + 4);
+
+        // No MTU in the config means no variable at all, not an empty one —
+        // the script falls back to what the gateway says.
+        let bare = client_env(Vec::new(), Path::new("/z"), 7, Path::new("/bin/ip"), None);
+        assert!(!bare.iter().any(|(k, _)| k == OsStr::new(ENV_MTU)));
+        assert_eq!(bare.len(), 3);
     }
 
     #[test]

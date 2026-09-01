@@ -141,6 +141,7 @@ Protocol   = anyconnect               ; default; nc | gp | pulse | f5 | fortinet
 User       = alice
 AuthGroup  = Employees                ; the "realm"/"domain" dropdown, if the server has one
 ServerCert = pin-sha256:HXXQ…=        ; pin the certificate; without it, the system CA store
+                                      ; (pin-sha256: or sha256: — never sha1:)
 PasswordFile = /home/alice/.config/vpn-zones/secrets/work.pass
 MTU        = 1300                     ; optional, wins over what the gateway offers
 Args       = --no-dtls --os=linux-64  ; optional, from an allowlist
@@ -158,9 +159,11 @@ WireGuard private key, which lives inside the config and goes with the zone,
 this one is yours to keep or remove.
 
 `ServerCert` is what a corporate CA the system does not know needs; a gateway
-with a publicly trusted certificate needs none. To learn the fingerprint, let
-the client tell you — it prints the exact string to pin, and the module puts it
-on your `PATH` for this one purpose:
+with a publicly trusted certificate needs none. `openconnect` itself also
+accepts a `sha1:` pin; a zone config does not, because a pin IS the whole trust
+decision and SHA-1 has not been collision-resistant for years. To learn the
+fingerprint, let the client tell you — it prints the exact `pin-sha256:` string,
+and the module puts it on your `PATH` for this one purpose:
 
 ```sh
 openconnect --non-inter vpn.example.com   # prints "--servercert pin-sha256:…"

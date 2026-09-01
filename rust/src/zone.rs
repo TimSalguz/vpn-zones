@@ -1337,6 +1337,11 @@ fn tell_the_zone(moved_w: OwnedFd, tool: u8) -> Result<(), String> {
 /// * `--passwd-on-stdin` with the password written on one line and the pipe
 ///   closed. Not a command-line argument: `/proc/<pid>/cmdline` is world
 ///   readable, and not an environment variable either, for the same reason.
+///
+/// And the environment is BUILT rather than inherited
+/// ([`crate::openconnect::client_env`]): `openconnect` honours `https_proxy`
+/// and its relatives, and a zone must not be one stray session variable away
+/// from talking to somebody else.
 fn spawn_openconnect(zone: &Zone, oc: &OcZone, zone_pid: libc::pid_t) -> Result<Child, String> {
     let cfg = &oc.cfg;
     let password = cfg.read_password().map_err(|e| format!("{CONFIG}: {e}"))?;
@@ -1386,14 +1391,20 @@ fn spawn_openconnect(zone: &Zone, oc: &OcZone, zone_pid: libc::pid_t) -> Result<
     }
     cmd.arg(cfg.server_arg());
 
-    // What the script needs and openconnect knows nothing about. Inherited
-    // through openconnect into the script, which is where they are read.
-    cmd.env(openconnect::ENV_DIR, &zone.dir)
-        .env(openconnect::ENV_NETNS_PID, zone_pid.to_string())
-        .env(openconnect::ENV_IP, &zone.tools.ip);
-    if let Some(mtu) = cfg.mtu {
-        cmd.env(openconnect::ENV_MTU, mtu.to_string());
-    }
+    // THE CLIENT STARTS WITH AN EMPTY ENVIRONMENT, not with ours. `openconnect`
+    // honours `https_proxy` and its relatives, so an environment carried in
+    // from the user's session could point the client at a proxy instead of at
+    // the gateway; the uplink's filter would drop that packet, but a zone
+    // should not have to be rescued by its second echelon from its own
+    // start-up. What survives, and why, is `openconnect::CLIENT_ENV_KEPT`; the
+    // rest is what the script needs and nobody else sets.
+    cmd.env_clear().envs(openconnect::client_env(
+        std::env::vars_os(),
+        &zone.dir,
+        zone_pid,
+        &zone.tools.ip,
+        cfg.mtu,
+    ));
     cmd.stdin(if password.is_some() {
         Stdio::piped()
     } else {
