@@ -104,10 +104,17 @@ pub const ENV_MTU: &str = "VPN_ZONE_OC_MTU";
 ///   accepted as two arguments, `Args = --useragent --script` would smuggle the
 ///   forbidden one in as a value that `openconnect` then reads as a flag of its
 ///   own the moment the list is reordered. `--flag=value` cannot split.
-const ALLOWED_ARGS: [(&str, bool); 17] = [
+/// * Three compatibility flags are left out although a user might reasonably
+///   want them, because each one weakens the tunnel itself and this project
+///   settles that conflict the same way every time: `--deflate` (stateful
+///   compression before encryption, i.e. the VORACLE/CRIME class — its
+///   opposite, `--no-deflate`, is here), `--dtls-ciphers` (the only way through
+///   this file to pick weaker transport crypto; a gateway that needs exotic
+///   ciphers can have `--no-dtls` instead) and `--passtos` (copies the inner
+///   traffic class onto the outer packets, which is inner metadata on the
+///   outside of the tunnel).
+const ALLOWED_ARGS: [(&str, bool); 14] = [
     ("--base-mtu", true),
-    ("--deflate", false),
-    ("--dtls-ciphers", true),
     ("--force-dpd", true),
     ("--local-hostname", true),
     ("--no-deflate", false),
@@ -115,7 +122,6 @@ const ALLOWED_ARGS: [(&str, bool); 17] = [
     ("--no-http-keepalive", false),
     ("--no-xmlpost", false),
     ("--os", true),
-    ("--passtos", false),
     ("--pfs", false),
     ("--queue-len", true),
     ("--reconnect-timeout", true),
@@ -1060,6 +1066,28 @@ mod tests {
                 "{bad} slipped through"
             );
         }
+        // And the three that weaken the tunnel rather than the setup around
+        // it: compression before encryption, weaker transport crypto, and the
+        // inner traffic class copied onto the outer packets.
+        for weakening in ["--deflate", "--dtls-ciphers=DEFAULT", "--passtos"] {
+            assert!(
+                matches!(
+                    config(&format!(
+                        "[OpenConnect]\nServer = a.b\nArgs = {weakening}\n"
+                    )),
+                    Err(ConfigError::ForbiddenArg(_))
+                ),
+                "{weakening} slipped through"
+            );
+        }
+        // Their safe opposites stay allowed.
+        assert_eq!(
+            config("[OpenConnect]\nServer = a.b\nArgs = --no-deflate --no-dtls\n")
+                .unwrap()
+                .extra,
+            ["--no-deflate", "--no-dtls"]
+        );
+
         // The shape matters too: a value-taking flag written as one word only,
         // and a flag without a value never with one.
         assert!(matches!(
