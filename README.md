@@ -152,8 +152,10 @@ vpn-zone add work ~/work-vpn.conf
 vpn-zone up work && vpn-zone run work -- remmina
 ```
 
-To learn the fingerprint, let the client tell you — it prints the exact string
-to pin:
+`ServerCert` is what a corporate CA the system does not know needs; a gateway
+with a publicly trusted certificate needs none. To learn the fingerprint, let
+the client tell you — it prints the exact string to pin, and the module puts it
+on your `PATH` for this one purpose:
 
 ```sh
 openconnect --non-inter vpn.example.com   # prints "--servercert pin-sha256:…"
