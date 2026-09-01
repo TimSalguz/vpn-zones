@@ -1195,7 +1195,8 @@ mod tests {
         assert_eq!(liveness_line(wg).as_deref(), Some("latest handshake: now"));
 
         // An OpenConnect one, whose mirror has no handshake in it at all.
-        let oc = "interface: awg0\n  backend: openconnect\n  connected: yes\n  address: 10.5.0.7/32\n";
+        let oc =
+            "interface: awg0\n  backend: openconnect\n  connected: yes\n  address: 10.5.0.7/32\n";
         assert_eq!(liveness_line(oc).as_deref(), Some("connected: yes"));
 
         // And the two dead shapes.

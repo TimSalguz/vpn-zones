@@ -1431,7 +1431,9 @@ fn spawn_openconnect(zone: &Zone, oc: &OcZone, zone_pid: libc::pid_t) -> Result<
             return Err("openconnect was given no stdin to read the password from".to_string());
         };
         // One line, then EOF: `--non-inter` means nothing else will be asked.
-        let written = stdin.write_all(password.as_bytes()).and_then(|()| stdin.write_all(b"\n"));
+        let written = stdin
+            .write_all(password.as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"));
         drop(stdin);
         if let Err(e) = written {
             let _ = child.kill();
@@ -1700,8 +1702,8 @@ fn zone_setup(zone: &Zone, links: Option<ZoneLinks<'_>>) -> Result<(), String> {
             // it to the journal answers "is this .conf still worth anything?"
             // straight away.
             thread::sleep(HANDSHAKE_AFTER);
-            let handshakes = tool_output(&wgtool, &["show", TUN_IFACE, "latest-handshakes"])
-                .unwrap_or_default();
+            let handshakes =
+                tool_output(&wgtool, &["show", TUN_IFACE, "latest-handshakes"]).unwrap_or_default();
             if handshake_seen(&handshakes) {
                 println!("zone {}: handshake done — the tunnel is alive", zone.name());
             } else {
@@ -2521,10 +2523,8 @@ mod tests {
 
     #[test]
     fn a_gateways_search_domain_becomes_one_more_line_and_no_more() {
-        let (text, _) = resolv_conf_with_search(
-            &["10.5.0.1".to_string()],
-            Some("corp.example.org"),
-        );
+        let (text, _) =
+            resolv_conf_with_search(&["10.5.0.1".to_string()], Some("corp.example.org"));
         assert_eq!(text, "nameserver 10.5.0.1\nsearch corp.example.org\n");
 
         // No domain, no line — and an empty one is no domain.

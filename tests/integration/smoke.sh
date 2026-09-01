@@ -42,7 +42,7 @@ HARNESS="$REPO_ROOT/tests/harness.nix"
 WORK=$(mktemp -d)
 STATE="$HOME/.local/state/vpn-zones"
 PROFILES="$HOME/.local/state/vpn-profiles"
-TEST_ZONES=(smoke smoke-crlf offsmoke)
+TEST_ZONES=(smoke smoke-crlf offsmoke ocsmoke)
 TEST_PROFILE=smoketest-prof
 MARKER="$HOME/.config/vpn-smoke-marker"
 # Песочница файловой системы: свой app-id (набор доступов запоминается по нему)
@@ -58,6 +58,11 @@ HOLDER_PIDS=()
 cleanup() {
   rc=$?
   set +e
+  # Сервер OpenConnect (если поднимался) — он под sudo и обычным kill не
+  # гасится. Ищем по пути НАШЕГО конфига, чтобы не задеть чужой ocserv.
+  if [ -n "${OCSERV_CONF:-}" ]; then
+    sudo -n pkill -TERM -f "$OCSERV_CONF" 2>/dev/null
+  fi
   for p in "${HOLDER_PIDS[@]}"; do kill -TERM "$p" 2>/dev/null; done
   # Оба namespace зоны: держатель гасит их вместе, но если он сам уже убит,
   # аплинк остался бы висеть с pasta на шее.
@@ -85,12 +90,16 @@ cleanup() {
   rm -f "${STATE:?}/.last/$PICKKEY" "${STATE:?}/.lastprofile/$PICKKEY" \
         "${STATE:?}/.labels/$PICKKEY"
   if [ "$rc" -ne 0 ]; then
-    for z in smoke offsmoke; do
+    for z in smoke offsmoke ocsmoke; do
       if [ -s "$WORK/holder-$z.log" ]; then
         printf -- '--- журнал держателя %s ---\n' "$z"
         cat "$WORK/holder-$z.log"
       fi
     done
+    if [ -s "$WORK/ocserv.log" ]; then
+      printf -- '--- журнал ocserv ---\n'
+      tail -60 "$WORK/ocserv.log"
+    fi
   fi
   rm -rf "$WORK"
   exit "$rc"
@@ -532,6 +541,255 @@ step "Внутри offline-зоны: правил нет — запрещать 
 offrules=$(in_off_root "$NFT" list ruleset 2>/dev/null || true)
 [ -z "$offrules" ] || fail "в offline-зоне появился ruleset: $offrules"
 echo "ok: ruleset пуст"
+
+# --- 7б. Зона OpenConnect ----------------------------------------------------
+# ВТОРОЙ ТИП БЭКЕНДА (rust/src/openconnect.rs). Проверяется весь контур целиком:
+# настоящий ocserv на раннере, настоящий openconnect в uplink-ns зоны, его tun
+# переезжает в app-ns, и в app-ns снова обязано быть РОВНО два интерфейса.
+#
+# Почему сервер живёт в сети ХОСТА, а не в отдельном userns: ocserv'у нужен свой
+# tun и привилегии, а внутри непривилегированного userns он их не получит —
+# зато зоне до него ходить незачем иначе, чем через pasta, то есть ровно тем
+# путём, которым она ходит к настоящему шлюзу. Со стороны зоны это неотличимо
+# от корпоративного сервера в интернете.
+#
+# Сертификат и пароль синтетические и генерируются на лету: в git не попадает
+# ни ключ, ни отпечаток.
+step "Зона OpenConnect: поднимаю ocserv на раннере"
+OC_SKIP=""
+if ! command -v sudo >/dev/null || ! sudo -n true 2>/dev/null; then
+  OC_SKIP="нет sudo без пароля — ocserv не поднять"
+fi
+if [ -n "$OC_SKIP" ] && [ -n "${VPN_ZONE_SMOKE_REQUIRE_OC:-}" ]; then
+  fail "VPN_ZONE_SMOKE_REQUIRE_OC=1, но часть про OpenConnect пропускается: $OC_SKIP"
+fi
+
+if [ -n "$OC_SKIP" ]; then
+  echo "ПРОПУСК (OpenConnect): $OC_SKIP"
+else
+  build ocTools octools
+  OCSERV="$WORK/octools/bin/ocserv"
+  OPENCONNECT="$WORK/octools/bin/openconnect"
+  OPENSSL="$WORK/octools/bin/openssl"
+  for b in "$OCSERV" "$OPENCONNECT" "$OPENSSL"; do
+    [ -x "$b" ] || fail "нет $b"
+  done
+
+  OCDIR="$WORK/ocserv"
+  OCSERV_CONF="$OCDIR/ocserv.conf"
+  OCPASS="$WORK/ocsmoke.pass"          # файл пароля зоны: обязан быть 0600
+  OCPASSWORD=smoke-secret
+  mkdir -p "$OCDIR"
+  # $WORK создан mktemp -d (0700), а воркеры ocserv работают под nobody и
+  # должны дойти до сокета и сертификата. Каталог делаем проходимым, но не
+  # читаемым: файл пароля зоны лежит рядом и остаётся 0600.
+  chmod 711 "$WORK"
+
+  # Адрес, по которому зона увидит сервер. Не 127.0.0.1: внутри uplink-ns
+  # петля своя, а pasta выпускает наружу — до собственного адреса хоста пакет
+  # доходит ровно так же, как до чужого.
+  SRVIP=$("$IP" -4 -o route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)
+  [ -n "$SRVIP" ] || fail "не удалось определить адрес раннера для ocserv"
+  echo "ocserv будет слушать на $SRVIP:4443"
+
+  step "Зона OpenConnect: синтетический сертификат и пароль"
+  "$OPENSSL" req -x509 -newkey rsa:2048 -nodes -days 1 \
+    -subj "/CN=vpn-smoke.invalid" -addext "subjectAltName=IP:$SRVIP" \
+    -keyout "$OCDIR/key.pem" -out "$OCDIR/cert.pem" >/dev/null 2>&1 \
+    || fail "не сгенерировался сертификат"
+  # Формат plain-файла ocserv: имя:группы:crypt(3). openssl passwd -6 даёт
+  # ровно такой хеш ($6$…), какой понимает crypt(3) glibc.
+  ochash=$("$OPENSSL" passwd -6 "$OCPASSWORD")
+  printf 'smoke:*:%s\n' "$ochash" > "$OCDIR/passwd"
+  printf '%s' "$OCPASSWORD" > "$OCPASS"
+  chmod 600 "$OCPASS"
+
+  cat > "$OCSERV_CONF" <<EOF
+auth = "plain[passwd=$OCDIR/passwd]"
+tcp-port = 4443
+udp-port = 4443
+run-as-user = nobody
+run-as-group = nogroup
+socket-file = $OCDIR/socket
+server-cert = $OCDIR/cert.pem
+server-key = $OCDIR/key.pem
+isolate-workers = false
+max-clients = 4
+max-same-clients = 2
+try-mtu-discovery = false
+device = ocsmoketun
+predictable-ips = true
+ipv4-network = 192.168.222.0
+ipv4-netmask = 255.255.255.0
+dns = 192.168.222.1
+default-domain = smoke.example
+ping-leases = false
+cisco-client-compat = true
+dtls-legacy = true
+auth-timeout = 40
+pid-file = $OCDIR/ocserv.pid
+EOF
+  chmod -R a+rX "$OCDIR"
+
+  sudo -n "$OCSERV" -c "$OCSERV_CONF" -f -d 1 >"$WORK/ocserv.log" 2>&1 &
+  for _ in $(seq 1 100); do
+    if (exec 3<>"/dev/tcp/$SRVIP/4443") 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  (exec 3<>"/dev/tcp/$SRVIP/4443") 2>/dev/null \
+    || { tail -30 "$WORK/ocserv.log" >&2; fail "ocserv не начал слушать $SRVIP:4443"; }
+  echo "ok: ocserv слушает"
+
+  # Отпечаток спрашиваем У САМОГО КЛИЕНТА: он печатает готовую строку
+  # «--servercert pin-sha256:…» — считать её своими руками значит однажды
+  # разойтись с ним в формате. Клиент при этом обязан ОТКАЗАТЬСЯ соединяться:
+  # сертификат самоподписанный, а отключать проверку мы не умеем нигде.
+  step "Зона OpenConnect: спрашиваю у openconnect отпечаток сертификата"
+  ocprobe=$("$OPENCONNECT" --non-inter --protocol=anyconnect "$SRVIP:4443" \
+    </dev/null 2>&1 || true)
+  OCPIN=$(printf '%s\n' "$ocprobe" | grep -m1 -o 'pin-sha256:[A-Za-z0-9+/=]*' || true)
+  [ -n "$OCPIN" ] || { printf '%s\n' "$ocprobe" >&2; fail "openconnect не назвал отпечаток"; }
+  echo "ok: $OCPIN"
+
+  step "vpn-zone add ocsmoke (конфиг с секцией [OpenConnect])"
+  cat > "$WORK/ocsmoke.conf" <<EOF
+[OpenConnect]
+Server = $SRVIP:4443
+Protocol = anyconnect
+User = smoke
+ServerCert = $OCPIN
+PasswordFile = $OCPASS
+Args = --no-dtls
+EOF
+  "$VPN_ZONE" add ocsmoke "$WORK/ocsmoke.conf"
+  [ -f "$STATE/ocsmoke/config.conf" ] || fail "конфиг OpenConnect-зоны не скопирован"
+
+  # Тот же файл с запрещённым флагом обязан быть отвергнут ещё на add:
+  # белый список Args — это не украшение, а единственное, что мешает подменить
+  # --script и вывести туннель из-под стены.
+  sed 's/^Args = .*/Args = --script=\/bin\/true/' "$WORK/ocsmoke.conf" > "$WORK/ocbad.conf"
+  if "$VPN_ZONE" add ocbadsmoke "$WORK/ocbad.conf" >"$WORK/ocbad.out" 2>&1; then
+    rm -rf "${STATE:?}/ocbadsmoke"
+    fail "add принял конфиг с --script в Args"
+  fi
+  rm -rf "${STATE:?}/ocbadsmoke"
+  grep -qi 'not allowed' "$WORK/ocbad.out" \
+    || fail "add отверг --script, но не объяснил почему: $(cat "$WORK/ocbad.out")"
+  echo "ok: --script в Args отвергнут на add"
+
+  step "Поднимаю зону ocsmoke держателем"
+  "$ZONE_HOLDER" ocsmoke >"$WORK/holder-ocsmoke.log" 2>&1 &
+  HOLDER_PIDS+=("$!")
+  wait_file "$STATE/ocsmoke/ready" 600 || fail "зона ocsmoke не поднялась за 60 секунд"
+  OCZPID=$(cat "$STATE/ocsmoke/zone.pid")
+  OCUPID=$(cat "$STATE/ocsmoke/uplink.pid")
+  echo "ok: app-ns pid $OCZPID, uplink pid $OCUPID"
+
+  in_oc() {
+    "$NSENTER" --preserve-credentials -U -n -m -t "$OCZPID" -- "$@"
+  }
+  in_ocup() {
+    "$NSENTER" --preserve-credentials -U -n -m -t "$OCUPID" -- "$@"
+  }
+  in_ocup_root() {
+    "$NSENTER" -U -n -m -t "$OCUPID" -- "$@"
+  }
+
+  step "Зона OpenConnect: в app-ns РОВНО два линка — lo и awg0"
+  # Тот же главный ассерт, что у WireGuard-зоны, и по той же причине: туннель
+  # строит чужая программа, а свойство обязано остаться прежним.
+  oclinks=$(in_oc "$IP" -o link show)
+  echo "$oclinks"
+  [ "$(echo "$oclinks" | wc -l)" -eq 2 ] || fail "в app-ns не два интерфейса"
+  echo "$oclinks" | grep -q ': lo:' || fail "в app-ns нет lo"
+  echo "$oclinks" | grep -q ': awg0[:@]' || fail "в app-ns нет awg0"
+  echo "$oclinks" | grep -q 'awg0.*[<,]UP[,>]' || fail "awg0 не поднят"
+
+  step "Зона OpenConnect: default через awg0, адрес от шлюза"
+  ocdef=$(in_oc "$IP" -4 route show default)
+  echo "$ocdef"
+  echo "$ocdef" | grep -q 'dev awg0' || fail "default route не через awg0"
+  ocaddr=$(in_oc "$IP" -br -4 addr show awg0)
+  echo "$ocaddr"
+  echo "$ocaddr" | grep -q '192\.168\.222\.' || fail "адрес не из пула ocserv: $ocaddr"
+
+  step "Зона OpenConnect: маршрут до самого шлюза тоже идёт В ТУННЕЛЬ"
+  # То же перевёрнутое условие, что у WireGuard-зоны: исключений в app-ns нет
+  # вовсе, TLS-сессия живёт этажом выше.
+  ocgw=$(in_oc "$IP" route get "$SRVIP")
+  echo "$ocgw"
+  echo "$ocgw" | grep -q 'dev awg0' || fail "в app-ns остался путь до шлюза мимо туннеля"
+
+  step "Зона OpenConnect: DNS и search — от шлюза, а не от хоста"
+  ocresolv=$(in_oc cat /etc/resolv.conf)
+  echo "$ocresolv"
+  echo "$ocresolv" | grep -Eq '^nameserver[[:space:]]+192\.168\.222\.1' \
+    || fail "в resolv.conf зоны нет резолвера шлюза"
+  echo "$ocresolv" | grep -Eq '^search[[:space:]]+smoke\.example' \
+    || fail "в resolv.conf зоны нет search-домена шлюза"
+
+  step "Зона OpenConnect: IPv6 без пути наружу"
+  if in_oc test -e /proc/sys/net/ipv6; then
+    ocdef6=$(in_oc "$IP" -6 route show default 2>/dev/null || true)
+    echo "v6 default: ${ocdef6:-<пусто>}"
+    if [ -n "$ocdef6" ]; then
+      echo "$ocdef6" | grep -q '^unreachable' || fail "v6 default есть и он не unreachable"
+    fi
+  fi
+
+  step "Зона OpenConnect: в uplink-ns есть pasta, но НЕТ туннеля"
+  ocup=$(in_ocup "$IP" -o link show)
+  echo "$ocup"
+  echo "$ocup" | grep -q ': hostif[:@]' || fail "в uplink-ns нет интерфейса pasta"
+  if in_ocup "$IP" -o link show awg0 >/dev/null 2>&1; then
+    fail "awg0 остался в uplink-ns — переезд tun не состоялся"
+  fi
+
+  step "Зона OpenConnect: второй эшелон аплинка — только адрес шлюза"
+  # Правило без порта, и это единственное место, где бэкенд шире WireGuard'а:
+  # DTLS уходит на порт, который выбирает сервер. «Только этот шлюз» — то же.
+  check_echelon in_ocup_root "$WORK/holder-ocsmoke.log" "uplink-ns (oc)" \
+    'chain output' 'policy drop' "daddr ${SRVIP//./\\.} accept"
+
+  step "Зона OpenConnect: трафик реально идёт в туннель"
+  # Конец туннеля на стороне сервера — 192.168.222.1, там же слушает сам
+  # ocserv. Если TCP-соединение оттуда открывается, значит пакеты прошли весь
+  # путь: app-ns → tun → openconnect в uplink-ns → pasta → ocserv.
+  in_oc timeout 10 bash -c "exec 3<>/dev/tcp/192.168.222.1/4443" \
+    || fail "из зоны не достучаться до конца туннеля — трафик через туннель не идёт"
+  echo "ok: соединение через туннель открылось"
+
+  step "Зона OpenConnect: зеркало состояния и vpn-zone check"
+  wait_file "$STATE/ocsmoke/status" 100 || fail "зеркало состояния не появилось"
+  ocstatus=$(cat "$STATE/ocsmoke/status")
+  echo "$ocstatus"
+  echo "$ocstatus" | grep -q 'backend: openconnect' || fail "в зеркале нет строки о бэкенде"
+  echo "$ocstatus" | grep -q 'connected: yes' || fail "в зеркале нет connected: yes"
+  "$VPN_ZONE" check ocsmoke || fail "vpn-zone check не признал OpenConnect-зону живой"
+
+  step "Зона OpenConnect: смерть клиента валит зону"
+  # Fail-closed: клиента убиваем, и зона обязана уйти целиком — держатель
+  # видит смерть аплинка и гасит всё. Убить его можно только став root ВНУТРИ
+  # userns зоны: настоящий uid процесса — это subuid, и обычным kill он не
+  # достаётся (docs/GOTCHAS.md §1).
+  OCPID=$(pgrep -f 'openconnect --protocol=anyconnect' | head -1 || true)
+  [ -n "$OCPID" ] || fail "процесс openconnect не найден"
+  "$NSENTER" -U -t "$OCUPID" -- kill -TERM "$OCPID" || fail "не убить openconnect"
+  ocgone=""
+  for _ in $(seq 1 100); do
+    if [ ! -d "/proc/$OCZPID" ] && [ ! -d "/proc/$OCUPID" ]; then
+      ocgone=1
+      break
+    fi
+    sleep 0.1
+  done
+  [ -n "$ocgone" ] || fail "клиент убит, а namespace зоны живы — зона не fail-closed"
+  echo "ok: зона ушла вместе с клиентом"
+
+  sudo -n pkill -TERM -f "$OCSERV_CONF" 2>/dev/null || true
+fi
 
 # --- 8. Гасим и проверяем уборку ---------------------------------------------
 step "Гашу держателей (TERM) и добиваю процессы зон"

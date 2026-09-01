@@ -165,8 +165,14 @@ pub enum ConfigError {
     PasswordFileMissing(String),
     /// Readable by the group or by everyone. A VPN password in a file every
     /// process on the machine can open is not a secret.
-    PasswordFileOpen { path: String, mode: u32 },
-    PasswordFileNotOurs { path: String, uid: u32 },
+    PasswordFileOpen {
+        path: String,
+        mode: u32,
+    },
+    PasswordFileNotOurs {
+        path: String,
+        uid: u32,
+    },
     PasswordFileEmpty(String),
     /// A flag that is not on the allowlist, or one written as two words.
     ForbiddenArg(String),
@@ -202,10 +208,9 @@ impl fmt::Display for ConfigError {
                 "PasswordFile = {path} is mode {mode:04o} — it holds a password and has to be \
                  0600 (chmod 600 {path})"
             ),
-            Self::PasswordFileNotOurs { path, uid } => write!(
-                f,
-                "PasswordFile = {path} belongs to uid {uid}, not to you"
-            ),
+            Self::PasswordFileNotOurs { path, uid } => {
+                write!(f, "PasswordFile = {path} belongs to uid {uid}, not to you")
+            }
             Self::PasswordFileEmpty(p) => write!(f, "PasswordFile = {p} is empty"),
             Self::ForbiddenArg(a) => write!(
                 f,
@@ -276,7 +281,10 @@ impl OcConfig {
         let raw_server = section.get("Server").ok_or(ConfigError::MissingServer)?;
         let (server, port) = split_server(raw_server)?;
 
-        let protocol = section.get("Protocol").unwrap_or(DEFAULT_PROTOCOL).to_string();
+        let protocol = section
+            .get("Protocol")
+            .unwrap_or(DEFAULT_PROTOCOL)
+            .to_string();
         if !PROTOCOLS.contains(&protocol.as_str()) {
             return Err(ConfigError::UnknownProtocol(protocol));
         }
@@ -358,9 +366,15 @@ impl OcConfig {
         if mode & 0o077 != 0 {
             return Err(ConfigError::PasswordFileOpen { path: shown, mode });
         }
+        // WHO owns it, but only when there is a "we" to compare against. This
+        // runs twice: once as the user, from `vpn-zone add`, where a file
+        // belonging to somebody else is worth refusing outright — and once
+        // inside the zone's user namespace, where we are uid 0 and every uid in
+        // the mapping is the user's own. Comparing there would refuse every
+        // password file there is (`docs/GOTCHAS.md` §1: the double mapping).
         // SAFETY: getuid(2) takes no arguments and cannot fail.
         let uid = unsafe { libc::getuid() };
-        if meta.uid() != uid {
+        if uid != 0 && meta.uid() != uid {
             return Err(ConfigError::PasswordFileNotOurs {
                 path: shown,
                 uid: meta.uid(),
@@ -394,10 +408,7 @@ impl OcConfig {
 /// would silently ignore half of what the user wrote.
 fn split_server(raw: &str) -> Result<(String, Option<u16>), ConfigError> {
     let bad = || ConfigError::BadServer(raw.to_string());
-    if raw.is_empty()
-        || raw.contains('/')
-        || raw.contains(char::is_whitespace)
-        || raw.contains('@')
+    if raw.is_empty() || raw.contains('/') || raw.contains(char::is_whitespace) || raw.contains('@')
     {
         return Err(bad());
     }
@@ -575,7 +586,8 @@ pub fn plan(
     if !is_iface_name(iface) {
         return Err(ScriptError::BadIface(iface.to_string()));
     }
-    let raw_addr = get("INTERNAL_IP4_ADDRESS").ok_or(ScriptError::Missing("INTERNAL_IP4_ADDRESS"))?;
+    let raw_addr =
+        get("INTERNAL_IP4_ADDRESS").ok_or(ScriptError::Missing("INTERNAL_IP4_ADDRESS"))?;
     let address: Ipv4Addr = raw_addr
         .parse()
         .map_err(|_| ScriptError::BadAddress(raw_addr.to_string()))?;
@@ -583,9 +595,7 @@ pub fn plan(
     let mtu = match mtu_override {
         Some(mtu) => mtu,
         None => match get("INTERNAL_IP4_MTU") {
-            Some(v) => v
-                .parse()
-                .map_err(|_| ScriptError::BadMtu(v.to_string()))?,
+            Some(v) => v.parse().map_err(|_| ScriptError::BadMtu(v.to_string()))?,
             None => DEFAULT_MTU,
         },
     };
@@ -690,11 +700,10 @@ impl Plan {
             match key {
                 "iface" if is_iface_name(value) => iface = Some(value.to_string()),
                 "address" => {
-                    address = Some(
-                        value
-                            .parse::<Ipv4Addr>()
-                            .map_err(|_| format!("{PLAN_FILE}: address={value} is not an address"))?,
-                    );
+                    address =
+                        Some(value.parse::<Ipv4Addr>().map_err(|_| {
+                            format!("{PLAN_FILE}: address={value} is not an address")
+                        })?);
                 }
                 "mtu" => {
                     mtu = Some(
@@ -704,7 +713,10 @@ impl Plan {
                     );
                 }
                 "dns" => {
-                    dns = value.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+                    dns = value
+                        .split_whitespace()
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
                 }
                 "search" if is_domain(value) => search = Some(value.to_string()),
                 other => return Err(format!("{PLAN_FILE}: bad value for {other}")),
@@ -908,7 +920,8 @@ mod tests {
 
     #[test]
     fn a_wireguard_config_is_not_an_openconnect_one() {
-        let wg = WgConfig::parse_str("[Interface]\nPrivateKey = x\n[Peer]\nPublicKey = y\n").unwrap();
+        let wg =
+            WgConfig::parse_str("[Interface]\nPrivateKey = x\n[Peer]\nPublicKey = y\n").unwrap();
         assert!(!is_openconnect(&wg));
         assert_eq!(OcConfig::from_ini(&wg), Err(ConfigError::NoSection));
 
@@ -918,18 +931,27 @@ mod tests {
 
     #[test]
     fn the_server_is_a_host_and_a_port_and_never_a_url() {
-        assert_eq!(split_server("vpn.example.org").unwrap(), ("vpn.example.org".into(), None));
+        assert_eq!(
+            split_server("vpn.example.org").unwrap(),
+            ("vpn.example.org".into(), None)
+        );
         assert_eq!(
             split_server("vpn.example.org:4443").unwrap(),
             ("vpn.example.org".into(), Some(4443))
         );
-        assert_eq!(split_server("198.51.100.7").unwrap(), ("198.51.100.7".into(), None));
+        assert_eq!(
+            split_server("198.51.100.7").unwrap(),
+            ("198.51.100.7".into(), None)
+        );
         // v6 in both shapes: bracketed with a port, bare without one.
         assert_eq!(
             split_server("[2001:db8::1]:443").unwrap(),
             ("2001:db8::1".into(), Some(443))
         );
-        assert_eq!(split_server("2001:db8::1").unwrap(), ("2001:db8::1".into(), None));
+        assert_eq!(
+            split_server("2001:db8::1").unwrap(),
+            ("2001:db8::1".into(), None)
+        );
 
         for bad in [
             "https://vpn.example.org",
@@ -965,7 +987,10 @@ mod tests {
             config("[OpenConnect]\nServer = a.b\nProtocol = openvpn\n"),
             Err(ConfigError::UnknownProtocol(_))
         ));
-        assert_eq!(config("[OpenConnect]\nUser = bob\n"), Err(ConfigError::MissingServer));
+        assert_eq!(
+            config("[OpenConnect]\nUser = bob\n"),
+            Err(ConfigError::MissingServer)
+        );
         assert!(matches!(
             config("[OpenConnect]\nServer = a.b\nMTU = big\n"),
             Err(ConfigError::BadMtu(_))
@@ -983,7 +1008,10 @@ mod tests {
             "sha256:8a5e:cb:00",
             "sha1:abcdef0123",
         ] {
-            let cfg = config(&format!("[OpenConnect]\nServer = a.b\nServerCert = {good}\n")).unwrap();
+            let cfg = config(&format!(
+                "[OpenConnect]\nServer = a.b\nServerCert = {good}\n"
+            ))
+            .unwrap();
             assert_eq!(cfg.server_cert.as_deref(), Some(good));
         }
         // Anything that is not a fingerprint is refused: there must be no way to
@@ -991,7 +1019,9 @@ mod tests {
         for bad in ["yes", "accept", "sha256:", "md5:aabb", "--no-system-trust"] {
             assert!(
                 matches!(
-                    config(&format!("[OpenConnect]\nServer = a.b\nServerCert = {bad}\n")),
+                    config(&format!(
+                        "[OpenConnect]\nServer = a.b\nServerCert = {bad}\n"
+                    )),
                     Err(ConfigError::BadServerCert(_))
                 ),
                 "{bad} was accepted as a pin"
@@ -1001,8 +1031,8 @@ mod tests {
 
     #[test]
     fn extra_arguments_are_an_allowlist_and_a_shape() {
-        let cfg = config("[OpenConnect]\nServer = a.b\nArgs = --no-dtls --os=linux-64 --pfs\n")
-            .unwrap();
+        let cfg =
+            config("[OpenConnect]\nServer = a.b\nArgs = --no-dtls --os=linux-64 --pfs\n").unwrap();
         assert_eq!(cfg.extra, ["--no-dtls", "--os=linux-64", "--pfs"]);
 
         // The dangerous ones, one by one. --script would replace the very thing
@@ -1095,7 +1125,10 @@ mod tests {
     #[test]
     fn every_reason_maps_to_exactly_one_action() {
         for quiet in ["pre-init", "reconnect", "attempt-reconnect"] {
-            assert_eq!(plan(&env(&[("reason", quiet)]), None).unwrap(), Action::Nothing);
+            assert_eq!(
+                plan(&env(&[("reason", quiet)]), None).unwrap(),
+                Action::Nothing
+            );
         }
         assert_eq!(
             plan(&env(&[("reason", "disconnect")]), None).unwrap(),
@@ -1263,7 +1296,10 @@ mod tests {
             dns: Vec::new(),
             ..plan
         };
-        assert_eq!(bare.to_text(), "iface=awg0\naddress=10.5.0.7\nmtu=1300\ndns=\n");
+        assert_eq!(
+            bare.to_text(),
+            "iface=awg0\naddress=10.5.0.7\nmtu=1300\ndns=\n"
+        );
         assert_eq!(Plan::parse(&bare.to_text()).unwrap().search, None);
 
         // And a file that is not a plan is a message, never a default.
