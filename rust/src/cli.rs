@@ -359,7 +359,7 @@ fn add(tools: &Tools, args: &[OsString]) -> u8 {
         Ok(ini) => ini,
         Err(e) => {
             eprintln!(
-                "{} не похож ни на конфиг WireGuard/AmneziaWG, ни на [OpenConnect]: {e}",
+                "{} не похож на конфиг WireGuard/AmneziaWG или OpenConnect: {e}",
                 conf.display()
             );
             return 1;
@@ -378,7 +378,7 @@ fn add(tools: &Tools, args: &[OsString]) -> u8 {
         }
     } else if ini.interface().is_none() {
         eprintln!(
-            "{} не похож ни на конфиг WireGuard/AmneziaWG, ни на [OpenConnect]",
+            "{} не похож на конфиг WireGuard/AmneziaWG или OpenConnect",
             conf.display()
         );
         return 1;

@@ -63,6 +63,9 @@ cleanup() {
   if [ -n "${OCSERV_CONF:-}" ]; then
     sudo -n pkill -TERM -f "$OCSERV_CONF" 2>/dev/null
   fi
+  # Каталог сервера лежит в /tmp (см. ниже, про nobody и $TMPDIR раннера), а
+  # значит его не уносит уборка $WORK.
+  [ -n "${OCDIR:-}" ] && rm -rf "${OCDIR:?}"
   for p in "${HOLDER_PIDS[@]}"; do kill -TERM "$p" 2>/dev/null; done
   # Оба namespace зоны: держатель гасит их вместе, но если он сам уже убит,
   # аплинк остался бы висеть с pasta на шее.
@@ -98,7 +101,7 @@ cleanup() {
     done
     if [ -s "$WORK/ocserv.log" ]; then
       printf -- '--- журнал ocserv ---\n'
-      tail -60 "$WORK/ocserv.log"
+      tail -120 "$WORK/ocserv.log"
     fi
   fi
   rm -rf "$WORK"
@@ -575,15 +578,17 @@ else
     [ -x "$b" ] || fail "нет $b"
   done
 
-  OCDIR="$WORK/ocserv"
+  # Каталог сервера — В /tmp, а НЕ в $WORK, и это не мелочь. ocserv форкает
+  # воркеры под nobody, и каждый из них открывает socket-file, сертификат и
+  # файл паролей САМ. $WORK лежит внутри $TMPDIR раннера
+  # (/home/runner/work/_temp), а туда nobody не пройдёт ни при каких правах на
+  # сам каталог — воркер молча умирает, и клиент видит только «TLS connection
+  # was non-properly terminated». /tmp проходим всегда.
+  OCDIR=$(mktemp -d /tmp/vpn-zones-ocserv.XXXXXX)
   OCSERV_CONF="$OCDIR/ocserv.conf"
   OCPASS="$WORK/ocsmoke.pass"          # файл пароля зоны: обязан быть 0600
   OCPASSWORD=smoke-secret
-  mkdir -p "$OCDIR"
-  # $WORK создан mktemp -d (0700), а воркеры ocserv работают под nobody и
-  # должны дойти до сокета и сертификата. Каталог делаем проходимым, но не
-  # читаемым: файл пароля зоны лежит рядом и остаётся 0600.
-  chmod 711 "$WORK"
+  chmod 755 "$OCDIR"
 
   # Адрес, по которому зона увидит сервер. Не 127.0.0.1: внутри uplink-ns
   # петля своя, а pasta выпускает наружу — до собственного адреса хоста пакет
@@ -627,11 +632,16 @@ ping-leases = false
 cisco-client-compat = true
 dtls-legacy = true
 auth-timeout = 40
+tls-priorities = "NORMAL:%SERVER_PRECEDENCE:%COMPAT"
 pid-file = $OCDIR/ocserv.pid
 EOF
   chmod -R a+rX "$OCDIR"
 
-  sudo -n "$OCSERV" -c "$OCSERV_CONF" -f -d 1 >"$WORK/ocserv.log" 2>&1 &
+  # shellcheck disable=SC2024
+  # Перенаправление делает НАШ шелл, а не sudo, — и это ровно то, что нужно:
+  # журнал сервера обязан лечь в $WORK от имени раннера, иначе его потом не
+  # прочитать и не удалить.
+  sudo -n "$OCSERV" -c "$OCSERV_CONF" -f -d 3 >"$WORK/ocserv.log" 2>&1 &
   for _ in $(seq 1 100); do
     if (exec 3<>"/dev/tcp/$SRVIP/4443") 2>/dev/null; then
       break
@@ -650,7 +660,12 @@ EOF
   ocprobe=$("$OPENCONNECT" --non-inter --protocol=anyconnect "$SRVIP:4443" \
     </dev/null 2>&1 || true)
   OCPIN=$(printf '%s\n' "$ocprobe" | grep -m1 -o 'pin-sha256:[A-Za-z0-9+/=]*' || true)
-  [ -n "$OCPIN" ] || { printf '%s\n' "$ocprobe" >&2; fail "openconnect не назвал отпечаток"; }
+  if [ -z "$OCPIN" ]; then
+    printf '%s\n' "$ocprobe" >&2
+    printf -- '--- журнал ocserv ---\n' >&2
+    cat "$WORK/ocserv.log" >&2
+    fail "openconnect не назвал отпечаток"
+  fi
   echo "ok: $OCPIN"
 
   step "vpn-zone add ocsmoke (конфиг с секцией [OpenConnect])"
