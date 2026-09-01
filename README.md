@@ -16,11 +16,13 @@ and can be pinned.
 
 Three independent layers, each enabled on its own.
 
-**Network.** A zone is a network namespace brought up as your user: kernel
-WireGuard/AmneziaWG inside, `pasta` from passt facing outward. There can be any
-number of zones, each with its own config. There are built-in "direct internet"
-and "no network" options — the latter means the literal absence of a route, not
-a firewall rule.
+**Network.** A zone is a network namespace brought up as your user: a tunnel
+inside, `pasta` from passt facing outward. Two kinds of tunnel are supported —
+kernel WireGuard/AmneziaWG, and OpenConnect (Cisco AnyConnect and ocserv, and
+through `Protocol =` also GlobalProtect, Pulse, F5, Fortinet and Array). There
+can be any number of zones, each with its own config. There are built-in
+"direct internet" and "no network" options — the latter means the literal
+absence of a route, not a firewall rule.
 
 **Data.** Five modes:
 
@@ -58,8 +60,10 @@ cannot see other windows.
 - unprivileged user namespaces (`kernel.unprivileged_userns_clone`);
 - a range in `/etc/subuid` and `/etc/subgid` for your user — NixOS hands them
   out to regular users by default;
-- `/dev/net/tun` with read and write access;
-- for VPN zones — the `wireguard` or `amneziawg` kernel module;
+- `/dev/net/tun` with read and write access (this is all an OpenConnect zone
+  needs — no kernel module and no root: the client creates its tun inside the
+  zone's own user namespace);
+- for WireGuard zones — the `wireguard` or `amneziawg` kernel module;
 - working XDG portals (for the filesystem sandbox).
 
 Check readiness:
@@ -118,6 +122,64 @@ Create a zone: the **"Add VPN zone"** entry → pick a `.conf` → give it a nam
 The system tells you whether the handshake went through — that is, whether the
 config is alive.
 
+### A corporate zone: OpenConnect
+
+A zone whose config has an `[OpenConnect]` section is carried by the
+`openconnect` client instead of a kernel tunnel — Cisco AnyConnect and ocserv
+out of the box, and GlobalProtect, Pulse, F5, Fortinet or Array through
+`Protocol =`. Everything else about the zone is unchanged, which is the point:
+the corporate VPN lives inside it, an RDP client or a browser runs in it, and
+the host and every other program never see the tunnel.
+
+Write the config yourself and add it like any other (the launcher entry is for
+`.conf` files of the WireGuard kind):
+
+```ini
+[OpenConnect]
+Server     = vpn.example.com          ; host, or host:port — no scheme, no path
+Protocol   = anyconnect               ; default; nc | gp | pulse | f5 | fortinet | array
+User       = alice
+AuthGroup  = Employees                ; the "realm"/"domain" dropdown, if the server has one
+ServerCert = pin-sha256:HXXQ…=        ; pin the certificate; without it, the system CA store
+PasswordFile = /home/alice/.config/vpn-zones/secrets/work.pass
+MTU        = 1300                     ; optional, wins over what the gateway offers
+Args       = --no-dtls --os=linux-64  ; optional, from an allowlist
+```
+
+```sh
+chmod 600 ~/.config/vpn-zones/secrets/work.pass   # required, and checked
+vpn-zone add work ~/work-vpn.conf
+vpn-zone up work && vpn-zone run work -- remmina
+```
+
+To learn the fingerprint, let the client tell you — it prints the exact string
+to pin:
+
+```sh
+openconnect --non-inter vpn.example.com   # prints "--servercert pin-sha256:…"
+```
+
+What such a zone deliberately does **not** do, all of it for one reason —
+a zone routes everything into the tunnel and has no second interface to route
+anything else through (`docs/LEAK-MODEL.md`):
+
+- **split tunnelling.** The gateway's split-include list is ignored and counted
+  in the journal. What the gateway does with traffic it did not ask for is its
+  own business;
+- **split DNS.** The gateway's resolvers and its one default domain go into the
+  zone's `resolv.conf`; a per-domain resolver would be a second path by another
+  name;
+- **IPv6**, which is not requested at all (`--disable-ipv6`) and closed in the
+  zone, as for a WireGuard config without a v6 address;
+- **interactive 2FA/OTP.** A zone is started by a systemd unit with no terminal
+  to ask on, so the client runs `--non-inter`. The config format leaves room for
+  it (ROADMAP M4);
+- **turning certificate checking off.** There is no way to spell it — not
+  through `ServerCert`, which must be a fingerprint, and not through `Args`,
+  which is an allowlist that does not contain `--no-system-trust`,
+  `--allow-insecure-crypto`, `--script`, `--csd-wrapper` or
+  `--external-browser`.
+
 Then just launch programs from the launcher. The same from the terminal:
 
 ```sh
@@ -170,6 +232,13 @@ The subtleties that took the most time are commented in detail in
   impossible there because no path exists (`docs/LEAK-MODEL.md`). The interface
   is created in the uplink and moved down, because a WireGuard socket stays in
   the namespace the interface was born in;
+- an **OpenConnect** zone is the same wall with a different thing behind it: the
+  whole client process stays in the uplink, together with the TLS session and
+  the gateway's address, and what moves down is a bare tun. A tun device and the
+  descriptor attached to it are separate things, so the client keeps reading and
+  writing packets after the interface has left its namespace — and it may create
+  that tun without root because `TUNSETIFF` asks for `CAP_NET_ADMIN` in the user
+  namespace that owns the network namespace, which is ours;
 - on top of that topology, and only as insurance against a mistake of ours,
   both namespaces get an **nftables ruleset**: nothing leaves the app namespace
   except through the tunnel, and nothing leaves the uplink except the tunnel's

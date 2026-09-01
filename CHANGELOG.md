@@ -5,6 +5,59 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
 
 ## [Unreleased]
 
+### Added (a second kind of zone: OpenConnect)
+- **A zone can now be carried by the `openconnect` client instead of a kernel
+  tunnel** — Cisco AnyConnect and ocserv by default, and through `Protocol =`
+  also GlobalProtect, Pulse, F5, Fortinet and Array (ROADMAP M4). A config with
+  an `[OpenConnect]` section makes such a zone; everything else about a zone is
+  unchanged, which is the whole point: the corporate VPN lives inside it, an RDP
+  client runs in it, and the host never sees the tunnel
+  (`rust/src/openconnect.rs`, `rust/src/zone.rs`).
+- **The wall stands where it stood.** The client runs in the uplink namespace,
+  creates its tun there through `/dev/net/tun` and runs `vpn-zone-core
+  oc-script` as its `--script`; the script moves that tun into the app
+  namespace and writes down what the gateway said, and the app namespace
+  configures it with the same code a WireGuard zone uses. The TLS session, the
+  gateway's address and every packet still wrapped in it stay one namespace up.
+  A tun device and the descriptor attached to it are separate things, so the
+  client goes on working after the interface has left its namespace — the same
+  property WireGuard's UDP socket has, reached from the other side.
+- No root and no kernel module: `TUNSETIFF` asks for `CAP_NET_ADMIN` in the
+  user namespace that OWNS the network namespace, and inside the zone's own
+  user namespace we are uid 0. All the device node needs to be is `crw-rw-rw-`.
+- **What such a zone deliberately does not do**, all of it for one reason — a
+  zone routes everything into the tunnel and has no second interface to route
+  anything else through: split tunnelling (`CISCO_SPLIT_INC_*` is ignored and
+  counted in the journal), split DNS, IPv6 (not even requested:
+  `--disable-ipv6`), and interactive 2FA/OTP (a zone has no terminal to ask on,
+  so the client runs `--non-inter`). Each is written down in
+  `docs/LEAK-MODEL.md` with the reasoning rather than left to be discovered.
+- **There is no way to spell "trust anything".** `ServerCert =` is a fingerprint
+  pin (`pin-sha256:`/`sha256:`/`sha1:`, checked for being one) and without it
+  the system CA store decides — that is the whole set of options. `Args =` is
+  an allowlist of flags in `--flag=value` shape only, and it contains neither
+  `--no-system-trust` nor `--allow-insecure-crypto`; nor `--script`,
+  `--csd-wrapper` or `--external-browser`, which would replace the thing that
+  puts the tunnel behind the wall or run a program of the server's choosing.
+- `PasswordFile =` must be absolute, non-empty and readable by nobody else
+  (0600, checked at `vpn-zone add` and again at start). It is read once, in the
+  uplink, and handed to the client on stdin — never on a command line
+  (`/proc/<pid>/cmdline` is world readable) and never in the environment.
+- Fail-closed, point by point: the gateway is resolved in the host's network
+  before any namespace exists and handed over with `--resolve`, so nothing looks
+  a name up from a namespace that has no resolver; the uplink's nftables rule is
+  `ip daddr <gateway> accept` and nothing else; the client is spawned with
+  `PR_SET_PDEATHSIG` so it cannot outlive the namespace it holds; the uplink
+  waits on the client instead of parking, so the client's exit takes the whole
+  zone down; and `disconnect` tears nothing down because the device dies with
+  the client's descriptor and takes the app namespace's only route with it.
+- The CI smoke test now runs a real ocserv on the runner with a certificate and
+  a password generated on the fly, puts an OpenConnect zone in front of it and
+  asserts the same invariants as for a WireGuard zone — exactly two links in the
+  app namespace, both routes into the tunnel, the gateway's resolvers and search
+  domain, no tunnel left in the uplink — plus a TCP connection through the
+  tunnel and "kill the client, the zone is gone".
+
 ### Fixed (DNS leak: the host's resolvers were reachable from inside a zone)
 - **Every name looked up inside a zone could be resolved by the HOST's
   systemd-resolved, around the tunnel.** nss-resolve talks varlink over
