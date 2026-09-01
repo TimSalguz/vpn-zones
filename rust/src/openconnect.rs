@@ -113,7 +113,13 @@ pub const ENV_MTU: &str = "VPN_ZONE_OC_MTU";
 ///   ciphers can have `--no-dtls` instead) and `--passtos` (copies the inner
 ///   traffic class onto the outer packets, which is inner metadata on the
 ///   outside of the tunnel).
-const ALLOWED_ARGS: [(&str, bool); 14] = [
+/// * `--form-entry` is left out for a different reason than the rest: it is
+///   genuinely useful (it answers an authentication form without a terminal),
+///   but its value would sit on a command line, and `/proc/<pid>/cmdline` is
+///   world readable — the same reason the password goes in on stdin. It is the
+///   natural place to start when interactive authentication gets built
+///   (ROADMAP M4).
+const ALLOWED_ARGS: [(&str, bool); 15] = [
     ("--base-mtu", true),
     ("--force-dpd", true),
     ("--local-hostname", true),
@@ -126,6 +132,10 @@ const ALLOWED_ARGS: [(&str, bool); 14] = [
     ("--queue-len", true),
     ("--reconnect-timeout", true),
     ("--sni", true),
+    // The path of the initial request, which GlobalProtect and Pulse need to
+    // tell a portal from a gateway. The host is still the pinned one; only the
+    // path changes.
+    ("--usergroup", true),
     ("--useragent", true),
     ("--version-string", true),
 ];
@@ -1080,13 +1090,22 @@ mod tests {
                 "{weakening} slipped through"
             );
         }
-        // Their safe opposites stay allowed.
+        // Their safe opposites stay allowed, and so does the one flag
+        // GlobalProtect and Pulse need to tell a portal from a gateway.
         assert_eq!(
-            config("[OpenConnect]\nServer = a.b\nArgs = --no-deflate --no-dtls\n")
-                .unwrap()
-                .extra,
-            ["--no-deflate", "--no-dtls"]
+            config(
+                "[OpenConnect]\nServer = a.b\nArgs = --no-deflate --no-dtls --usergroup=gateway\n"
+            )
+            .unwrap()
+            .extra,
+            ["--no-deflate", "--no-dtls", "--usergroup=gateway"]
         );
+        // And the one that would put a secret on a world-readable command line
+        // does not.
+        assert!(matches!(
+            config("[OpenConnect]\nServer = a.b\nArgs = --form-entry=main:secondary=1234\n"),
+            Err(ConfigError::ForbiddenArg(_))
+        ));
 
         // The shape matters too: a value-taking flag written as one word only,
         // and a flag without a value never with one.

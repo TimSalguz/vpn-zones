@@ -152,6 +152,11 @@ vpn-zone add work ~/work-vpn.conf
 vpn-zone up work && vpn-zone run work -- remmina
 ```
 
+The password file stays where you put it — `vpn-zone rm` deletes the zone and
+its copy of the config, but never a file outside the zone's directory. Unlike a
+WireGuard private key, which lives inside the config and goes with the zone,
+this one is yours to keep or remove.
+
 `ServerCert` is what a corporate CA the system does not know needs; a gateway
 with a publicly trusted certificate needs none. To learn the fingerprint, let
 the client tell you — it prints the exact string to pin, and the module puts it
