@@ -1416,8 +1416,9 @@ fn mirror(
 /// Tell systemd the zone is up (`Type=notify`): whatever is ordered after the
 /// holder then starts with the tunnel and the zone's resolv.conf already in
 /// place, instead of with a namespace that holds `lo` alone. Run by hand, with
-/// no `NOTIFY_SOCKET`, there is nobody to tell.
-fn notify_ready() {
+/// no `NOTIFY_SOCKET`, there is nobody to tell. A user zone's holder says the
+/// same (`zone::hold`).
+pub(crate) fn notify_ready() {
     let Some(socket) = std::env::var_os("NOTIFY_SOCKET") else {
         return;
     };

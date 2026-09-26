@@ -257,6 +257,58 @@ impl Inotify {
     }
 }
 
+/// Wait, as long as it takes, until `ready(path)` holds — looked at again
+/// whenever something appears in its directory — or the process of `pidfd`
+/// ends (`false`: it will not make it now). No clock decides: a loaded
+/// machine makes it later, never "not there". Without a watch on the
+/// directory (not there yet, no inotify instance left) it is looked at every
+/// [`LOOK_AGAIN`] instead — which decides how soon, and nothing else.
+pub fn wait_for_entry(path: &Path, pidfd: Option<&OwnedFd>, ready: impl Fn(&Path) -> bool) -> bool {
+    use std::os::fd::AsRawFd;
+    let watch = path.parent().and_then(|dir| Inotify::watch(dir).ok());
+    let pollin = |fd: RawFd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        if ready(path) {
+            return true;
+        }
+        let mut fds: Vec<libc::pollfd> = Vec::with_capacity(2);
+        if let Some(fd) = pidfd {
+            fds.push(pollin(fd.as_raw_fd()));
+        }
+        if let Some(w) = &watch {
+            fds.push(pollin(w.fd.as_raw_fd()));
+        }
+        let ms = if watch.is_some() {
+            -1
+        } else {
+            LOOK_AGAIN.as_millis() as libc::c_int
+        };
+        // SAFETY: a valid array of pollfd and its length.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
+        if rc < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        for pfd in fds.iter().filter(|p| p.revents != 0) {
+            if pidfd.is_some_and(|fd| fd.as_raw_fd() == pfd.fd) {
+                return false;
+            }
+            if let Some(w) = &watch {
+                let _ = w.names();
+            }
+        }
+    }
+}
+
+/// How often [`wait_for_entry`] looks without a watch.
+pub const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// What happened in a directory a [`DirWatch`] watches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirEvent {
@@ -611,6 +663,40 @@ mod link_target_tests {
 #[cfg(test)]
 mod inotify_tests {
     use super::*;
+
+    /// Waited for as long as it takes — and no longer than its maker lives.
+    #[test]
+    fn an_entry_is_waited_for_until_it_is_there_or_its_maker_is_gone() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("vz-wait-entry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wait = |script: &str, path: &Path| {
+            let mut maker = Command::new("sh")
+                .args(["-c", script, "sh"])
+                .arg(&dir)
+                .spawn()
+                .unwrap();
+            let fd = pidfd_open(maker.id() as i32).unwrap();
+            let there = wait_for_entry(path, Some(&fd), Path::exists);
+            let _ = maker.kill();
+            let _ = maker.wait();
+            there
+        };
+        // Made a moment later, by a maker that goes on.
+        assert!(wait(
+            "sleep 0.3; touch \"$1/sock\"; sleep 30",
+            &dir.join("sock")
+        ));
+        // Its maker gone without it.
+        assert!(!wait("sleep 0.2", &dir.join("never")));
+        // No directory to watch yet: looked at again until it is there.
+        assert!(wait(
+            "sleep 0.3; mkdir \"$1/later\"; touch \"$1/later/x\"; sleep 30",
+            &dir.join("later/x")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn inotify_events_are_read_past_their_padding() {
