@@ -123,7 +123,12 @@ fn parse_request(text: &str) -> Request {
             "asker" => req.asker = fields.get(1).map(|v| v.to_string()),
             "program" => req.program = fields.get(1).unwrap_or(&"").to_string(),
             "cmd" => req.command.push(fields.get(1).unwrap_or(&"").to_string()),
-            "rule" => req.rule = fields.get(1).map(|v| v.to_string()).filter(|v| !v.is_empty()),
+            "rule" => {
+                req.rule = fields
+                    .get(1)
+                    .map(|v| v.to_string())
+                    .filter(|v| !v.is_empty())
+            }
             _ => {}
         }
     }
@@ -919,7 +924,9 @@ mod tests {
         assert!(w.answer().ends_with("rule\t0\n"));
         let _ = w.update(Msg::Rule(true));
         assert!(w.answer().ends_with("rule\t1\n"));
-        let mut plain = Window::new(parse_request("title\tt\nnet\tnl\tnl\ncontainer\t\tОсновной\t\n"));
+        let mut plain = Window::new(parse_request(
+            "title\tt\nnet\tnl\tnl\ncontainer\t\tОсновной\t\n",
+        ));
         let _ = plain.update(Msg::Rule(true));
         assert!(!plain.answer().contains("rule"));
     }
