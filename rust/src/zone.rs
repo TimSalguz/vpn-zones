@@ -161,9 +161,9 @@ const START: &str = "zone.start";
 /// stray pasta by the number in its command line.
 const UPLINK_PID: &str = "uplink.pid";
 const READY: &str = "ready";
-/// pasta's pid file, the holder's pasta's word that the namespace it
-/// configures is done (`wait_for_pasta_link`, `wait_for_default_route`).
-const PASTA_PID: &str = "pasta.pid";
+/// The holder's word to the uplink that pasta is done with its namespace
+/// (`PastaWord`, `wait_for_default_route`).
+const PASTA_DONE: &str = "pasta.done";
 const STATUS: &str = "status";
 const STATUS_TMP: &str = "status.tmp";
 const RESOLV: &str = "resolv.conf";
@@ -732,7 +732,7 @@ pub fn run(args: Args) -> u8 {
     let _ = fs::remove_file(zone.path(STATUS));
     let _ = fs::remove_file(zone.path(UPLINK_PID));
     let _ = fs::remove_file(zone.path(READY));
-    let _ = fs::remove_file(zone.path(PASTA_PID));
+    let _ = fs::remove_file(zone.path(PASTA_DONE));
     // What this run comes up with, before it is up: `status --json` names what
     // has changed since (`hermetic::APPLIED`). The last run's goes first — a
     // note that cannot be written leaves "not known", never a stale one.
@@ -1453,34 +1453,39 @@ fn supervise(zone: &Zone) -> Result<u8, String> {
             );
             vec!["-4"]
         };
-        // Its word that it is done: the pid file (`wait_for_pasta_link`).
-        let _ = fs::remove_file(zone.path(PASTA_PID));
-        match Command::new(&zone.tools.pasta)
-            .arg("--netns")
-            .arg(&netns)
-            .args(["--config-net", "-q", "-I", TUN_IFACE, "-f"])
-            .arg("-P")
-            .arg(zone.path(PASTA_PID))
-            .args([
-                "-a",
-                HOSTIF_GUEST4,
-                "-n",
-                HOSTIF_PREFIX4,
-                "-g",
-                HOSTIF_GATEWAY4,
-            ])
-            // The template interface too, explicitly: older pasta takes it
-            // from the host's default route rather than from --outbound-if*,
-            // and refuses the whole thing ("External interface not usable")
-            // when that route is not on the interface asked for.
-            .arg("-i")
-            .arg(&host.interface)
-            .arg("--outbound-if4")
-            .arg(&host.interface)
-            .args(&v6_args)
-            .args(PASTA_CLOSED)
-            .spawn()
-        {
+        // Its word that it is done (`PastaWord`), heard before the zone is
+        // told: the zone then looks at the route once.
+        let word = PastaWord::new();
+        match word
+            .as_ref()
+            .map_err(|e| io::Error::other(format!("no directory for its pid file: {e}")))
+            .and_then(|word| {
+                Command::new(&zone.tools.pasta)
+                    .arg("--netns")
+                    .arg(&netns)
+                    .args(["--config-net", "-q", "-I", TUN_IFACE, "-f"])
+                    .arg("-P")
+                    .arg(word.path())
+                    .args([
+                        "-a",
+                        HOSTIF_GUEST4,
+                        "-n",
+                        HOSTIF_PREFIX4,
+                        "-g",
+                        HOSTIF_GATEWAY4,
+                    ])
+                    // The template interface too, explicitly: older pasta takes it
+                    // from the host's default route rather than from --outbound-if*,
+                    // and refuses the whole thing ("External interface not usable")
+                    // when that route is not on the interface asked for.
+                    .arg("-i")
+                    .arg(&host.interface)
+                    .arg("--outbound-if4")
+                    .arg(&host.interface)
+                    .args(&v6_args)
+                    .args(PASTA_CLOSED)
+                    .spawn()
+            }) {
             Ok(mut child) => {
                 PASTA_CHILD.store(child.id() as i32, Ordering::SeqCst);
                 // The interface deleted or renamed: pasta down at once, and the
@@ -1501,8 +1506,17 @@ fn supervise(zone: &Zone) -> Result<u8, String> {
                     });
                 match watched {
                     Ok(()) => {
+                        let done = word.as_ref().is_ok_and(|word| word.wait(&mut child));
                         pasta = Some(child);
-                        if let Err(e) = tell_the_zone(moved_w, TOOL_HOSTIF) {
+                        if !done {
+                            // EOF instead of the byte: pasta ended before it
+                            // was done, and says why itself.
+                            drop(moved_w);
+                            eprintln!(
+                                "zone {}: pasta ended before its interface was ready",
+                                zone.name()
+                            );
+                        } else if let Err(e) = tell_the_zone(moved_w, TOOL_HOSTIF) {
                             eprintln!("zone {}: {e}", zone.name());
                         }
                     }
@@ -1609,19 +1623,35 @@ fn supervise(zone: &Zone) -> Result<u8, String> {
         drop(ready);
 
         let netns = format!("/proc/{pid}/ns/net");
-        // Its word that it is done: the pid file (`wait_for_default_route`).
-        let _ = fs::remove_file(zone.path(PASTA_PID));
-        match Command::new(&zone.tools.pasta)
-            .arg("--netns")
-            .arg(&netns)
-            .args(["--config-net", "-q", "-I", PASTA_IFACE, "-f"])
-            .arg("-P")
-            .arg(zone.path(PASTA_PID))
-            .args(PASTA_CLOSED)
-            .spawn()
-        {
-            Ok(child) => {
+        // Its word that it is done (`PastaWord`), passed on to the uplink as
+        // `PASTA_DONE` (`wait_for_default_route`).
+        let _ = fs::remove_file(zone.path(PASTA_DONE));
+        let word = PastaWord::new();
+        match word
+            .as_ref()
+            .map_err(|e| io::Error::other(format!("no directory for its pid file: {e}")))
+            .and_then(|word| {
+                Command::new(&zone.tools.pasta)
+                    .arg("--netns")
+                    .arg(&netns)
+                    .args(["--config-net", "-q", "-I", PASTA_IFACE, "-f"])
+                    .arg("-P")
+                    .arg(word.path())
+                    .args(PASTA_CLOSED)
+                    .spawn()
+            }) {
+            Ok(mut child) => {
                 PASTA_CHILD.store(child.id() as i32, Ordering::SeqCst);
+                // Ended first: `wait_any` below sees it, and takes the zone
+                // down.
+                if word.as_ref().is_ok_and(|word| word.wait(&mut child)) {
+                    if let Err(e) = touch(&zone.path(PASTA_DONE)) {
+                        eprintln!(
+                            "zone {}: cannot tell the uplink pasta is done: {e}",
+                            zone.name()
+                        );
+                    }
+                }
                 pasta = Some(child);
             }
             Err(e) => {
@@ -3837,17 +3867,11 @@ fn wait_for_app_namespace(zone_up_r: OwnedFd) -> Result<(), String> {
 /// Wait for pasta to create and configure its interface in this namespace,
 /// then see that it did: the link up and a default route through it.
 ///
-/// Waited for is pasta's own word that it is done — its pid file written
-/// ([`PASTA_PID`], `sys::written`), "once initialisation is done" — as long
-/// as it takes, no clock: pasta that ends instead takes the zone down
-/// (`supervise`), this process with it, and says why in the journal. Then
-/// the route is looked at once: pasta done without one is a failure now, not
-/// a wait for ever. `ours`: pasta is the holder's; a system zone's
-/// (`TOOL_SYSZONE`) was done before the service answered.
-fn wait_for_pasta_link(zone: &Zone, ours: bool) -> Result<(), String> {
-    if ours {
-        sys::wait_for_entry(&zone.path(PASTA_PID), None, sys::written);
-    }
+/// The byte that says which backend it is comes once pasta has said it is
+/// done — the holder's own pasta ([`PastaWord`]), or a system zone's, done
+/// before the service answered — so the route is looked at once: pasta done
+/// without one is a failure now, not a wait for ever.
+fn wait_for_pasta_link(zone: &Zone) -> Result<(), String> {
     let route =
         tool_output(&zone.tools.ip, &["-4", "route", "show", "default"]).unwrap_or_default();
     let route6 =
@@ -4311,7 +4335,7 @@ fn zone_setup(zone: &Zone, links: Option<ZoneLinks<'_>>) -> Result<(), String> {
             let Backend::HostIf(host) = backend else {
                 return Err("pasta was attached to a zone that is not a host-interface one".into());
             };
-            wait_for_pasta_link(zone, true)?;
+            wait_for_pasta_link(zone)?;
             let dns: Vec<String> = host.dns.iter().map(ToString::to_string).collect();
             (dns, None, Mirror::HostIf(host.interface.clone()))
         }
@@ -4323,7 +4347,7 @@ fn zone_setup(zone: &Zone, links: Option<ZoneLinks<'_>>) -> Result<(), String> {
                         .into(),
                 );
             };
-            wait_for_pasta_link(zone, false)?;
+            wait_for_pasta_link(zone)?;
             // Addresses only: they go into resolv.conf as they are.
             let dns: Vec<String> = fs::read_to_string(zone.path(SYS_RESOLVERS))
                 .unwrap_or_default()
@@ -5227,14 +5251,57 @@ fn feed_nft(nft: &Path, ruleset: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Wait for pasta to be done with the uplink namespace — its pid file
-/// written ([`PASTA_PID`]), as long as it takes: pasta that ends instead
-/// takes the zone down (`supervise`), this process with it. What it did is
-/// looked at after, once (`uplink_setup`): no route then is a failure, not a
-/// wait for ever (a host with no IPv4 default route, or one outside the main
-/// table, when pasta took its copy).
+/// Wait for pasta to be done with the uplink namespace — the holder's word
+/// ([`PASTA_DONE`], passed on from [`PastaWord`]), as long as it takes:
+/// pasta that ends instead takes the zone down (`supervise`), this process
+/// with it. What it did is looked at after, once (`uplink_setup`): no route
+/// then is a failure, not a wait for ever (a host with no IPv4 default route,
+/// or one outside the main table, when pasta took its copy).
 fn wait_for_default_route(zone: &Zone) {
-    sys::wait_for_entry(&zone.path(PASTA_PID), None, sys::written);
+    sys::wait_for_entry(&zone.path(PASTA_DONE), None, Path::exists);
+}
+
+/// pasta's word that it is done: its pid file, which it writes "once
+/// initialisation is done" — the namespace configured (`sys::written`). In a
+/// directory of its own under `/tmp`, made here: pasta runs as this
+/// process's user of the zone's namespace with every capability dropped
+/// (its `isolate_initial`), and the zone's directory, in the host user's
+/// home, is out of its reach; `/tmp` is not, and the directory is this user's
+/// (`mkdtemp`, 0700) — pasta's too. Gone with this.
+struct PastaWord {
+    dir: PathBuf,
+}
+
+impl PastaWord {
+    fn new() -> io::Result<Self> {
+        use std::os::unix::ffi::OsStringExt;
+        let mut template = b"/tmp/vpn-zone-pasta.XXXXXX\0".to_vec();
+        // SAFETY: a writable NUL-terminated template ending in six Xs.
+        let made = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+        if made.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        template.pop();
+        Ok(Self {
+            dir: PathBuf::from(std::ffi::OsString::from_vec(template)),
+        })
+    }
+
+    fn path(&self) -> PathBuf {
+        self.dir.join("pasta.pid")
+    }
+
+    /// As long as it takes: `true` once pasta says it is done, `false` when
+    /// it ended first.
+    fn wait(&self, pasta: &mut Child) -> bool {
+        sys::wait_for_child_entry(&self.path(), pasta, sys::written)
+    }
+}
+
+impl Drop for PastaWord {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
 }
 
 fn default_route(zone: &Zone, family: Family) -> DefaultRoute {

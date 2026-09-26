@@ -1072,9 +1072,11 @@ fn spawn_uplink_pasta(
         ])
         .args(zone::PASTA_CLOSED)
         .stdin(std::process::Stdio::null());
-    // Its word that it is done (`serve_uplink`), made for the user it runs as.
+    // Its word that it is done (`serve_uplink`), writable by the group it
+    // runs with: this service may not give a file to the user (no
+    // `CAP_CHOWN`).
     if let Some(path) = pid_file {
-        crate::sys::pid_file_for(path, uid, gid)
+        crate::sys::pid_file_for_group(path, gid)
             .map_err(|e| format!("cannot make {}: {e}", path.display()))?;
         cmd.arg("-P").arg(path);
     }

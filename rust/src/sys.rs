@@ -393,6 +393,38 @@ pub fn pid_file_for(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// A pid file for a pasta about to run with the group `gid`, made by a
+/// process that may not give files away (no `CAP_CHOWN`: the system-zone
+/// service): created with that group as its filesystem group (`CAP_SETGID`),
+/// root's and writable by the group (0620). Only this thread's filesystem
+/// group changes, and back.
+pub fn pid_file_for_group(path: &Path, gid: u32) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::remove_file(path);
+    // SAFETY: setfsgid(2) takes an id and returns the previous one.
+    let before = unsafe { libc::setfsgid(gid) };
+    let made = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o620)
+        .open(path);
+    // SAFETY: as above, the one it had.
+    unsafe { libc::setfsgid(before as libc::gid_t) };
+    let file = made?;
+    let meta = file.metadata()?;
+    use std::os::unix::fs::MetadataExt;
+    if meta.gid() != gid {
+        return Err(io::Error::other("the pid file did not get the group"));
+    }
+    // The umask took the group's write away: given back.
+    // SAFETY: a valid descriptor and a mode.
+    if unsafe { libc::fchmod(file.as_raw_fd(), 0o620) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// What happened in a directory a [`DirWatch`] watches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirEvent {
