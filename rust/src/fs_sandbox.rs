@@ -163,14 +163,6 @@ fn sandbox_machine_id(sandbox_dir: Option<&Path>, scratch: &Path) -> Option<Path
 /// descriptor and closes it itself.
 const SECCOMP_FD: libc::c_int = 34;
 
-/// Waiting for the proxy socket: 50 steps of 0.1 s, five seconds, as in bash.
-const WAIT_STEPS: u32 = 50;
-const WAIT_STEP: Duration = Duration::from_millis(100);
-
-/// A second for the X server to come up. Without it the program starts before
-/// the socket exists and dies with "cannot open display".
-const X11_SETTLE: Duration = Duration::from_secs(1);
-
 /// How long to wait for a TERM'd bus proxy before insisting with a KILL.
 const PROXY_GRACE: Duration = Duration::from_millis(500);
 
@@ -995,18 +987,13 @@ fn stop(mut child: Child) {
     // SAFETY: kill(2) takes no pointers and the child has not been waited for
     // yet, so the pid is still ours.
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
-    let deadline = std::time::Instant::now() + PROXY_GRACE;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => break,
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
-            Ok(None) => std::thread::sleep(WAIT_STEP),
-        }
+    // Not reaped yet, so the pidfd is this child's even if it is gone already.
+    let gone = crate::sys::pidfd_open(child.id() as i32)
+        .is_some_and(|fd| crate::sys::pidfd_wait(&fd, PROXY_GRACE));
+    if !gone {
+        let _ = child.kill();
     }
+    let _ = child.wait();
 }
 
 fn runtime_dir() -> PathBuf {
@@ -1034,6 +1021,18 @@ fn socket_at(path: PathBuf) -> Option<PathBuf> {
         Ok(meta) if meta.file_type().is_socket() => Some(path),
         _ => None,
     }
+}
+
+/// The socket of a helper just started, once it is there: waited for as long
+/// as that takes, or until the helper ends without it (`None`). No clock: on
+/// a loaded machine a helper comes up late, and a deadline would start the
+/// program without its bus exactly there.
+fn helper_socket(socket: &Path, child: &Child) -> Option<PathBuf> {
+    let pidfd = crate::sys::pidfd_open(child.id() as i32)?;
+    crate::sys::wait_for_entry(socket, Some(&pidfd), |p| {
+        socket_at(p.to_path_buf()).is_some()
+    })
+    .then(|| socket.to_path_buf())
 }
 
 /// Where the scratch directories go: below our part of the runtime directory
@@ -1143,7 +1142,7 @@ fn start_bus_proxy(tool: &Path, socket: &Path, runtime: &Path) -> (Option<Child>
         });
     // The output goes to /dev/null: an open stdout of the proxy makes the call
     // look like it is hanging long after the program has finished.
-    let mut child = match Command::new(tool)
+    let child = match Command::new(tool)
         .arg(address)
         .arg(socket)
         .arg("--filter")
@@ -1163,19 +1162,12 @@ fn start_bus_proxy(tool: &Path, socket: &Path, runtime: &Path) -> (Option<Child>
     };
     PROXY_PID.store(child.id() as i32, Ordering::SeqCst);
 
-    for _ in 0..WAIT_STEPS {
-        if let Some(path) = socket_at(socket.to_path_buf()) {
-            return (Some(child), Some(path));
-        }
-        // A proxy that has already exited will never create the socket, and
-        // waiting out the full five seconds for it would delay every launch on
-        // a machine with no session bus at all (a CI runner, a tty login).
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            break;
-        }
-        std::thread::sleep(WAIT_STEP);
+    // As long as it takes, or until the proxy ends without it — on a
+    // machine with no session bus at all (a CI runner, a tty login) at once.
+    if let Some(path) = helper_socket(socket, &child) {
+        return (Some(child), Some(path));
     }
-    eprintln!("fs-sandbox: the D-Bus proxy did not come up — the program gets no session bus");
+    eprintln!("fs-sandbox: the D-Bus proxy ended before its socket was there — the program gets no session bus");
     (Some(child), None)
 }
 
@@ -1209,7 +1201,7 @@ fn start_bus_filter(
     if let Some(app) = portal_app {
         command.arg("--portal-app").arg(app);
     }
-    let mut child = match command.stdin(Stdio::null()).stdout(Stdio::null()).spawn() {
+    let child = match command.stdin(Stdio::null()).stdout(Stdio::null()).spawn() {
         Ok(child) => child,
         Err(e) => {
             eprintln!(
@@ -1219,16 +1211,10 @@ fn start_bus_filter(
         }
     };
     FILTER_PID.store(child.id() as i32, Ordering::SeqCst);
-    for _ in 0..WAIT_STEPS {
-        if let Some(path) = socket_at(socket.to_path_buf()) {
-            return (Some(child), Some(path));
-        }
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            break;
-        }
-        std::thread::sleep(WAIT_STEP);
+    if let Some(path) = helper_socket(socket, &child) {
+        return (Some(child), Some(path));
     }
-    eprintln!("fs-sandbox: the bus filter did not come up — the program gets no session bus");
+    eprintln!("fs-sandbox: the bus filter ended before its socket was there — the program gets no session bus");
     (Some(child), None)
 }
 
@@ -1663,10 +1649,28 @@ pub fn run_x11(args: X11Args) -> u8 {
         .stderr(Stdio::null())
         .spawn()
     {
-        Ok(_) => {
-            // A second for the server to come up. Without it the program starts
-            // before the socket exists and dies with "cannot open display".
-            std::thread::sleep(X11_SETTLE);
+        Ok(satellite) => {
+            // Its socket first: started before it, the program dies with
+            // "cannot open display". Waited for as long as it takes, or until
+            // the satellite ends without it — no clock (this was one second:
+            // on a loaded machine, too short).
+            let socket = args
+                .display
+                .strip_prefix(':')
+                .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                .map(|n| Path::new(crate::x11::X11_DIR).join(format!("X{n}")));
+            let up = socket.is_some_and(|socket| {
+                crate::sys::pidfd_open(satellite.id() as i32).is_some_and(|pidfd| {
+                    crate::sys::wait_for_entry(&socket, Some(&pidfd), |p| {
+                        fs::symlink_metadata(p).is_ok()
+                    })
+                })
+            });
+            if !up {
+                eprintln!(
+                    "fs-sandbox: the X server ended before its socket was there — the program starts without it"
+                );
+            }
         }
         Err(e) => eprintln!(
             "fs-sandbox: cannot start {} ({e}) — the program gets no X server",

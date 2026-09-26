@@ -18,7 +18,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use crate::profile::EXIT_NOT_STARTED;
 
@@ -49,9 +48,6 @@ pub const X11_DIR: &str = "/tmp/.X11-unix";
 /// The displays a satellite may take: `:100`…`:499`, like the sandbox's.
 const FIRST: u32 = 100;
 const LAST: u32 = 499;
-/// How long the satellite gets to create its socket: 50 × 0.1 s.
-const WAIT_STEPS: u32 = 50;
-const WAIT_STEP: Duration = Duration::from_millis(100);
 
 /// What `x11-run` was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,20 +123,17 @@ pub fn run(args: Args) -> u8 {
             return exec(&args.cmd);
         }
     };
+    // Waited for as long as it takes, or until the satellite ends without
+    // it: no clock — on a loaded machine the server comes up late, and a
+    // deadline would start the program without X exactly there.
     let socket = dir.join(format!("X{number}"));
-    let mut up = false;
-    for _ in 0..WAIT_STEPS {
-        if std::fs::symlink_metadata(&socket).is_ok() {
-            up = true;
-            break;
-        }
-        if matches!(satellite.try_wait(), Ok(Some(_))) {
-            break;
-        }
-        std::thread::sleep(WAIT_STEP);
-    }
+    let up = crate::sys::pidfd_open(satellite.id() as i32).is_some_and(|pidfd| {
+        crate::sys::wait_for_entry(&socket, Some(&pidfd), |p| {
+            std::fs::symlink_metadata(p).is_ok()
+        })
+    });
     if !up {
-        eprintln!("x11-run: the X server did not come up — the program starts without it");
+        eprintln!("x11-run: the X server ended before its socket was there — the program starts without it");
         let _ = satellite.kill();
         let _ = satellite.wait();
         return exec(&args.cmd);

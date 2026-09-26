@@ -1031,6 +1031,20 @@ fn hold(zone: &Zone, ids: &Ids) -> Result<u8, String> {
     drop(unshared_w);
     drop(mapped_r);
     USERNS_CHILD.store(pid, Ordering::SeqCst);
+    // The unit is `Type=notify`: `systemctl start` — `cellward up`, a launch
+    // into a zone that is down — returns when the zone is ready, however long
+    // its setup takes (no clock of ours; the unit has no start timeout), or
+    // when it failed: this process ends then. `ready` is this run's — the last
+    // run's was removed before (`run`) — and it is written by the zone's own
+    // process, in the zone's directory this one sees too.
+    {
+        let ready = zone.path(READY);
+        thread::spawn(move || {
+            if sys::wait_for_entry(&ready, None, Path::is_file) {
+                crate::system::notify_ready();
+            }
+        });
+    }
     // systemd stops the unit by signalling THIS process; without passing it on,
     // the zone would survive its own holder.
     on_term_and_int(forward_signal);
@@ -2090,17 +2104,11 @@ fn start_proxy(
             return None;
         }
     };
-    for _ in 0..WAIT_STEPS {
-        if fs::symlink_metadata(&socket).is_ok() {
-            return Some(child);
-        }
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            break;
-        }
-        thread::sleep(WAIT_STEP);
+    if socket_up(&socket, &child) {
+        return Some(child);
     }
     eprintln!(
-        "zone {}: the {what} proxy did not come up — the zone gets no {what}",
+        "zone {}: the {what} proxy ended before its socket was there — the zone gets no {what}",
         zone.name()
     );
     let _ = child.kill();
@@ -2160,14 +2168,8 @@ fn start_pulse_filter(zone: &Zone) -> Option<Child> {
             return None;
         }
     };
-    for _ in 0..WAIT_STEPS {
-        if fs::symlink_metadata(&socket).is_ok() {
-            return Some(child);
-        }
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            break;
-        }
-        thread::sleep(WAIT_STEP);
+    if socket_up(&socket, &child) {
+        return Some(child);
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -2223,14 +2225,8 @@ fn start_pipewire_context(zone: &Zone) -> Option<Child> {
             return None;
         }
     };
-    for _ in 0..WAIT_STEPS {
-        if fs::symlink_metadata(&socket).is_ok() {
-            return Some(child);
-        }
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            break;
-        }
-        thread::sleep(WAIT_STEP);
+    if socket_up(&socket, &child) {
+        return Some(child);
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -2326,17 +2322,24 @@ fn start_session_filter(zone: &Zone) {
             return;
         }
     };
-    for _ in 0..WAIT_STEPS {
-        if fs::symlink_metadata(&socket).is_ok() {
-            return;
-        }
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            break;
-        }
-        thread::sleep(WAIT_STEP);
+    if socket_up(&socket, &child) {
+        return;
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Whether a helper just started has its socket up: waited for as long as
+/// that takes, or until the helper ends without it. No clock: on a loaded
+/// machine a helper comes up late, and a deadline would take the zone's bus
+/// or sound away exactly there. A helper that hangs before its socket holds
+/// the zone's start — `cellward up` waits for it, and says what it waits for
+/// only in the journal; stopping the zone ends it.
+fn socket_up(socket: &Path, child: &Child) -> bool {
+    let Some(pidfd) = sys::pidfd_open(child.id() as i32) else {
+        return false;
+    };
+    sys::wait_for_entry(socket, Some(&pidfd), |p| fs::symlink_metadata(p).is_ok())
 }
 
 /// The host's runtime directory of the zone's user.

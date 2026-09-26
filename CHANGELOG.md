@@ -223,6 +223,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   told by its launch, not taken for the zone's own programs.
 
 ### Fixed
+- **A zone comes up however long its setup takes, and its helpers too**
+  (the owner, 2026-09-26: no fixed waits that a slow or busy machine
+  breaks). The user zone's unit is now `Type=notify` with no start timeout:
+  the holder says `READY=1` once the zone has written `ready`, so `cellward
+  up` and a launch into a zone that is down return exactly when the zone is
+  ready, or failed (was ten seconds of polling, then "не поднялась" of a
+  zone that came up a moment later). The zone's helpers (the bus proxies,
+  the sound filter, the PipeWire context, a hermetic zone's session bus
+  filter), `x11-run`'s satellite and a file sandbox's bus proxy, bus filter
+  and X server are waited for until their socket is there — an inotify
+  watch on its directory — or until they end without it (their pidfd); was
+  five seconds, and one second for the sandbox's X server, then no bus, no
+  sound or no X. A start that hangs is ended by `cellward down`.
 - **A zone no longer reaches the devices the session's ACL opens** (audit
   2026-09-26, from inside a zone; LEAK-MODEL §19): `/dev/uinput` — a
   program of a zone made a virtual keyboard and typed into any window of
