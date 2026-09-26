@@ -658,14 +658,17 @@ impl Proxy {
                         // Fail-closed: the program's connections died with
                         // the proxy, and it is not given another way to the
                         // compositor. (After the program, its exit is the
-                        // ordinary end.) Gone before it said the program
-                        // opened a window: it will not now
-                        // (`crate::wl_sandbox::no_word`; after the word, a
-                        // second one is not read).
-                        crate::wl_sandbox::no_word();
+                        // ordinary end — and the pipe's end, when this
+                        // process goes, is the launch's: a hand-over, if the
+                        // program opened no window.)
                         if main_status.is_some() {
                             continue;
                         }
+                        // Gone while the program lives, before it said the
+                        // program opened a window: it will not now
+                        // (`crate::wl_sandbox::no_word`; after the word, a
+                        // second one is not read).
+                        crate::wl_sandbox::no_word();
                         eprintln!(
                             "wl-sandbox: the Wayland proxy exited ({}) — the program has no \
                              display now",
@@ -2414,6 +2417,49 @@ mod tests {
             assert_eq!(await_file(&dir, "foreign"), "refused");
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A program gone with no window of its own: the proxy ends with it and
+    /// says nothing, and the end of the picker's pipe is the launch's end —
+    /// a hand-over (`crate::picker`), not "no word will come".
+    #[test]
+    fn a_program_gone_without_a_window_leaves_the_pipe_silent() {
+        let dir = std::env::temp_dir().join(format!("vz-wl-proxy-word-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (passed, text) = run_alone("wl_proxy::tests::silent_after_the_program", &dir);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(passed, "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by a_program_gone_without_a_window_leaves_the_pipe_silent"]
+    fn silent_after_the_program() {
+        let dir = std::env::var_os(TEST_DIR).map_or_else(
+            || std::env::temp_dir().join(format!("vz-wl-proxy-word1-{}", std::process::id())),
+            PathBuf::from,
+        );
+        fs::create_dir_all(&dir).unwrap();
+        let up = Upstream::bind(&dir, 44).unwrap();
+        let zone = UnixListener::bind(dir.join("zone-sock")).unwrap();
+        let (heard, told) = crate::sys::pipe().unwrap();
+        crate::wl_sandbox::put_opened(told);
+        // Before any thread: the fork in `start` has to be the only thing.
+        let mut proxy =
+            start(&zone, &up.path, None, crate::wl_sandbox::opened_for_proxy()).unwrap();
+        drop(zone);
+        drop(up.listener);
+        #[allow(clippy::zombie_processes)]
+        let main = std::process::Command::new("true").spawn().unwrap();
+        proxy.take_over();
+        let status = proxy.supervise(main.id() as libc::pid_t, || {});
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        // The supervisor goes, its copy with it.
+        crate::wl_sandbox::drop_opened();
+        let mut byte = [0u8; 1];
+        // SAFETY: a valid descriptor and a buffer of one byte.
+        let n = unsafe { libc::read(heard.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
+        assert_eq!(n, 0, "a word was said: {:?}", byte[0] as char);
     }
 
     /// A signal to the supervisor — the pid of the launch, the pid of its

@@ -1171,12 +1171,10 @@ pub fn run(tools: &Tools, argv: &[OsString]) -> u8 {
         eprintln!("нечего запускать");
         return 1;
     }
+    let through_wl_sandbox = compositor_wrap.is_some();
     let exec = match compositor_wrap {
         Some(mut wrapped) => {
             wrapped.extend(exec);
-            // The picker's pipe, given on to `wl-sandbox` alone, as the last
-            // thing before its exec (`wl_sandbox::pass_opened_on`).
-            crate::wl_sandbox::pass_opened_on();
             wrapped
         }
         None => {
@@ -1214,6 +1212,12 @@ pub fn run(tools: &Tools, argv: &[OsString]) -> u8 {
         }
     }
 
+    // The picker's pipe, given on to `wl-sandbox` alone, as the very last
+    // thing before its exec (`wl_sandbox::pass_opened_on`): nothing this
+    // process starts on the way has it.
+    if through_wl_sandbox {
+        crate::wl_sandbox::pass_opened_on();
+    }
     let e = exec_command(&exec);
     eprintln!("не удалось запустить {}: {e}", exec[0].to_string_lossy());
     EXIT_NOT_STARTED

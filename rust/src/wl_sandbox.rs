@@ -124,8 +124,20 @@ pub fn take_opened() {
     }
 }
 
+/// The pipe put here as [`take_opened`] would (a test's).
+#[cfg(test)]
+pub(crate) fn put_opened(fd: OwnedFd) {
+    *OPENED.lock().unwrap_or_else(|e| e.into_inner()) = Some(fd);
+}
+
+/// The pipe gone as with this process, without a word (a test's).
+#[cfg(test)]
+pub(crate) fn drop_opened() {
+    OPENED.lock().unwrap_or_else(|e| e.into_inner()).take();
+}
+
 /// A copy of the pipe for the proxy, which says the word itself.
-fn opened_for_proxy() -> Option<OwnedFd> {
+pub(crate) fn opened_for_proxy() -> Option<OwnedFd> {
     OPENED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
