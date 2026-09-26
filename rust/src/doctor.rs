@@ -850,7 +850,12 @@ pub struct Bounded {
 /// waits; -1 when nobody waits.
 static INTERRUPT_W: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// The person gave up on a probe once: the next Ctrl-C ends the doctor, for
+/// every zone after it too.
+static GAVE_UP: AtomicBool = AtomicBool::new(false);
+
 extern "C" fn interrupted(_: libc::c_int) {
+    GAVE_UP.store(true, Ordering::SeqCst);
     let fd = INTERRUPT_W.load(Ordering::SeqCst);
     if fd >= 0 {
         // SAFETY: write(2) is async-signal-safe; one byte from a static.
@@ -871,7 +876,7 @@ const SAY_WAITING_AFTER: libc::c_int = 3000;
 /// Waited for as long as it takes — no clock: the walk is bounded by what it
 /// may read (`sockets::LIMITS`), a loaded machine only makes it later, and a
 /// guess at "too long" would fail the check on exactly such a machine. A
-/// program of the zone can hold the probe (LEAK-MODEL §16, and §19 for the
+/// program of the zone can hold the probe (LEAK-MODEL §16, and §17 for the
 /// user's cgroups): stop it — seen as it happens (`waitid(WSTOPPED)`), the
 /// probe killed and the check failed —, freeze or starve it through a cgroup
 /// it may write, or stop the doctor itself; a tracer it cannot be, the probe
@@ -893,6 +898,22 @@ pub fn run_bounded(
     // unseen — and no stop of it could be seen either.
     // SAFETY: signal(2) with a standard disposition.
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+    // SAFETY: getpid(2) takes nothing and cannot fail.
+    let parent = unsafe { libc::getpid() };
+    // SAFETY: between fork and exec the closure makes two syscalls and
+    // allocates nothing. The probe dies with the doctor: in a group of its
+    // own, nothing else of the terminal's would end it, and a frozen one
+    // would stay for good. Kept across `nsenter`'s exec and its entering
+    // the zone: neither changes the effective ids.
+    unsafe {
+        command.pre_exec(move || {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            if libc::getppid() != parent {
+                return Err(io::Error::other("the doctor is gone"));
+            }
+            Ok(())
+        });
+    }
     let mut child = command
         .process_group(0)
         .stdin(Stdio::null())
@@ -931,8 +952,13 @@ pub fn run_bounded(
     let mut stderr = child.stderr.take();
     let mut buf = vec![0u8; 64 * 1024];
     let mut ended = false;
-    // A Ctrl-C while the probe is waited for is told through a pipe.
-    let interrupt = crate::sys::pipe().ok();
+    // A Ctrl-C while the probe is waited for is told through a pipe — until
+    // the person gave up once: then it is the doctor's again.
+    let interrupt = if GAVE_UP.load(Ordering::SeqCst) {
+        None
+    } else {
+        crate::sys::pipe().ok()
+    };
     let previous = interrupt.as_ref().map(|(_, w)| {
         INTERRUPT_W.store(w.as_raw_fd(), Ordering::SeqCst);
         // SAFETY: a handler that only writes a byte and resets itself.

@@ -191,6 +191,7 @@ fn menu(config: &Config, user: &str) {
         // Mouse reports off — a program of a zone may have turned them on:
         // a click is not a choice (`next_key` skips them all the same).
         print!("\x1b[?1000l\x1b[?9l");
+        let _ = io::stdout().flush();
         drop_typeahead();
 
         let fallback = config.fallback.as_deref().filter(|_| net != Net::Alive);
@@ -401,7 +402,9 @@ fn read_key() -> Option<u8> {
 /// together with a key reads as one piece too, and is pressed again.
 /// `None` at the end of input.
 fn next_key(mut read: impl FnMut(&mut [u8]) -> Option<usize>) -> Option<u8> {
-    let mut buf = [0u8; 256];
+    // As large as the terminal's own input queue: a sequence is never cut
+    // by the size of a read.
+    let mut buf = [0u8; 4096];
     loop {
         let n = read(&mut buf)?;
         let chunk = &buf[..n.min(buf.len())];

@@ -80,8 +80,9 @@ const REGISTRY: &str = "org.freedesktop.host.portal.Registry";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 /// The serial of the filter's own `Register` on a program's connection.
 /// Serials are per connection and a program counts its own from 1: this one
-/// it would have to pick on purpose, and nothing of the program's is in
-/// flight while ours is (`register`). Not higher: xdg-dbus-proxy keeps the
+/// it would have to pick on purpose — and a message of the program's with
+/// this serial waits while ours is unanswered (`Conn::holds`), so that no
+/// answer to it can pass for the portal's. Not higher: xdg-dbus-proxy keeps the
 /// serials above [`MAX_CLIENT_SERIAL`] for messages of its own and closes a
 /// connection whose client uses one.
 pub const REGISTER_SERIAL: u32 = 0xFFFE_FF00;
@@ -742,20 +743,30 @@ impl Conn {
         self.settled.notify_all();
     }
 
-    /// Before a call that may reach the portal ([`may_reach_portal`]): wait
-    /// while our `Register` is unanswered, as long as it takes — see
+    /// Whether a message of the program's waits for our `Register` to be
+    /// settled: a call the portal may see ([`may_reach_portal`]) — and one
+    /// with our `Register`'s serial, whatever it is and wherever it goes: an
+    /// answer to it would pass for the portal's (`Conn::answered`), and the
+    /// program cannot answer for us.
+    fn holds(&self, h: &Header) -> bool {
+        let reg = self.registration();
+        matches!(reg.stage, Stage::Register(_))
+            && (may_reach_portal(h) || reg.outstanding == Some(h.serial))
+    }
+
+    /// Wait while our `Register` is unanswered, as long as it takes — see
     /// [`Conn::wait_while`] for who ends it. And while it waits, the
-    /// program's side is watched: a program gone does not keep its
-    /// connection (and one of the filter's few) held. `false`: it went.
-    fn settle(&self, client: RawFd) -> bool {
+    /// program's side is watched: a program that went (or shut its writing
+    /// side) is held for no longer — what it sent still goes up, without an
+    /// id, and its connection (one of the filter's few) is not kept.
+    fn settle(&self, client: RawFd) {
         if !matches!(self.registration().stage, Stage::Register(_)) {
-            return true;
+            return;
         }
         let Ok((wake_r, wake_w)) = sys::pipe() else {
             self.wait_while(|s| matches!(s, Stage::Register(_)));
-            return true;
+            return;
         };
-        let gone = AtomicBool::new(false);
         thread::scope(|scope| {
             scope.spawn(|| {
                 let mut fds = [
@@ -779,7 +790,6 @@ impl Conn {
                     break;
                 }
                 if fds[1].revents == 0 && fds[0].revents != 0 {
-                    gone.store(true, Ordering::SeqCst);
                     self.program_gone();
                 }
             });
@@ -787,7 +797,6 @@ impl Conn {
             // SAFETY: a valid descriptor and one byte.
             let _ = unsafe { libc::write(wake_w.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
         });
-        !gone.load(Ordering::SeqCst)
     }
 
     /// The portal that took the zone's id for this connection, if one did.
@@ -1278,8 +1287,8 @@ fn client_to_bus(
             // The first call that may reach the portal waits for our
             // `Register` to be settled — and everything after it with it,
             // unread, in order; what went before it is up already.
-            if may_reach_portal(&h) && !conn.settle(client.as_raw_fd()) {
-                return Ok(());
+            if conn.holds(&h) {
+                conn.settle(client.as_raw_fd());
             }
             match door(&h) {
                 // The descriptors of an answered call are dropped — closed.
@@ -2368,6 +2377,46 @@ mod tests {
         assert_eq!(s.portal().as_deref(), Some(":1.7"));
     }
 
+    /// A program's call with our `Register`'s serial, to any name, waits for
+    /// the portal's answer: an answer to it cannot pass for the portal's.
+    #[test]
+    fn a_call_with_our_serial_waits_for_the_portals_answer() {
+        let mut s = Served::start("serial", Some("cellward.zone.nl"), |c| c);
+        let mut first = AUTH.to_vec();
+        first.extend(hello(1));
+        first.extend(method(
+            REGISTER_SERIAL,
+            "org.freedesktop.Notifications",
+            "org.freedesktop.Notifications",
+            "GetServerInformation",
+            0,
+        ));
+        s.program.send(&first, &[]);
+        s.authenticated();
+        let (_, h, _) = s.bus.message();
+        assert_eq!(h.member.as_deref(), Some("Hello"));
+        s.bus.send(&reply_to(1, "org.freedesktop.DBus"), &[]);
+        let (msg, h, _) = s.bus.message();
+        assert_register(&msg, &h, REGISTER_SERIAL);
+        assert!(
+            s.bus.quiet(HELD),
+            "a call with our serial went up before the answer"
+        );
+        s.bus.send(&reply_to(REGISTER_SERIAL, ":1.7"), &[]);
+        let (_, h, _) = s.bus.message();
+        assert_eq!(
+            (h.member.as_deref(), h.serial),
+            (Some("GetServerInformation"), REGISTER_SERIAL)
+        );
+        assert_eq!(s.portal().as_deref(), Some(":1.7"));
+        // Its own answer now is the program's.
+        s.bus.send(&reply_to(REGISTER_SERIAL, ":1.9"), &[]);
+        let (_, h, _) = s.program.message();
+        assert_eq!(h.reply_serial, Some(1));
+        let (_, h, _) = s.program.message();
+        assert_eq!(h.reply_serial, Some(REGISTER_SERIAL));
+    }
+
     /// A program gone while its call waits for the portal is let go: its
     /// connection — one of the filter's few — does not stay held.
     #[test]
@@ -2386,8 +2435,11 @@ mod tests {
         assert!(s.bus.quiet(HELD));
         // The program goes; the portal still says nothing.
         let _ = s.program.stream.shutdown(std::net::Shutdown::Both);
-        // The filter hangs up its end of the bus: the end of the stream, not
-        // the test's patience running out.
+        // What it sent still goes up — as a message on the bus can outlive
+        // its sender —, and then the filter hangs up its end of the bus: the
+        // end of the stream, not the test's patience running out.
+        let (_, h, _) = s.bus.message();
+        assert_eq!(h.serial, 2);
         let mut buf = [0u8; 64];
         let got = sys::recv_into_with_fds(s.bus.stream.as_raw_fd(), &mut buf, 1).map(|r| r.0);
         assert_eq!(

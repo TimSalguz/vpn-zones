@@ -1566,11 +1566,60 @@ fn serve(sock: RawFd, uid: u32, data: &[u8], fds: Vec<OwnedFd>) -> Result<u8, St
         // SAFETY: our own child and an out-parameter.
         let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
         if rc == pid {
+            end_leftovers();
             return Ok(crate::profile::exit_code_of(status));
         }
         let err = io::Error::last_os_error();
         if err.kind() != io::ErrorKind::Interrupted {
             return Err(format!("waitpid: {err}"));
+        }
+    }
+}
+
+/// The command is over, and so is what it left behind: every other process
+/// of this unit's cgroup is killed now — not at the unit's stop, where
+/// `SIGTERM` and `TimeoutStopSec` would let one that ignores it hold the
+/// terminal (the client relays output until the last holder of the pty is
+/// gone, `pty_session`). Only after the command: a `systemctl stop` or a
+/// shutdown still gives a running one its `SIGTERM`. Each is waited for on
+/// its pidfd; one forked meanwhile is in the next read of the cgroup.
+fn end_leftovers() {
+    let cgroup_of = |pid: &str| {
+        fs::read_to_string(format!("/proc/{pid}/cgroup"))
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix("0::").map(str::to_owned))
+            })
+    };
+    let Some(ours) = cgroup_of("self") else {
+        return;
+    };
+    let procs = Path::new("/sys/fs/cgroup")
+        .join(ours.trim_start_matches('/'))
+        .join("cgroup.procs");
+    let me = std::process::id() as i32;
+    loop {
+        let others: Vec<i32> = fs::read_to_string(&procs)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .filter(|&p| p != me)
+            .collect();
+        if others.is_empty() {
+            return;
+        }
+        for pid in others {
+            let Some(fd) = sys::pidfd_open(pid) else {
+                continue;
+            };
+            // Still of this cgroup once held: the number may have been reused
+            // between the read and the pidfd.
+            if cgroup_of(&pid.to_string()).as_deref() != Some(ours.as_str()) {
+                continue;
+            }
+            sys::pidfd_signal(&fd, libc::SIGKILL);
+            sys::pidfd_wait_end(&fd);
         }
     }
 }

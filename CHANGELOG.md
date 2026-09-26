@@ -238,9 +238,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
     busy machine made the zone's remembered screen cast ask again). What
     the program sends the bus and other names before that goes on at once,
     so a portal that is stuck — or stopped by a program of some zone —
-    holds nothing it would not hold anyway; a program that goes while its
-    call waits is let go. The filter's own notices go one at a time, in a
-    thread of their own;
+    holds nothing it would not hold anyway; a message with the serial of
+    the zone's `Register` waits too, so that no answer to it can pass for
+    the portal's; a program that goes while its call waits is let go, what
+    it sent still delivered. The filter's own notices go one at a time, in
+    a thread of their own;
   - the doctor's walk of the reachable sockets is bounded by what it reads,
     not by 2 s a place (which reported "not seen whole" on a slow disk), and
     the doctor waits for its probe to the end (was 30 s, then a failed
@@ -250,19 +252,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
     cgroups the doctor says after a few seconds what it waits for, and
     Ctrl-C gives up on the probe — the check failed, the report printed; a
     second Ctrl-C ends the doctor. The probe is a process group of its own,
-    so the terminal's Ctrl-C and Ctrl-Z are the doctor's, and a pipe
-    someone else holds open no longer keeps the doctor reading once the
-    probe is gone;
+    so the terminal's Ctrl-C and Ctrl-Z are the doctor's, and it dies with
+    the doctor (`PR_SET_PDEATHSIG`); a pipe someone else holds open no
+    longer keeps the doctor reading once the probe is gone;
   - `vpn-zone-sys` relays a command's output to the end (was 2 s after its
-    exit, and the tail was cut); what the command left behind is killed
-    with it at once (`KillSignal=SIGKILL` on the service), so nothing holds
-    the terminal after it;
+    exit, and the tail was cut); what the command left behind in its unit is
+    killed by the service as soon as the command is over, so nothing holds
+    the terminal after it (a `systemctl stop` still gives a running command
+    its `SIGTERM`);
   - the window menu's "restart" waits for the program to close however
     long it takes — a program asking whether to save is closing too (was
-    10 s, then the restart was cancelled). Past 2 s it asks: wait (the
-    default), close now (killed; too quick a press is taken for a stray
-    key) or cancel the restart (Esc); the program closing meanwhile
-    answers it;
+    10 s, then the restart was cancelled). Past 2 s it asks: cancel the
+    restart (Enter, the default — always safe), close now (killed; too
+    quick a press is taken for a stray key and asked again) or wait (Esc);
+    the program closing meanwhile answers it;
   - the TTY console no longer sleeps 300 ms for a terminal's late answers
     after a shell. Keys are read straight from the terminal a piece at a
     time: a piece with an ESC in it is a sequence — an answer to a query

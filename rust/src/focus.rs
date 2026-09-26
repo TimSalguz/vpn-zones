@@ -720,82 +720,88 @@ const SAY_CLOSING_AFTER: std::time::Duration = std::time::Duration::from_secs(2)
 
 /// A program asked to close for a restart that has not closed yet: the
 /// person decides, while it goes on closing (it may be asking whether to
-/// save). "Wait" is the default — Enter changes nothing; "close now" kills
-/// it, and what is unsaved is lost — pressed sooner than
+/// save). Enter — the default — cancels the restart, which is always safe;
+/// "close now" kills it, and what is unsaved is lost: pressed sooner than
 /// [`crate::dialog::TOO_FAST`] after the question it is taken for a key
-/// meant for something else, and waits; Esc cancels the restart. The program
-/// closing meanwhile answers the question: the dialog goes. `true`: it
-/// closed, and the restart goes on — its launch window asks, and can be
-/// closed.
+/// meant for something else, and the question comes again; Esc (or closing
+/// the question) waits for it, and the restart follows. The program closing
+/// meanwhile answers the question: it goes. `true`: it closed, and the
+/// restart goes on — its launch window asks, and can be closed.
 fn closed_after_all(tools: &Tools, label: &str, program: &OwnedFd) -> bool {
     let shown = label.replace('<', "‹").replace('>', "›").replace('&', "＆");
     let text = format!(
         "«{shown}» ещё не закрылась — может быть, спрашивает, сохранить ли. \
-         Перезапуск будет, когда она закроется."
+         «Ждать» (Esc): перезапуск будет, когда она закроется."
     );
-    let asked = std::time::Instant::now();
-    let dialog = Command::new(&tools.kdialog)
-        .args(["--title", crate::dialog::APP, "--warningyesnocancel"])
-        .arg(&text)
-        .args([
-            "--yes-label",
-            "Ждать",
-            "--no-label",
-            "Закрыть сразу",
-            "--cancel-label",
-            "Отменить перезапуск",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    let (mut dialog, dialog_fd) = match dialog {
-        Ok(child) => match crate::sys::pidfd_open(child.id() as i32) {
-            Some(fd) => (child, fd),
-            None => {
-                let mut child = child;
-                let _ = child.kill();
-                let _ = child.wait();
-                crate::sys::pidfd_wait_end(program);
-                return true;
-            }
-        },
-        // Nowhere to ask: waited for, as the restart asked.
-        Err(_) => {
-            crate::sys::pidfd_wait_end(program);
-            return true;
-        }
-    };
     let pollin = |fd: &OwnedFd| libc::pollfd {
         fd: fd.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
-    let mut fds = [pollin(program), pollin(&dialog_fd)];
     loop {
-        // SAFETY: two valid pollfds for the duration of the call.
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-        if rc < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-            continue;
+        let asked = std::time::Instant::now();
+        let dialog = Command::new(&tools.kdialog)
+            .args(["--title", crate::dialog::APP, "--warningyesnocancel"])
+            .arg(&text)
+            .args([
+                "--yes-label",
+                "Отменить перезапуск",
+                "--no-label",
+                "Закрыть сразу",
+                "--cancel-label",
+                "Ждать",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let (mut dialog, dialog_fd) = match dialog {
+            Ok(child) => match crate::sys::pidfd_open(child.id() as i32) {
+                Some(fd) => (child, fd),
+                None => {
+                    let mut child = child;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    crate::sys::pidfd_wait_end(program);
+                    return true;
+                }
+            },
+            // Nowhere to ask: waited for, as the restart asked.
+            Err(_) => {
+                crate::sys::pidfd_wait_end(program);
+                return true;
+            }
+        };
+        let mut fds = [pollin(program), pollin(&dialog_fd)];
+        loop {
+            // SAFETY: two valid pollfds for the duration of the call.
+            let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if rc < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
         }
-        break;
-    }
-    if fds[0].revents != 0 {
-        let _ = dialog.kill();
-        let _ = dialog.wait();
-        return true;
-    }
-    match dialog.wait().ok().and_then(|s| s.code()) {
-        Some(1) if crate::dialog::not_too_soon(asked).is_ok() => {
-            crate::sys::pidfd_signal(program, libc::SIGKILL);
-            crate::sys::pidfd_wait_end(program);
-            true
+        if fds[0].revents != 0 {
+            let _ = dialog.kill();
+            let _ = dialog.wait();
+            return true;
         }
-        Some(0 | 1) => {
-            crate::sys::pidfd_wait_end(program);
-            true
+        match dialog.wait().ok().and_then(|s| s.code()) {
+            Some(0) => return false,
+            Some(1) if crate::dialog::not_too_soon(asked).is_ok() => {
+                crate::sys::pidfd_signal(program, libc::SIGKILL);
+                crate::sys::pidfd_wait_end(program);
+                return true;
+            }
+            // Too soon: asked again.
+            Some(1) => continue,
+            // "Wait", Esc, the question closed — or kdialog gone some other
+            // way: the restart waits for the program.
+            _ => {
+                crate::sys::pidfd_wait_end(program);
+                return true;
+            }
         }
-        _ => false,
     }
 }
 
