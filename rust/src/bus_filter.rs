@@ -1429,23 +1429,27 @@ fn open_link(ctx: &Ctx, uri: &str, who: &crate::origin::Who) -> u32 {
         return RESPONSE_OTHER;
     }
     let claim = match who {
+        crate::origin::Who::Main => crate::broker::LINK_MAIN.to_owned(),
         crate::origin::Who::Container(name) => name.clone(),
-        _ => String::new(),
+        crate::origin::Who::Unknown => String::new(),
     };
     let (uri, opener, in_zone) = (uri.to_owned(), ctx.opener.clone(), ctx.via_broker.is_some());
     thread::spawn(move || match crate::broker::link(&uri, &claim) {
-        Some(0) => eprintln!("bus-filter: link {shown} → the broker"),
-        Some(_) => eprintln!("bus-filter: link {shown}: the broker did not open it"),
-        None if in_zone => {
-            eprintln!("bus-filter: link {shown}: no broker to hand it to — not opened")
+        crate::broker::Linked::Opened => eprintln!("bus-filter: link {shown} → the broker"),
+        crate::broker::Linked::Refused => {
+            eprintln!("bus-filter: link {shown}: the broker did not open it")
         }
-        None => run_opener(&opener, &uri, &shown),
+        // A sandbox on the host: its links open as before.
+        crate::broker::Linked::NotAZone | crate::broker::Linked::NoBroker if !in_zone => {
+            run_opener(&opener, &uri, &shown)
+        }
+        _ => eprintln!("bus-filter: link {shown}: no broker to hand it to — not opened"),
     });
     RESPONSE_OK
 }
 
-/// The opener, in this process's context: a sandbox's filter on the host
-/// with no broker to ask.
+/// The opener, in this process's context: a sandbox's filter on the host —
+/// the broker opens zones' links only — or with no broker to ask.
 fn run_opener(opener: &Path, uri: &str, shown: &str) {
     match Command::new(opener)
         .arg(uri)

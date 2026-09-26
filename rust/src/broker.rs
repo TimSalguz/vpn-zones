@@ -71,6 +71,9 @@ const MAGIC: &[u8] = b"VZB1\0";
 const PICK_MAGIC: &[u8] = b"VZP1\0";
 /// The magic of a link to open ([`handle_link`]).
 const LINK_MAGIC: &[u8] = b"VZL1\0";
+/// A link request's word for the zone's own programs (no container is
+/// named `main`).
+pub const LINK_MAIN: &str = "main";
 /// The socket, below the runtime directory.
 pub const SOCKET: &str = "vpn-zones/broker";
 /// The largest request the broker reads: a command line, not a file.
@@ -931,6 +934,16 @@ fn begin_asking(origin: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// [`ASKING`] held and a question to `origin` begun: one at a time, and
+/// counted ([`begin_asking`]).
+fn start_asking(origin: &str) -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    let guard = ASKING
+        .try_lock()
+        .map_err(|_| "уже открыт другой вопрос о запуске".to_owned())?;
+    begin_asking(origin)?;
+    Ok(guard)
+}
+
 /// The last question put to `origin` was answered no.
 fn answered_no(origin: &str) {
     if let Ok(mut asked) = ASKED.lock() {
@@ -978,8 +991,7 @@ fn handle_pick(tools: &Tools, origin: &Origin, app_id: &OsString, cmd: &[OsStrin
                 .to_owned()
         }
     };
-    let result =
-        pick_and_check(&zone, locked, app_id, cmd, &origin.name(), None).map(|(argv, _)| argv);
+    let result = pick_and_check(&zone, locked, app_id, cmd, &origin.name());
     let (answer, target) = match result {
         Ok(argv) => {
             let target = argv
@@ -1017,8 +1029,20 @@ fn pick_and_check(
     app_id: &OsString,
     cmd: &[OsString],
     origin: &str,
-    offer_rule: Option<&str>,
-) -> Result<(Vec<OsString>, bool), String> {
+) -> Result<Vec<OsString>, String> {
+    let cmd = host_command(cmd)?;
+    let Ok(_asking) = ASKING.try_lock() else {
+        return Err("уже открыт другой вопрос о запуске".to_owned());
+    };
+    begin_asking(origin)?;
+    ask_window(zone, locked, app_id, &cmd, origin, None).map(|(argv, _)| argv)
+}
+
+/// The command a zone asks for as the host runs it: shown whole, someone to
+/// ask, and its program as the host finds it, once — what the window shows
+/// is what runs: `run` finds nothing again by PATH, where a link in the
+/// home could have been pointed elsewhere while the window was open.
+fn host_command(cmd: &[OsString]) -> Result<Vec<OsString>, String> {
     if cmd.is_empty() {
         return Err("нечего запускать".to_owned());
     }
@@ -1039,14 +1063,22 @@ fn pick_and_check(
             shown_word(&cmd[0].to_string_lossy())
         )
     })?;
-    let cmd: Vec<OsString> = std::iter::once(program.into_os_string())
+    Ok(std::iter::once(program.into_os_string())
         .chain(cmd[1..].iter().cloned())
-        .collect();
-    let cmd = cmd.as_slice();
-    let Ok(_asking) = ASKING.try_lock() else {
-        return Err("уже открыт другой вопрос о запуске".to_owned());
-    };
-    begin_asking(origin)?;
+        .collect())
+}
+
+/// The launch window for a zone's `cmd` ([`host_command`]'s), and its answer
+/// checked: the arguments of `run`, and whether the offered rule was
+/// ticked. The caller holds [`ASKING`] and has begun asking.
+fn ask_window(
+    zone: &str,
+    locked: bool,
+    app_id: &OsString,
+    cmd: &[OsString],
+    origin: &str,
+    offer_rule: Option<&str>,
+) -> Result<(Vec<OsString>, bool), String> {
     let exe = own_binary()?;
     let picker = exe.with_file_name("vpn-zone-pick");
     let mut command = Command::new(&picker);
@@ -1152,6 +1184,7 @@ fn handle_link(tools: &Tools, origin: &Origin, peer: Option<&Peer>, args: &[OsSt
             ("target", answer.1.as_str()),
             ("app", answer.2.as_str()),
             ("link", answer.3.as_str()),
+            ("container", answer.4.as_str()),
             ("decision", decision),
             ("why", why),
         ],
@@ -1161,28 +1194,50 @@ fn handle_link(tools: &Tools, origin: &Origin, peer: Option<&Peer>, args: &[OsSt
     answer.0
 }
 
+/// Who asked for a link to be opened.
+enum Asker {
+    /// A program of the zone's own, with no container.
+    Main,
+    /// A program of this container.
+    Container(Box<crate::container::Container>),
+    /// Not known: no rule, and never started without the window.
+    Unknown,
+}
+
+/// The answer a link from outside a zone gets: the asking filter opens it
+/// itself, as before (a sandbox on the host).
+pub const NOT_A_ZONE: &str = "refused: not a zone";
+
 /// [`handle_link`]'s work: the answer, the network it went to, the program,
-/// and the link as the log may show it.
+/// the link as the log may show it, and whose program asked (`main`, a
+/// container, `?`).
 fn link_answer(
     tools: &Tools,
     origin: &Origin,
     peer: Option<&Peer>,
     args: &[OsString],
-) -> (String, String, String, String) {
+) -> (String, String, String, String, String) {
     let refused = |why: String, shown: &str| {
         (
             format!("refused: {why}"),
             String::new(),
             String::new(),
             shown.to_owned(),
+            String::new(),
         )
     };
-    // A zone's program, or a sandbox's on the host.
-    let zone = match origin {
-        Origin::Zone(zone) => Some(zone.as_str()),
-        Origin::Host => None,
-        _ => return refused("не понять, откуда ссылка".to_owned(), ""),
+    // A zone's program only: a sandbox on the host opens its links itself.
+    let Origin::Zone(zone) = origin else {
+        let nothing = String::new;
+        return (
+            NOT_A_ZONE.to_owned(),
+            nothing(),
+            nothing(),
+            nothing(),
+            nothing(),
+        );
     };
+    let zone = zone.as_str();
     let Some(uri) = args.first().and_then(|u| u.to_str()) else {
         return refused("нет ссылки".to_owned(), "");
     };
@@ -1193,23 +1248,49 @@ fn link_answer(
     let Some(scheme) = crate::links::scheme_of(uri) else {
         return refused("у ссылки нет схемы".to_owned(), &shown);
     };
-    // Whose program asks: the filter's word from the zone's filter alone,
-    // else the kernel's. Only a container that is one keeps a rule.
-    let claim = args
-        .get(1)
-        .and_then(|c| c.to_str())
-        .filter(|c| !c.is_empty());
-    let container = zone
-        .and_then(|zone| match claim {
-            Some(c) if is_zones_filter(tools, zone, peer) => Some(c.to_owned()),
-            _ => container_of(tools, zone, peer),
-        })
-        .filter(|c| !c.is_empty())
-        .and_then(|c| crate::container::load(tools, &c));
+    // Whose program asks: the zone's filter's word from that filter alone
+    // (`main`: the zone's own; a container's name; nothing: not known),
+    // anyone else's container as the kernel says.
+    let word = match args.get(1).and_then(|c| c.to_str()) {
+        Some(c) if is_zones_filter(tools, zone, peer) => Some(c.to_owned()),
+        _ => container_of(tools, zone, peer).map(|c| {
+            if c.is_empty() {
+                LINK_MAIN.to_owned()
+            } else {
+                c
+            }
+        }),
+    };
+    let asker = match word.as_deref() {
+        Some(LINK_MAIN) => Asker::Main,
+        Some(name) if !name.is_empty() => crate::container::load(tools, name)
+            .map_or(Asker::Unknown, |c| Asker::Container(Box::new(c))),
+        _ => Asker::Unknown,
+    };
+    let who = match &asker {
+        Asker::Main => LINK_MAIN.to_owned(),
+        Asker::Container(c) => c.name.clone(),
+        Asker::Unknown => "?".to_owned(),
+    };
+    let refused = |why: String, shown: &str| {
+        let (a, t, p, l, _) = refused(why, shown);
+        (a, t, p, l, who.clone())
+    };
+    // One question at a time, and counted — taken where the person is
+    // asked, once for both windows: the choice of a program is a question
+    // as the launch window is; a zone that asks without end is not asked,
+    // and a no holds it off for a while.
+    let mut asking: Option<std::sync::MutexGuard<'static, ()>> = None;
     let dirs = crate::desktop::source_dirs(&tools.home);
-    let ruled = container
-        .as_ref()
-        .and_then(|c| crate::links::rule(c, &scheme));
+    let entry_of = |id: &str| {
+        crate::desktop::find_entry(&dirs, &tools.home, &tools.state, id)
+            .filter(|(_, groups)| crate::desktop::desktop_entry(groups).is_some())
+    };
+    // The container's rule, where its program is still there.
+    let ruled = match &asker {
+        Asker::Container(c) => crate::links::rule(c, &scheme).filter(|id| entry_of(id).is_some()),
+        _ => None,
+    };
     let id = match &ruled {
         Some(id) => id.clone(),
         None => {
@@ -1232,18 +1313,22 @@ fn link_answer(
                         &shown,
                     );
                 }
+                match start_asking(&origin.name()) {
+                    Ok(guard) => asking = Some(guard),
+                    Err(why) => return refused(why, &shown),
+                }
                 match crate::links::choose(&tools.busctl, &tools.kdialog, &scheme, uri, &programs) {
                     crate::links::Choice::Chosen(id) => id,
                     crate::links::Choice::Cancelled => {
-                        return refused("программу не выбрали".to_owned(), &shown)
+                        answered_no(&origin.name());
+                        return refused("программу не выбрали".to_owned(), &shown);
                     }
                     crate::links::Choice::Unavailable(why) => return refused(why, &shown),
                 }
             }
         }
     };
-    let Some((file, groups)) = crate::desktop::find_entry(&dirs, &tools.home, &tools.state, &id)
-    else {
+    let Some((file, groups)) = entry_of(&id) else {
         return refused(format!("ярлыка {id} нет"), &shown);
     };
     let Some(entry) = crate::desktop::desktop_entry(&groups) else {
@@ -1259,20 +1344,26 @@ fn link_answer(
         .unwrap_or(&id)
         .to_owned();
     let app_id = OsString::from(crate::desktop::stable_key(&id));
-    let Some(zone) = zone else {
-        // A sandbox's program on the host: the host's own launch of it, with
-        // the picker's window as any launch has.
-        return (start_picker(&app_id, &name, &cmd), String::new(), id, shown);
-    };
     // An entry CellWard does not take over (a symlink of the user's, of
-    // home-manager's): run where the link was asked for, as `xdg-open` in the
-    // zone would run it — no network or container is crossed.
+    // home-manager's, any entry where sync takes none over): run where the
+    // link was asked for — in the zone, in the asking program's own container
+    // —, as `xdg-open` there would run it; nothing is crossed. One whose
+    // container is not known goes through the window.
     if !crate::desktop::intercepted(&tools.home, &id) {
-        let argv: Vec<OsString> = [OsString::from(zone), "--".into()]
-            .into_iter()
-            .chain(cmd)
-            .collect();
-        return (start(&app_id, &argv, true), zone.to_owned(), id, shown);
+        let mut argv: Vec<OsString> = vec![zone.into()];
+        match &asker {
+            Asker::Main => {}
+            Asker::Container(c) => {
+                argv.push("--container".into());
+                argv.push(c.name.clone().into());
+            }
+            Asker::Unknown => argv.clear(),
+        }
+        if !argv.is_empty() {
+            argv.push("--".into());
+            argv.extend(cmd);
+            return (start(&app_id, &argv, true), zone.to_owned(), id, shown, who);
+        }
     }
     let locked = tools
         .state
@@ -1281,22 +1372,32 @@ fn link_answer(
         .exists();
     // "Always", per container and only where it is known: the program kept
     // for this scheme — the choice of it skipped next time, the window not.
-    let offer = match (&container, &ruled) {
-        (Some(c), None) => Some(format!(
+    let offer = match (&asker, &ruled) {
+        (Asker::Container(c), None) => Some(format!(
             "Всегда открывать ссылки {scheme}: из контейнера {} в {name}",
             c.name
         )),
         _ => None,
     };
-    let result = pick_and_check(
-        zone,
-        locked,
-        &app_id,
-        &cmd,
-        &origin.name(),
-        offer.as_deref(),
-    );
-    let (argv, keep) = match result {
+    // Held to the end: the window's answer is started under it.
+    let _asking = match asking {
+        Some(guard) => guard,
+        None => match start_asking(&origin.name()) {
+            Ok(guard) => guard,
+            Err(why) => return refused(why, &shown),
+        },
+    };
+    let chosen = host_command(&cmd).and_then(|cmd| {
+        ask_window(
+            zone,
+            locked,
+            &app_id,
+            &cmd,
+            &origin.name(),
+            offer.as_deref(),
+        )
+    });
+    let (argv, keep) = match chosen {
         Ok(chosen) => chosen,
         Err(why) => return refused(why, &shown),
     };
@@ -1305,7 +1406,7 @@ fn link_answer(
         .map(|z| z.to_string_lossy().into_owned())
         .unwrap_or_default();
     if keep {
-        if let Some(c) = &container {
+        if let Asker::Container(c) = &asker {
             if let Err(e) = crate::container::set_link(tools, &c.name, &scheme, Some(&id)) {
                 eprintln!(
                     "broker: the rule for {scheme} links of {} not kept: {e}",
@@ -1314,7 +1415,7 @@ fn link_answer(
             }
         }
     }
-    (start(&app_id, &argv, false), target, id, shown)
+    (start(&app_id, &argv, false), target, id, shown, who)
 }
 
 /// What the window chose, against the request: the arguments of `run`, with
@@ -1376,42 +1477,6 @@ fn start(app_id: &OsString, argv: &[OsString], unasked: bool) -> String {
             "ok".to_owned()
         }
         Err(e) => format!("refused: не запустить vpn-zone: {e}"),
-    }
-}
-
-/// The picker, as a launch on the host starts it: for a link of a sandboxed
-/// program of the host, its program chosen.
-fn start_picker(app_id: &OsString, label: &str, cmd: &[OsString]) -> String {
-    let exe = match own_binary() {
-        Ok(exe) => exe,
-        Err(why) => return format!("refused: {why}"),
-    };
-    let mut command = Command::new(exe.with_file_name("vpn-zone-pick"));
-    command
-        .arg("--id")
-        .arg(app_id)
-        .arg("--label")
-        .arg(label)
-        .arg("--")
-        .args(cmd)
-        .env_remove(crate::launch::ENV_CURRENT)
-        .env_remove(crate::launch::ENV_DELEGATED)
-        .env_remove("VPN_ZONE_ASK")
-        .env_remove("VPN_ZONE_PROFILE")
-        .env_remove("LISTEN_PID")
-        .env_remove("LISTEN_FDS")
-        .env_remove("LISTEN_FDNAMES")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    match command.spawn() {
-        Ok(mut child) => {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-            "ok".to_owned()
-        }
-        Err(e) => format!("refused: не запустить пикер: {e}"),
     }
 }
 
@@ -1501,11 +1566,37 @@ pub fn request(app_id: &[u8], argv: &[OsString]) -> Option<u8> {
     exchange(&encode(app_id, argv))
 }
 
-/// The client half of a link to open, for a bus filter: `Some(code)` when a
-/// broker answered (after the windows were answered or closed), `None` when
-/// there is none to ask.
-pub fn link(uri: &str, container: &str) -> Option<u8> {
-    exchange(&encode_link(b"", uri, container))
+/// What came of a link handed to the broker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Linked {
+    /// Opened.
+    Opened,
+    /// Not opened: refused, or nobody chose.
+    Refused,
+    /// The broker takes the asker for no zone's program: its own to open.
+    NotAZone,
+    /// No broker to ask.
+    NoBroker,
+}
+
+/// The client half of a link to open, for a bus filter (after the windows
+/// were answered or closed). `container`: whose program's connection asked
+/// — [`LINK_MAIN`] for the zone's own, empty where not known.
+pub fn link(uri: &str, container: &str) -> Linked {
+    let Some(answer) = exchange_text(&encode_link(b"", uri, container)) else {
+        return Linked::NoBroker;
+    };
+    if answer == "ok" {
+        Linked::Opened
+    } else if answer == NOT_A_ZONE {
+        Linked::NotAZone
+    } else {
+        eprintln!(
+            "брокер: {}",
+            answer.strip_prefix("refused: ").unwrap_or(&answer)
+        );
+        Linked::Refused
+    }
 }
 
 /// The client half of a choice to make, for the picker in a zone: `Some(code)`
@@ -1516,24 +1607,29 @@ pub fn pick(app_id: &[u8], cmd: &[OsString]) -> Option<u8> {
 }
 
 fn exchange(request: &[u8]) -> Option<u8> {
-    let socket = runtime_dir().join(SOCKET);
-    let mut stream = UnixStream::connect(&socket).ok()?;
-    if stream.write_all(request).is_err() {
-        return Some(crate::profile::EXIT_NOT_STARTED);
-    }
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    let mut answer = String::new();
-    let _ = stream.read_to_string(&mut answer);
-    let answer = answer.trim();
+    let answer = exchange_text(request)?;
     if answer == "ok" {
         Some(0)
     } else {
         eprintln!(
             "брокер: {}",
-            answer.strip_prefix("refused: ").unwrap_or(answer)
+            answer.strip_prefix("refused: ").unwrap_or(&answer)
         );
         Some(1)
     }
+}
+
+/// The broker's one line of answer to `request`; `None` with no broker.
+fn exchange_text(request: &[u8]) -> Option<String> {
+    let socket = runtime_dir().join(SOCKET);
+    let mut stream = UnixStream::connect(&socket).ok()?;
+    if stream.write_all(request).is_err() {
+        return Some("refused: запрос не отправлен".to_owned());
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut answer = String::new();
+    let _ = stream.read_to_string(&mut answer);
+    Some(answer.trim().to_owned())
 }
 
 #[cfg(test)]

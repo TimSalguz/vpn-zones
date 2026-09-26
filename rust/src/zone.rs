@@ -2240,8 +2240,11 @@ fn start_pipewire_context(zone: &Zone) -> Option<Child> {
 /// The session bus filter of a hermetic zone (`crate::bus_filter`, LEAK-MODEL
 /// §2), in front of its proxy: in the app namespace — so that the broker knows
 /// the zone by its network namespace — and as the user, like the proxy. A link
-/// a program hands the portal goes to the broker as "open it in this very
-/// zone". It dies with this process (`PR_SET_PDEATHSIG`), which is the zone.
+/// a program hands the portal goes to the broker with the container of the
+/// program's connection (`crate::links`); the broker believes that word from
+/// this filter alone, a child of this very process (`broker::is_zones_filter`)
+/// — which is why it is started here and nowhere else. It dies with this
+/// process (`PR_SET_PDEATHSIG`), which is the zone.
 /// Unlike the `Helpers` it lives in the zone's user namespace, beside the
 /// zone's programs: that is why it makes itself not dumpable first thing and
 /// starts nothing (`--via-broker`) — what it started would be dumpable again.

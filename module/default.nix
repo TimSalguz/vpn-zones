@@ -1073,6 +1073,13 @@ in
       message = "programs.cellward.containers.${name}.permissions.paths: слою над домом выдаются только пути дома (~/…): вне дома слоя нет, там и так настоящее";
     }) cfg.containers
     ++ lib.mapAttrsToList (name: c: {
+      assertion = lib.all (
+        scheme: builtins.match "[A-Za-z][A-Za-z0-9+.-]*" scheme != null
+      ) (lib.attrNames c.links)
+      && lib.all (app: builtins.match "[^-./[:space:]][^/[:space:]]*" app != null) (lib.attrValues c.links);
+      message = "programs.cellward.containers.${name}.links: схема ссылки — латиница, цифры, + . - (https, tg…); программа — id ярлыка без пути и пробелов (firefox)";
+    }) cfg.containers
+    ++ lib.mapAttrsToList (name: c: {
       assertion = c.home != "main" || (c.permissions.paths == [ ] && c.trust.certificates == [ ]);
       message = "programs.cellward.containers.${name}: основному дому (home = \"main\") выдавать нечего и своих сертификатов у него нет — он и так настоящий, а сертификат лёг бы в настоящий дом";
     }) cfg.containers
@@ -1328,8 +1335,8 @@ in
         "${vpn-zone-rust}/bin/vpn-zone-core zone-holder"
         + " --ip ${iproute} --awg ${awg} --wg ${wg} --pasta ${pasta} --nft ${nft}"
         + " --openconnect ${openconnect} --dbus-proxy ${dbusProxy}/bin/xdg-dbus-proxy"
-        # Чем фильтр шины герметичной зоны просит брокера открыть ссылку
-        # программы — в той же зоне (LEAK-MODEL §2).
+        # Фильтр шины герметичной зоны отдаёт ссылки брокеру (PERMISSIONS
+        # §11.13); opener остался ему на случай песочницы на хосте.
         + " --opener ${vpn-zone-opener}"
         # Чем фильтр звука зоны спрашивает, дать ли программе микрофон
         # (rust/src/microphone.rs): спрашивает в окружении юнита — есть ли в

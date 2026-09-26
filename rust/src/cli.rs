@@ -2522,7 +2522,8 @@ fn container(tools: &Tools, args: &[OsString]) -> u8 {
                     match crate::container::set_link(tools, selector, scheme, Some(id)) {
                         Ok(()) => {
                             println!(
-                                "ссылки {scheme}: из контейнера {selector} открываются в {id} —                                  без выбора программы (окно сети и контейнера остаётся)"
+                                "ссылки {scheme}: из контейнера {selector} открываются в {id} — \
+                                 без выбора программы (окно сети и контейнера остаётся)"
                             );
                             0
                         }

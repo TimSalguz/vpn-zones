@@ -2535,7 +2535,7 @@ pub fn set_link(
         .filter(|l| l.source == Source::Local && l.value.0 != scheme)
         .map(|l| crate::links::rule_word(&l.value.0, &l.value.1))
         .collect();
-    if let Some(id) = id {
+    if let Some(id) = id.map(crate::links::bare_id) {
         if !crate::links::plausible_id(id) {
             return Err(format!(
                 "«{id}» — не id ярлыка (имя .desktop-файла без расширения)"

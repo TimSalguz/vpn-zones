@@ -209,6 +209,19 @@ let
   ''
   );
 
+  # A program of a zone that asks the broker itself to open a link on behalf
+  # of a container it names (argv[1] the link, argv[2] the container): the
+  # broker believes that word from the zone's bus filter alone. Prints the
+  # answer.
+  forgeLink = pkgs.writeText "forge-link.py" ''
+    import os, socket, sys
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(os.environ["XDG_RUNTIME_DIR"] + "/vpn-zones/broker")
+    s.sendall(b"VZL1\0\0" + sys.argv[1].encode() + b"\0" + sys.argv[2].encode() + b"\0")
+    s.shutdown(socket.SHUT_WR)
+    print(s.recv(4096).decode().strip())
+  '';
+
   # A raw session-bus client: ends the authentication the way dbus-daemon and
   # xdg-dbus-proxy allow and the bus filter used to miss ("BEGIN" and more on
   # the line), then asks the portal to open the link in argv[1]. Prints what
@@ -2451,6 +2464,13 @@ let
           out = alice(f"cellward run vmherm --container vmlink -- {portal} ''' 'https://example.test/by-rule' '@a{{sv}} {{}}'")
           assert "/org/freedesktop/portal/desktop/request/" in out, out
           machine.wait_until_succeeds("grep -q 'second https://example.test/by-rule' /home/alice/opened-urls", timeout=30)
+          # The filter's word alone: a program of the zone that sends the same
+          # request itself, naming the container, is the zone's own to the
+          # broker — no rule of vmlink's, and here no window to choose in.
+          out = in_zone(hp, "${pkgs.python3}/bin/python3 ${forgeLink} https://example.test/forged vmlink")
+          assert out.startswith("refused"), out
+          machine.sleep(2)
+          machine.fail("grep -q forged /home/alice/opened-urls")
           out = in_zone(hp, f"{portal} ''' 'https://example.test/no-rule' '@a{{sv}} {{}}'")
           assert "/org/freedesktop/portal/desktop/request/" in out, out
           machine.sleep(3)

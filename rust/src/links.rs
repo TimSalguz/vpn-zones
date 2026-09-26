@@ -194,7 +194,7 @@ pub fn rule_word(scheme: &str, id: &str) -> String {
 /// A rule's word read back: the scheme, lowercased, and the program's id.
 pub fn parse_rule(word: &str) -> Option<(String, String)> {
     let (scheme, id) = word.trim().split_once(char::is_whitespace)?;
-    let id = id.trim();
+    let id = bare_id(id.trim());
     let scheme = scheme_of(&format!("{scheme}:"))?;
     plausible_id(id).then(|| (scheme, id.to_owned()))
 }
@@ -332,7 +332,7 @@ fn app_chooser(
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     );
-    let mut args: Vec<OsString> = ["--user", "--json=short", "--timeout=infinity", "call"]
+    let mut args: Vec<OsString> = ["--user", "--json=short", "--timeout=infinity", "--", "call"]
         .iter()
         .map(OsString::from)
         .collect();
@@ -393,13 +393,20 @@ pub fn parse_answer(json: &str) -> Option<Choice> {
     })
 }
 
-/// A launcher id as a file name can carry it: no path, no space.
+/// A launcher id as a file name can carry it: no path, no space, and not
+/// what a program would take for an option.
 pub fn plausible_id(id: &str) -> bool {
     !id.is_empty()
+        && !id.starts_with('-')
         && id != "."
         && id != ".."
         && !id.contains(['/', '\0'])
         && !id.contains(char::is_whitespace)
+}
+
+/// A launcher id as written: `firefox.desktop` is `firefox`.
+pub fn bare_id(id: &str) -> &str {
+    id.strip_suffix(".desktop").unwrap_or(id)
 }
 
 /// `kdialog`'s menu of `programs`, where no backend shows a window.
@@ -413,7 +420,8 @@ fn kdialog_menu(kdialog: &Path, uri: &str, programs: &[Program]) -> Option<Choic
     ];
     for p in programs {
         args.push(p.id.clone().into());
-        args.push(p.name.clone().into());
+        // Not taken for an option: a name is anybody's text.
+        args.push(p.name.trim_start_matches('-').to_owned().into());
     }
     let out = Command::new(kdialog)
         .args(&args)
@@ -455,6 +463,11 @@ mod tests {
             parse_rule("HTTPS  org.mozilla.firefox"),
             Some(("https".into(), "org.mozilla.firefox".into()))
         );
+        assert_eq!(
+            parse_rule("https firefox.desktop"),
+            Some(("https".into(), "firefox".into()))
+        );
+        assert_eq!(parse_rule("https -x"), None);
         for bad in [
             "https",
             "https ../x",
