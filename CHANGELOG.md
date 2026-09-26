@@ -223,6 +223,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   told by its launch, not taken for the zone's own programs.
 
 ### Fixed
+- **The network of a zone is waited for until it is there** (the owner,
+  2026-09-26: no fixed waits a slow or busy machine breaks). pasta's
+  interface and default route in a zone through a host interface or a
+  system zone, in a zone's uplink, in a system zone and in its uplink, and
+  pasta attaching a user zone through a system zone (`vpn-zone-sys`) are
+  waited for with an rtnetlink subscription in that namespace — woken by
+  the kernel's news of links, addresses and routes — until they are there
+  or pasta ends (was five seconds, then the zone did not come up; 300 ms
+  for the attach, and a slow pasta was taken for one that attached). An
+  OpenConnect client is waited for until its plan is written or it exits
+  (was two minutes). pasta that cannot be started for a zone's uplink now
+  takes the zone down at once, rather than leaving the uplink to wait.
+  The broker and the system-zone service read a request as long as it takes
+  (was five seconds): a peer that says nothing holds a slot of its own
+  origin (four per zone) or of its own user (16 of the service's 64
+  connections), which bounds it instead.
 - **A zone comes up however long its setup takes, and its helpers too**
   (the owner, 2026-09-26: no fixed waits that a slow or busy machine
   breaks). The user zone's unit is now `Type=notify` with no start timeout:

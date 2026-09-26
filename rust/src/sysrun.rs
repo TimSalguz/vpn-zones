@@ -762,15 +762,13 @@ struct Launch {
 /// Who asks, from the kernel; then what they ask for.
 fn serve_any(sock: RawFd) -> Result<Vec<u8>, String> {
     let uid = peer_uid(sock)?;
-    // A client that connects and says nothing must not hold the unit — and
-    // one of the few connections the socket allows — for ever (review).
-    set_recv_timeout(sock, REQUEST_WAIT);
+    // Read as long as it takes, no clock: a client writes its request as it
+    // connects, and on a loaded machine that is later, not never. One that
+    // connects and says nothing holds its own unit — and one of the few
+    // connections the socket allows its user (`MaxConnectionsPerSource`, 16
+    // of 64): a count bounds it, where five seconds used to (review).
     let (data, fds) = sys::recv_with_fds(sock, MAX_REQUEST, 3)
         .map_err(|e| format!("cannot read the request: {e}"))?;
-    // The request is in: from here the connection is the command's life, and
-    // a wait on it must not end after five seconds (review: every command was
-    // hung up then — the watcher took the timeout for the client leaving).
-    set_recv_timeout(sock, Duration::ZERO);
     if system::is_off() {
         // The zones are down and stay down (their units check the same
         // flag): say so, rather than "the zone did not come up".
@@ -811,15 +809,10 @@ pub const ENV_PASTA: &str = "VPN_ZONE_PASTA";
 /// The group user zones' pasta runs with in a system zone (`BRIDGE_GROUP`
 /// rule in `system::ns_up`).
 pub const BRIDGE_GROUP: &str = "vpn-zones-bridge";
-/// How long a client has to say what it wants.
-const REQUEST_WAIT: Duration = Duration::from_secs(5);
 /// ioctl_ns(2): `_IO(0xb7, 0x1)` and `_IO(0xb7, 0x4)`.
 const NS_GET_USERNS: libc::c_ulong = 0xb701;
 const NS_GET_NSTYPE: libc::c_ulong = 0xb703;
 const NS_GET_OWNER_UID: libc::c_ulong = 0xb704;
-/// pasta failing at once — no such namespace, no way in — is said as a
-/// refusal rather than as an uplink that ends a moment later.
-const UPLINK_SETTLE: Duration = Duration::from_millis(300);
 
 pub fn encode_uplink(zone: &str, pid: i32) -> Vec<u8> {
     let mut out = UPLINK_MAGIC.to_vec();
@@ -993,23 +986,6 @@ fn ns_owner_uid(userns: &OwnedFd) -> Result<u32, String> {
 /// Whether two descriptors are the same namespace.
 fn same_ns(a: &OwnedFd, b: &OwnedFd) -> bool {
     matches!((ns_id(a), ns_id(b)), (Some(x), Some(y)) if x == y)
-}
-
-fn set_recv_timeout(sock: RawFd, wait: Duration) {
-    let tv = libc::timeval {
-        tv_sec: libc::time_t::try_from(wait.as_secs()).unwrap_or(5),
-        tv_usec: 0,
-    };
-    // SAFETY: a valid descriptor and a timeval of the size given.
-    unsafe {
-        libc::setsockopt(
-            sock,
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            (&raw const tv).cast(),
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        )
-    };
 }
 
 fn send_on(sock: RawFd, answer: &[u8]) {
@@ -1205,8 +1181,24 @@ fn serve_uplink(
     // The namespace pasta was started in: the one to follow if it changes.
     let mut serving = file_ns_id(&sysnet);
     drop(sysnet);
-    thread::sleep(UPLINK_SETTLE);
-    if let Ok(Some(status)) = pasta.try_wait() {
+    // Attached once its interface is in the zone's namespace: as long as that
+    // takes, woken by the kernel's news of that namespace, or pasta ends
+    // without it — said as a refusal, not as an uplink that ends a moment
+    // later. No clock (this was 300 ms, and a slow pasta was taken for one
+    // that had attached).
+    let pidfd = sys::pidfd_open(pasta.id() as i32)
+        .ok_or_else(|| format!("cannot watch pasta: {}", io::Error::last_os_error()))?;
+    let interface = CString::new(zone::TUN_IFACE).map_err(|e| e.to_string())?;
+    // SAFETY: a NUL-terminated name; the lookup is in the calling thread's
+    // network namespace, the zone's there.
+    let attached = sys::wait_for_network_in(&netns, Some(&pidfd), || unsafe {
+        libc::if_nametoindex(interface.as_ptr()) != 0
+    })
+    .map_err(|e| format!("cannot wait for pasta: {e}"))?;
+    if !attached {
+        let status = pasta
+            .wait()
+            .map_or_else(|e| e.to_string(), |s| s.to_string());
         return Err(format!("pasta could not attach ({status})"));
     }
     println!(

@@ -439,9 +439,6 @@ const DEFAULT_RESOLVERS: [&str; 2] = ["1.1.1.1", "9.9.9.9"];
 /// zone says whose rules these are.
 const NFT_TABLE: &str = "vpnzone";
 
-/// Waiting is done in 0.1 s steps, 50 of them — five seconds, as in bash.
-const WAIT_STEPS: u32 = 50;
-const WAIT_STEP: Duration = Duration::from_millis(100);
 /// How often the tunnel state is mirrored into the `status` file. Five seconds
 /// is the compromise the bash version settled on: the handshake shows up almost
 /// at once and the load is nil.
@@ -474,13 +471,6 @@ pub(crate) const SYSTEM_TIER_DIR: &str = "/run/vpn-zones";
 /// The system zone's resolvers, as the service said them, one per line: what
 /// the app namespace's resolv.conf is written from.
 const SYS_RESOLVERS: &str = "system-resolvers";
-
-/// How long the uplink waits for the OpenConnect client to authenticate and
-/// hand the tunnel over: two minutes in 0.1 s steps. Long, and deliberately so
-/// — a corporate gateway with a slow authentication step is ordinary, and
-/// giving up on a connection that was about to succeed costs the user the zone.
-/// The wait ends early the moment the client exits.
-const OC_CONNECT_STEPS: u32 = 1200;
 
 /// Absolute paths of the tools the zone drives. Absolute because part of this
 /// code runs inside a namespace where `PATH` can be anything; Nix substitutes
@@ -1622,10 +1612,15 @@ fn supervise(zone: &Zone) -> Result<u8, String> {
                 PASTA_CHILD.store(child.id() as i32, Ordering::SeqCst);
                 pasta = Some(child);
             }
-            Err(e) => eprintln!(
-                "zone {}: cannot start pasta ({e}) — the zone will have no way out",
-                zone.name()
-            ),
+            Err(e) => {
+                // The uplink waits for pasta's route as long as it takes:
+                // without pasta that is for ever, so the zone goes now.
+                kill_and_reap(pid);
+                kill_and_reap(zone_pid);
+                return Err(format!(
+                    "cannot start pasta ({e}) — the zone has no way out"
+                ));
+            }
         }
     } else {
         // An offline zone: nobody is on the other end of any of these.
@@ -3831,9 +3826,12 @@ fn wait_for_app_namespace(zone_up_r: OwnedFd) -> Result<(), String> {
 
 /// Wait for pasta to create and configure its interface in this namespace: the
 /// link up and a default route through it. pasta does this over netlink from
-/// outside, so the only way to know it is done is to look.
-fn wait_for_pasta_link(zone: &Zone) -> Result<(), String> {
-    for _ in 0..WAIT_STEPS {
+/// outside; the kernel's news of it here wakes the look (`wait_for_network`).
+/// As long as it takes, no clock: pasta that ends instead takes the zone down
+/// (`supervise`), this process with it — pasta refusing an interface that is
+/// down says so itself, in the journal.
+fn wait_for_pasta_link(zone: &Zone) {
+    sys::wait_for_network(None, || {
         let route =
             tool_output(&zone.tools.ip, &["-4", "route", "show", "default"]).unwrap_or_default();
         let route6 =
@@ -3843,14 +3841,8 @@ fn wait_for_pasta_link(zone: &Zone) -> Result<(), String> {
                 .map(parse_default_route)
                 .any(|r| r.dev.as_deref() == Some(TUN_IFACE))
         };
-        if through(&route) || through(&route6) {
-            return Ok(());
-        }
-        thread::sleep(WAIT_STEP);
-    }
-    Err(format!(
-        "pasta did not bring up {TUN_IFACE} with a default route — is the host's interface up?"
-    ))
+        through(&route) || through(&route6)
+    });
 }
 
 /// Ask the system-zone service for the way out through `system`
@@ -4044,29 +4036,25 @@ fn spawn_openconnect(zone: &Zone, oc: &OcZone, zone_pid: libc::pid_t) -> Result<
 /// The plan file appearing IS the report — the script writes it by rename after
 /// the move, so its existence means the interface is already down there. The
 /// wait ends early if the client dies, which is the ordinary failure: a wrong
-/// password, a refused certificate, an unreachable gateway.
+/// password, a refused certificate, an unreachable gateway. Otherwise as long
+/// as it takes — no clock: a corporate gateway with a slow authentication step
+/// is ordinary, and giving up on a connection that was about to succeed costs
+/// the user the zone (this was two minutes). A client that hangs is ended by
+/// stopping the zone.
 fn wait_for_plan(zone: &Zone, client: &mut Child) -> Result<(), String> {
     let plan = zone.path(openconnect::PLAN_FILE);
-    for _ in 0..OC_CONNECT_STEPS {
-        if plan.exists() {
-            return Ok(());
-        }
-        match client.try_wait() {
-            Ok(Some(status)) => {
-                return Err(format!(
-                    "openconnect exited ({status}) before the tunnel was up — the messages above \
-                     are its own"
-                ))
-            }
-            Ok(None) => {}
-            Err(e) => return Err(format!("cannot check on openconnect: {e}")),
-        }
-        thread::sleep(WAIT_STEP);
+    let pidfd = sys::pidfd_open(client.id() as i32)
+        .ok_or_else(|| format!("cannot watch openconnect: {}", io::Error::last_os_error()))?;
+    if sys::wait_for_entry(&plan, Some(&pidfd), Path::exists) {
+        return Ok(());
     }
-    Err(format!(
-        "openconnect did not hand the tunnel over in time ({OC_CONNECT_STEPS} tries of {} ms)",
-        WAIT_STEP.as_millis()
-    ))
+    match client.wait() {
+        Ok(status) => Err(format!(
+            "openconnect exited ({status}) before the tunnel was up — the messages above are \
+             its own"
+        )),
+        Err(e) => Err(format!("cannot check on openconnect: {e}")),
+    }
 }
 
 /// Create the tunnel interface; the answer says which tool configures it.
@@ -4304,7 +4292,7 @@ fn zone_setup(zone: &Zone, links: Option<ZoneLinks<'_>>) -> Result<(), String> {
             let Backend::HostIf(host) = backend else {
                 return Err("pasta was attached to a zone that is not a host-interface one".into());
             };
-            wait_for_pasta_link(zone)?;
+            wait_for_pasta_link(zone);
             let dns: Vec<String> = host.dns.iter().map(ToString::to_string).collect();
             (dns, None, Mirror::HostIf(host.interface.clone()))
         }
@@ -4316,7 +4304,7 @@ fn zone_setup(zone: &Zone, links: Option<ZoneLinks<'_>>) -> Result<(), String> {
                         .into(),
                 );
             };
-            wait_for_pasta_link(zone)?;
+            wait_for_pasta_link(zone);
             // Addresses only: they go into resolv.conf as they are.
             let dns: Vec<String> = fs::read_to_string(zone.path(SYS_RESOLVERS))
                 .unwrap_or_default()
@@ -5220,13 +5208,13 @@ fn feed_nft(nft: &Path, ruleset: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Wait for pasta's default route in the uplink namespace — as long as it
+/// takes, woken by the kernel's news (`wait_for_network`): pasta that ends
+/// instead takes the zone down (`supervise`), this process with it.
 fn wait_for_default_route(zone: &Zone) {
-    for _ in 0..WAIT_STEPS {
-        if !zone.ip_line(&["-4", "route", "show", "default"]).is_empty() {
-            return;
-        }
-        thread::sleep(WAIT_STEP);
-    }
+    sys::wait_for_network(None, || {
+        !zone.ip_line(&["-4", "route", "show", "default"]).is_empty()
+    });
 }
 
 fn default_route(zone: &Zone, family: Family) -> DefaultRoute {
