@@ -1346,24 +1346,19 @@ fn link_answer(
     let app_id = OsString::from(crate::desktop::stable_key(&id));
     // An entry CellWard does not take over (a symlink of the user's, of
     // home-manager's, any entry where sync takes none over): run where the
-    // link was asked for — in the zone, in the asking program's own container
-    // —, as `xdg-open` there would run it; nothing is crossed. One whose
-    // container is not known goes through the window.
+    // link was asked for — in the zone, in the asking program's own
+    // container —, as `xdg-open` there would run it; no network is crossed.
+    // A program of no container known (a throwaway sandbox's) gets the
+    // zone's own, where `xdg-open` in the zone ran it before.
     if !crate::desktop::intercepted(&tools.home, &id) {
         let mut argv: Vec<OsString> = vec![zone.into()];
-        match &asker {
-            Asker::Main => {}
-            Asker::Container(c) => {
-                argv.push("--container".into());
-                argv.push(c.name.clone().into());
-            }
-            Asker::Unknown => argv.clear(),
+        if let Asker::Container(c) = &asker {
+            argv.push("--container".into());
+            argv.push(c.name.clone().into());
         }
-        if !argv.is_empty() {
-            argv.push("--".into());
-            argv.extend(cmd);
-            return (start(&app_id, &argv, true), zone.to_owned(), id, shown, who);
-        }
+        argv.push("--".into());
+        argv.extend(cmd);
+        return (start(&app_id, &argv, true), zone.to_owned(), id, shown, who);
     }
     let locked = tools
         .state
