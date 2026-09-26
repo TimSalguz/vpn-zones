@@ -862,6 +862,11 @@ in
           description = "cellward: a program in a system zone";
           serviceConfig = {
             ExecStart = "${core} system-run-service";
+            # Команда кончилась — кончилось и то, что она оставила: сразу,
+            # а не через TimeoutStopSec после SIGTERM, который остаток может
+            # не слушать. Клиент досылает вывод, пока pty кто-то держит
+            # (rust/src/sysrun.rs, pty_session), — держать его некому.
+            KillSignal = "SIGKILL";
             StandardInput = "socket";
             StandardOutput = "journal";
             StandardError = "journal";

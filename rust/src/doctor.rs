@@ -840,25 +840,61 @@ pub struct Bounded {
     pub stopped: bool,
     /// Killed for answering more than it may.
     pub overflow: bool,
+    /// Given up on by the person (Ctrl-C).
+    pub interrupted: bool,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
+
+/// The write end of the pipe a Ctrl-C is told through while [`run_bounded`]
+/// waits; -1 when nobody waits.
+static INTERRUPT_W: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn interrupted(_: libc::c_int) {
+    let fd = INTERRUPT_W.load(Ordering::SeqCst);
+    if fd >= 0 {
+        // SAFETY: write(2) is async-signal-safe; one byte from a static.
+        unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
+    }
+    // A second Ctrl-C ends the doctor, as it would have.
+    // SAFETY: signal(2) is async-signal-safe.
+    unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+}
+
+/// When the doctor says what it is waiting for. Only that: it waits either
+/// way.
+const SAY_WAITING_AFTER: libc::c_int = 3000;
 
 /// Run `command` to its end, reading at most `max` bytes of its standard
 /// output; past that it is killed, and says so.
 ///
 /// Waited for as long as it takes — no clock: the walk is bounded by what it
 /// may read (`sockets::LIMITS`), a loaded machine only makes it later, and a
-/// guess at "too long" would fail the check on exactly such a machine. What a
-/// program of the zone can do to hold the probe is stop it (`kill -STOP`: the
-/// same user; signals are open, LEAK-MODEL §16 — a tracer it cannot be: the
-/// probe is not dumpable, [`as_a_program`]). A stop is seen as it happens,
-/// and the probe is killed and the check failed, rather than the doctor
-/// hanging or taking silence for "nothing". The end is the process's own
-/// (its pidfd), not its pipes': a pipe held open by someone else ends the
-/// reading once the probe is gone and what it wrote is read.
-pub fn run_bounded(command: &mut Command, max: usize) -> io::Result<Bounded> {
+/// guess at "too long" would fail the check on exactly such a machine. A
+/// program of the zone can hold the probe (LEAK-MODEL §16, and §19 for the
+/// user's cgroups): stop it — seen as it happens (`waitid(WSTOPPED)`), the
+/// probe killed and the check failed —, freeze or starve it through a cgroup
+/// it may write, or stop the doctor itself; a tracer it cannot be, the probe
+/// is not dumpable ([`as_a_program`]). So the doctor never says "fine" for a
+/// probe that did not answer: it waits, says after a while what for
+/// (`waiting`, on standard error), and a Ctrl-C gives up on the probe — the
+/// check failed ([`Bounded::interrupted`]); a second one ends the doctor.
+/// The probe is a process group of its own: the terminal's Ctrl-C and Ctrl-Z
+/// are the doctor's, never the probe's. The end is the process's own (its
+/// pidfd), not its pipes': a pipe held open by someone else ends the reading
+/// once the probe is gone and what it wrote is read.
+pub fn run_bounded(
+    command: &mut Command,
+    max: usize,
+    waiting: Option<&str>,
+) -> io::Result<Bounded> {
+    use std::os::unix::process::CommandExt;
+    // Inherited as "ignore", SIGCHLD would have the kernel reap the probe
+    // unseen — and no stop of it could be seen either.
+    // SAFETY: signal(2) with a standard disposition.
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
     let mut child = command
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -874,7 +910,14 @@ pub fn run_bounded(command: &mut Command, max: usize) -> io::Result<Bounded> {
     };
     let stopped = Arc::new(AtomicBool::new(false));
     {
-        let watch = pidfd.try_clone()?;
+        let watch = match pidfd.try_clone() {
+            Ok(fd) => fd,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
         let stopped = Arc::clone(&stopped);
         std::thread::spawn(move || {
             if crate::sys::pidfd_stopped_or_gone(&watch) == crate::sys::ChildState::Stopped {
@@ -888,6 +931,20 @@ pub fn run_bounded(command: &mut Command, max: usize) -> io::Result<Bounded> {
     let mut stderr = child.stderr.take();
     let mut buf = vec![0u8; 64 * 1024];
     let mut ended = false;
+    // A Ctrl-C while the probe is waited for is told through a pipe.
+    let interrupt = crate::sys::pipe().ok();
+    let previous = interrupt.as_ref().map(|(_, w)| {
+        INTERRUPT_W.store(w.as_raw_fd(), Ordering::SeqCst);
+        // SAFETY: a handler that only writes a byte and resets itself.
+        unsafe {
+            libc::signal(
+                libc::SIGINT,
+                interrupted as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            )
+        }
+    });
+    let interrupt_r = interrupt.as_ref().map(|(r, _)| r.as_raw_fd());
+    let mut said = waiting.is_none();
     'read: while stdout.is_some() || stderr.is_some() {
         let pollin = |fd| libc::pollfd {
             fd,
@@ -898,14 +955,22 @@ pub fn run_bounded(command: &mut Command, max: usize) -> io::Result<Bounded> {
             stdout.as_ref().map(AsRawFd::as_raw_fd),
             stderr.as_ref().map(AsRawFd::as_raw_fd),
             (!ended).then(|| pidfd.as_raw_fd()),
+            interrupt_r.filter(|_| !ended),
         ]
         .into_iter()
         .flatten()
         .map(pollin)
         .collect();
         // Once it has ended, only what is in the pipes already: everything it
-        // wrote is there by then.
-        let ms = if ended { 0 } else { -1 };
+        // wrote is there by then. Before, no clock but the one for saying
+        // what the doctor waits for.
+        let ms = if ended {
+            0
+        } else if !said {
+            SAY_WAITING_AFTER
+        } else {
+            -1
+        };
         // SAFETY: a valid array of pollfd and its length.
         let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
         if ready < 0 {
@@ -915,15 +980,27 @@ pub fn run_bounded(command: &mut Command, max: usize) -> io::Result<Bounded> {
             }
             let _ = child.kill();
             let _ = child.wait();
+            restore_interrupt(previous);
             return Err(e);
         }
         if ready == 0 {
-            break;
+            if ended {
+                break;
+            }
+            if let Some(waiting) = waiting.filter(|_| !said) {
+                eprintln!("{waiting}");
+            }
+            said = true;
+            continue;
         }
         for pfd in fds.iter().filter(|p| p.revents != 0) {
             if pfd.fd == pidfd.as_raw_fd() {
                 ended = true;
                 continue;
+            }
+            if Some(pfd.fd) == interrupt_r {
+                out.interrupted = true;
+                break 'read;
             }
             let is_out = stdout.as_ref().map(AsRawFd::as_raw_fd) == Some(pfd.fd);
             let n = if is_out {
@@ -955,15 +1032,27 @@ pub fn run_bounded(command: &mut Command, max: usize) -> io::Result<Bounded> {
             }
         }
     }
-    if out.overflow {
+    if out.overflow || out.interrupted {
         let _ = child.kill();
     }
     // Both pipes closed or the child gone: it is done, or about to be — and a
-    // stop on the way is still seen, and ends it.
-    let status = child.wait()?;
+    // stop on the way is still seen, and ends it. A Ctrl-C now is the
+    // doctor's again: a second one would have been anyway.
+    let status = child.wait();
+    restore_interrupt(previous);
+    let status = status?;
     out.stopped = stopped.load(Ordering::SeqCst);
-    out.success = status.success() && !out.stopped && !out.overflow;
+    out.success = status.success() && !out.stopped && !out.overflow && !out.interrupted;
     Ok(out)
+}
+
+/// SIGINT as it was before [`run_bounded`], and nobody told of it.
+fn restore_interrupt(previous: Option<libc::sighandler_t>) {
+    INTERRUPT_W.store(-1, Ordering::SeqCst);
+    if let Some(previous) = previous.filter(|p| *p != libc::SIG_ERR) {
+        // SAFETY: signal(2) with the disposition it returned before.
+        unsafe { libc::signal(libc::SIGINT, previous) };
+    }
 }
 
 /// A check the probe prints once, printed more than once: somebody else
@@ -1298,12 +1387,20 @@ pub fn zone_checks(tools: &Tools, name: &str, uid: u32) -> (bool, Vec<Check>) {
         .arg(&tools.core)
         .arg("doctor-probe")
         .args(&probe_args);
-    match run_bounded(&mut command, PROBE_OUTPUT_MAX) {
+    let waiting =
+        format!("doctor: жду пробу в зоне {name} — Ctrl-C: не ждать (проверка не пройдена)");
+    match run_bounded(&mut command, PROBE_OUTPUT_MAX, Some(&waiting)) {
         Ok(out) if out.stopped => checks.push(Check::new(
             "probe",
             Level::Fail,
             "пробу в зоне остановили сигналом — она снята (программа зоны может так \
              сделать; проверка не пройдена)",
+        )),
+        Ok(out) if out.interrupted => checks.push(Check::new(
+            "probe",
+            Level::Fail,
+            "пробу в зоне не дождались (Ctrl-C) — проверка не пройдена: программа зоны \
+             может заморозить или замедлить её",
         )),
         Ok(out) if out.overflow => checks.push(Check::new(
             "probe",
@@ -1712,6 +1809,7 @@ mod tests {
         let quick = run_bounded(
             Command::new("sh").args(["-c", "echo out; echo err >&2"]),
             1024,
+            None,
         )
         .unwrap();
         assert!(quick.success && !quick.stopped && !quick.overflow);
@@ -1722,20 +1820,26 @@ mod tests {
         let stopped = run_bounded(
             Command::new("sh").args(["-c", "kill -STOP $$; echo never"]),
             1024,
+            None,
         )
         .unwrap();
         assert!(stopped.stopped && !stopped.success, "{stopped:?}");
         assert!(stopped.stdout.is_empty());
         // Its pipe held by someone else: the probe's end is the end.
         let started = Instant::now();
-        let held =
-            run_bounded(Command::new("sh").args(["-c", "sleep 60 & echo out"]), 1024).unwrap();
+        let held = run_bounded(
+            Command::new("sh").args(["-c", "sleep 60 & echo out"]),
+            1024,
+            None,
+        )
+        .unwrap();
         assert!(held.success && !held.stopped, "{held:?}");
         assert_eq!(held.stdout, b"out\n");
         assert!(started.elapsed() < Duration::from_secs(30));
         let flood = run_bounded(
             Command::new("sh").args(["-c", "while :; do echo xxxxxxxxxxxxxxxx; done"]),
             4096,
+            None,
         )
         .unwrap();
         assert!(flood.overflow && !flood.success);

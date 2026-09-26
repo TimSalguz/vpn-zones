@@ -24,7 +24,7 @@
 
 use std::ffi::{CStr, OsString};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -188,6 +188,9 @@ fn menu(config: &Config, user: &str) {
             waited = true;
             net = wait_alive(zone);
         }
+        // Mouse reports off — a program of a zone may have turned them on:
+        // a click is not a choice (`next_key` skips them all the same).
+        print!("\x1b[?1000l\x1b[?9l");
         drop_typeahead();
 
         let fallback = config.fallback.as_deref().filter(|_| net != Net::Alive);
@@ -366,7 +369,18 @@ fn read_key() -> Option<u8> {
         // SAFETY: descriptor 0 and a filled termios.
         unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) };
     }
-    let key = next_key(&mut io::stdin().lock());
+    // Straight from the descriptor, not through `io::stdin()`'s buffer: what
+    // a buffer took in ahead would be out of `drop_typeahead`'s reach.
+    let key = next_key(|buf| loop {
+        // SAFETY: descriptor 0 and a buffer of the length given.
+        let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+        if n >= 0 {
+            return Some(n as usize);
+        }
+        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return None;
+        }
+    });
     if is_tty {
         // SAFETY: descriptor 0 and the termios read from it.
         unsafe { libc::tcsetattr(0, libc::TCSANOW, &saved) };
@@ -374,60 +388,28 @@ fn read_key() -> Option<u8> {
     key
 }
 
-/// The next key in `input`: a byte of its own, never one of an escape
-/// sequence. What a terminal answers to a query a program printed — the
-/// console's `ESC [ ? 6 c` for its kind, `ESC [ 0 n` for its status (an `n`
-/// in it: the admin tool's key), `ESC [ <row> ; <col> R` for the cursor — is
-/// such a sequence, and so it is not a choice, whenever it arrives: no clock
-/// decides what was typed. Keys that send a sequence (arrows, F-keys — the
-/// console's F1 is `ESC [ [ A`) choose nothing either, and a lone Esc takes
-/// the key after it. `None` at the end of input.
-fn next_key(input: &mut impl Read) -> Option<u8> {
-    let mut byte = || {
-        let mut b = [0u8; 1];
-        match input.read(&mut b) {
-            Ok(1) => Some(b[0]),
-            _ => None,
-        }
-    };
+/// The next key, from `read` — a chunk at a time, what the terminal has as
+/// it has it. A key is the first byte of a chunk with no ESC in it; a chunk
+/// of ESC alone is the Esc key. Any other chunk with an ESC in it is a
+/// sequence and chooses nothing, whenever it arrives: a terminal's answer to
+/// a query a program printed (the console's `ESC [ ? 6 c` for its kind,
+/// `ESC [ 0 n` for its status — an `n` in it, the admin tool's key —,
+/// `ESC [ <row> ; <col> R` for the cursor), a key that sends one (arrows,
+/// F-keys: the console's F1 is `ESC [ [ A`), a mouse report. The kernel
+/// hands such a sequence over whole, in one piece, where a person's keys
+/// come one by one — so no clock decides what was typed. Esc pressed
+/// together with a key reads as one piece too, and is pressed again.
+/// `None` at the end of input.
+fn next_key(mut read: impl FnMut(&mut [u8]) -> Option<usize>) -> Option<u8> {
+    let mut buf = [0u8; 256];
     loop {
-        let b = byte()?;
-        if b != 0x1b {
-            return Some(b);
-        }
-        match byte()? {
-            // CSI: parameters and intermediates, up to a final byte — the
-            // console's F-keys put one more `[` first.
-            b'[' => {
-                let mut first = true;
-                loop {
-                    let c = byte()?;
-                    if std::mem::take(&mut first) && c == b'[' {
-                        byte()?;
-                        break;
-                    }
-                    if (0x40..=0x7e).contains(&c) {
-                        break;
-                    }
-                }
-            }
-            // OSC, DCS, SOS, PM, APC: up to BEL or ST (`ESC \`).
-            b']' | b'P' | b'X' | b'^' | b'_' => {
-                let mut esc = false;
-                loop {
-                    let c = byte()?;
-                    if c == 0x07 || (esc && c == b'\\') {
-                        break;
-                    }
-                    esc = c == 0x1b;
-                }
-            }
-            // SS3: one byte more (F1–F4, keypad).
-            b'O' => {
-                byte()?;
-            }
-            // ESC and one byte.
-            _ => {}
+        let n = read(&mut buf)?;
+        let chunk = &buf[..n.min(buf.len())];
+        match chunk {
+            [] => return None,
+            [0x1b] => return Some(0x1b),
+            _ if chunk.contains(&0x1b) => continue,
+            [first, ..] => return Some(*first),
         }
     }
 }
@@ -454,19 +436,28 @@ mod tests {
 
     #[test]
     fn a_terminals_answer_is_never_a_key() {
-        let key = |input: &[u8]| next_key(&mut io::Cursor::new(input.to_vec()));
-        assert_eq!(key(b"q"), Some(b'q'));
-        assert_eq!(key(b"\x1b[?6c\x1b[0nq"), Some(b'q'));
-        assert_eq!(key(b"\x1b[12;40Rk"), Some(b'k'));
-        assert_eq!(key(b"\x1b[[An"), Some(b'n'));
-        assert_eq!(key(b"\x1b]52;c;eA==\x07\r"), Some(b'\r'));
-        assert_eq!(key(b"\x1bP1$r0m\x1b\\x"), Some(b'x'));
-        assert_eq!(key(b"\x1bOPp"), Some(b'p'));
-        // A lone Esc takes the key after it.
-        assert_eq!(key(b"\x1bkq"), Some(b'q'));
-        // Cut short: the end of input, not a key.
-        assert_eq!(key(b"\x1b[0"), None);
-        assert_eq!(key(b""), None);
+        let key = |chunks: &[&[u8]]| {
+            let mut chunks = chunks.iter();
+            next_key(|buf| {
+                let chunk = chunks.next()?;
+                buf[..chunk.len()].copy_from_slice(chunk);
+                Some(chunk.len())
+            })
+        };
+        assert_eq!(key(&[b"q"]), Some(b'q'));
+        // The console's answers, whole: never a key.
+        assert_eq!(key(&[b"\x1b[?6c", b"\x1b[0n", b"q"]), Some(b'q'));
+        assert_eq!(key(&[b"\x1b[12;40R", b"k"]), Some(b'k'));
+        // Two answers in one piece, and an answer with a key typed with it.
+        assert_eq!(key(&[b"\x1b[?6c\x1b[0n", b"\x1b[0nk", b"p"]), Some(b'p'));
+        // F1 on the console, and a mouse report (`ESC [ M b x y`: a click
+        // at column 78 makes an `n`).
+        assert_eq!(key(&[b"\x1b[[A", b"\x1b[M n+", b"\r"]), Some(b'\r'));
+        // Esc alone is a key: the menu's way out.
+        assert_eq!(key(&[b"\x1b"]), Some(0x1b));
+        // The end of input.
+        assert_eq!(key(&[]), None);
+        assert_eq!(key(&[b""]), None);
     }
 
     #[test]

@@ -653,11 +653,14 @@ impl Conn {
     /// late, and a guess at "too late" would make the connection nameless
     /// on exactly such a machine. The bus answers the Hello itself; for the
     /// `Register` it answers in the portal's stead when the portal cannot:
-    /// an error when the activation fails (on systemd's clock, not ours),
-    /// `NoReply` when the portal goes without answering. The bus side going
-    /// settles it too ([`Conn::bus_gone`]). A portal alive and stuck holds
-    /// the connection until it is restarted — as GTK's own wait for the
-    /// portal's settings at start does.
+    /// an error when the activation fails, `NoReply` when the portal goes
+    /// without answering. The bus side going settles it too
+    /// ([`Conn::bus_gone`]), and the program's side going ends the wait for a
+    /// call ([`Conn::settle`]). A portal alive and stuck (or stopped: a
+    /// program of any zone can `kill -STOP` it, LEAK-MODEL §16) holds only
+    /// what would reach it — a program's calls to the portal and what the
+    /// program sends after them — until it is restarted, as it holds GTK's
+    /// own wait for its settings at start.
     fn wait_while(&self, waiting: impl Fn(&Stage) -> bool) {
         let mut reg = self.registration();
         while waiting(&reg.stage) {
@@ -718,13 +721,73 @@ impl Conn {
         false
     }
 
-    /// The bus side is gone: nobody is to wait for its answers.
+    /// The bus side is gone: nobody is to wait for its answers — whatever
+    /// the stage, short of settled: a `Register` about to be sent after this
+    /// would otherwise be waited for with nobody left to answer it.
     fn bus_gone(&self) {
         let mut reg = self.registration();
-        if matches!(reg.stage, Stage::Hello(_) | Stage::Register(_)) {
+        if reg.stage != Stage::Done {
             reg.stage = Stage::Closed;
         }
         self.settled.notify_all();
+    }
+
+    /// The program's side went while its call waited for our `Register`:
+    /// nobody is left to hold it for.
+    fn program_gone(&self) {
+        let mut reg = self.registration();
+        if matches!(reg.stage, Stage::Register(_)) {
+            reg.stage = Stage::Closed;
+        }
+        self.settled.notify_all();
+    }
+
+    /// Before a call that may reach the portal ([`may_reach_portal`]): wait
+    /// while our `Register` is unanswered, as long as it takes — see
+    /// [`Conn::wait_while`] for who ends it. And while it waits, the
+    /// program's side is watched: a program gone does not keep its
+    /// connection (and one of the filter's few) held. `false`: it went.
+    fn settle(&self, client: RawFd) -> bool {
+        if !matches!(self.registration().stage, Stage::Register(_)) {
+            return true;
+        }
+        let Ok((wake_r, wake_w)) = sys::pipe() else {
+            self.wait_while(|s| matches!(s, Stage::Register(_)));
+            return true;
+        };
+        let gone = AtomicBool::new(false);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut fds = [
+                    libc::pollfd {
+                        fd: client,
+                        events: libc::POLLRDHUP,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: wake_r.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                loop {
+                    // SAFETY: two valid pollfds for the duration of the call.
+                    let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+                    if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+                if fds[1].revents == 0 && fds[0].revents != 0 {
+                    gone.store(true, Ordering::SeqCst);
+                    self.program_gone();
+                }
+            });
+            self.wait_while(|s| matches!(s, Stage::Register(_)));
+            // SAFETY: a valid descriptor and one byte.
+            let _ = unsafe { libc::write(wake_w.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+        });
+        !gone.load(Ordering::SeqCst)
     }
 
     /// The portal that took the zone's id for this connection, if one did.
@@ -787,13 +850,15 @@ fn is_hello(h: &Header) -> bool {
 /// Who the connection is to the portal (LEAK-MODEL §23): with the program's
 /// Hello gone up, our own `Register(<portal_app>, {})` — once the bus has
 /// answered the Hello, so that the connection has its name — on the
-/// program's connection, and the program's next messages held, in order and
-/// with their descriptors, until the portal answers. They are held simply by
-/// not being read: this is the only reader of the program's side.
+/// program's connection. From the program's first call the portal may see
+/// ([`may_reach_portal`]) on, its messages are held, in order and with their
+/// descriptors, until the portal answers; what it sends the bus and other
+/// names before that goes on. They are held simply by not being read: this
+/// is the only reader of the program's side.
 ///
 /// The portal takes an id only before the first call it sees from a
 /// connection ("Registered too late") and only once, so ours goes first, and
-/// nothing of the program's passes until the portal has settled it: a call
+/// nothing the portal may see passes until the portal has settled it: a call
 /// handled beside a `Register` still in the portal's hands could make the
 /// connection a nameless one after all. The program cannot answer for us
 /// either: its own `Register` is refused (`refused`), and the answer to ours
@@ -810,11 +875,20 @@ fn register(conn: &Conn, ctx: &Ctx, up: RawFd, hello: &Header) -> io::Result<()>
         return Ok(());
     };
     conn.wait_while(|s| matches!(s, Stage::Hello(_)));
+    let serial = register_serial(hello.serial);
+    // Looked at and moved on under one lock: the bus side going in between
+    // (`bus_gone`) would leave a `Register` waited for with nobody to
+    // answer it.
     let welcomed = {
         let mut reg = conn.registration();
         let stage = reg.stage.clone();
-        if stage != Stage::Welcomed(true) && stage != Stage::Closed {
-            reg.stage = Stage::Done;
+        match stage {
+            Stage::Welcomed(true) => {
+                reg.stage = Stage::Register(serial);
+                reg.outstanding = Some(serial);
+            }
+            Stage::Closed => {}
+            _ => reg.stage = Stage::Done,
         }
         stage
     };
@@ -831,12 +905,6 @@ fn register(conn: &Conn, ctx: &Ctx, up: RawFd, hello: &Header) -> io::Result<()>
             return Ok(());
         }
     }
-    let serial = register_serial(hello.serial);
-    {
-        let mut reg = conn.registration();
-        reg.stage = Stage::Register(serial);
-        reg.outstanding = Some(serial);
-    }
     let call = wire::message(
         wire::METHOD_CALL,
         0,
@@ -850,9 +918,21 @@ fn register(conn: &Conn, ctx: &Ctx, up: RawFd, hello: &Header) -> io::Result<()>
         ],
         &body::register(app),
     );
-    send_all(up, &call, &[])?;
-    conn.wait_while(|s| *s == Stage::Register(serial));
-    Ok(())
+    // Not waited for here: the program's calls that may reach the portal
+    // wait for the answer (`Conn::settle`); what goes elsewhere before them
+    // goes on.
+    send_all(up, &call, &[])
+}
+
+/// A call the portal may see: to its name, or to a unique name — which may
+/// be the portal's (GDBus calls a name's owner by its unique name once it
+/// knows it). Such a call waits for our `Register` to be settled; calls to
+/// the bus and to other names, signals and replies do not.
+fn may_reach_portal(h: &Header) -> bool {
+    h.kind == wire::METHOD_CALL
+        && h.destination
+            .as_deref()
+            .is_some_and(|d| d == PORTAL || d.starts_with(':'))
 }
 
 /// All of `data`, the descriptors with its first byte.
@@ -1195,6 +1275,12 @@ fn client_to_bus(
                 register(conn, ctx, up, &h)?;
                 continue;
             }
+            // The first call that may reach the portal waits for our
+            // `Register` to be settled — and everything after it with it,
+            // unread, in order; what went before it is up already.
+            if may_reach_portal(&h) && !conn.settle(client.as_raw_fd()) {
+                return Ok(());
+            }
             match door(&h) {
                 // The descriptors of an answered call are dropped — closed.
                 Some(which @ (Door::Network | Door::Proxy)) => answer_value(conn, ctx, &h, which)?,
@@ -1455,8 +1541,9 @@ struct OwnConn {
 
 impl OwnConn {
     fn open(upstream: &Path) -> Option<Self> {
-        // No clock of ours: the bus answers every call, with an error of its
-        // own for a callee that never does, or the connection ends.
+        // No clock of ours: what is asked on it is the bus's own (the
+        // portal's owner, answered at once) or asked from a thread of its own
+        // (a notice, `notify`) — a callee that never answers holds only that.
         let mut stream = UnixStream::connect(upstream).ok()?;
         // SAFETY: getuid(2) cannot fail and takes no pointers.
         let uid = unsafe { libc::getuid() }.to_string();
@@ -1497,7 +1584,8 @@ impl OwnConn {
         Some(conn)
     }
 
-    /// A method call and its reply (or error), within the read timeout.
+    /// A method call and its reply (or error), or `None` when the connection
+    /// ends first.
     fn call(
         &mut self,
         dest: &str,
@@ -1565,9 +1653,21 @@ fn notify(ctx: &Ctx, summary: &str, text: &str) {
         *last = Some(Instant::now());
     }
     // In a thread of its own: a notification daemon slow to answer holds
-    // nothing of the program's.
+    // nothing of the program's. One at a time: a daemon that never answers
+    // holds one thread, not one per notice.
+    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    if IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let (upstream, summary, text) = (ctx.upstream.clone(), summary.to_owned(), text.to_owned());
     thread::spawn(move || {
+        struct Landed;
+        impl Drop for Landed {
+            fn drop(&mut self) {
+                IN_FLIGHT.store(false, Ordering::SeqCst);
+            }
+        }
+        let _landed = Landed;
         let Some(mut conn) = OwnConn::open(&upstream) else {
             return;
         };
@@ -2232,6 +2332,71 @@ mod tests {
     /// The program cannot name itself or answer for us: its own `Register`,
     /// pipelined right behind its Hello, waits behind ours and is refused;
     /// a Hello under our serial moves ours aside.
+    /// Only what the portal may see waits for it: a call to another name
+    /// goes up at once — a portal that is stuck (or stopped by a program of
+    /// any zone) holds nothing else of the program's.
+    #[test]
+    fn only_a_call_the_portal_may_see_waits_for_it() {
+        let mut s = Served::start("other", Some("cellward.zone.nl"), |c| c);
+        let mut first = AUTH.to_vec();
+        first.extend(hello(1));
+        first.extend(method(
+            2,
+            "org.freedesktop.Notifications",
+            "org.freedesktop.Notifications",
+            "GetServerInformation",
+            0,
+        ));
+        first.extend(method(3, PORTAL, SETTINGS, "Read", 0));
+        first.extend(method(4, "org.freedesktop.Notifications", "x.y", "Z", 0));
+        s.program.send(&first, &[]);
+        s.authenticated();
+        let (_, h, _) = s.bus.message();
+        assert_eq!(h.member.as_deref(), Some("Hello"));
+        s.bus.send(&reply_to(1, "org.freedesktop.DBus"), &[]);
+        let (msg, h, _) = s.bus.message();
+        assert_register(&msg, &h, REGISTER_SERIAL);
+        let (_, h, _) = s.bus.message();
+        assert_eq!(h.serial, 2, "a call to another name waited for the portal");
+        // The portal's call waits, and what came after it waits behind it.
+        assert!(s.bus.quiet(HELD));
+        s.bus.send(&reply_to(REGISTER_SERIAL, ":1.7"), &[]);
+        let (_, h, _) = s.bus.message();
+        assert_eq!(h.serial, 3);
+        let (_, h, _) = s.bus.message();
+        assert_eq!(h.serial, 4);
+        assert_eq!(s.portal().as_deref(), Some(":1.7"));
+    }
+
+    /// A program gone while its call waits for the portal is let go: its
+    /// connection — one of the filter's few — does not stay held.
+    #[test]
+    fn a_program_gone_while_it_waits_is_let_go() {
+        let mut s = Served::start("gone", Some("cellward.zone.nl"), |c| c);
+        let mut first = AUTH.to_vec();
+        first.extend(hello(1));
+        first.extend(method(2, PORTAL, SETTINGS, "Read", 0));
+        s.program.send(&first, &[]);
+        s.authenticated();
+        let (_, h, _) = s.bus.message();
+        assert_eq!(h.member.as_deref(), Some("Hello"));
+        s.bus.send(&reply_to(1, "org.freedesktop.DBus"), &[]);
+        let (msg, h, _) = s.bus.message();
+        assert_register(&msg, &h, REGISTER_SERIAL);
+        assert!(s.bus.quiet(HELD));
+        // The program goes; the portal still says nothing.
+        let _ = s.program.stream.shutdown(std::net::Shutdown::Both);
+        // The filter hangs up its end of the bus: the end of the stream, not
+        // the test's patience running out.
+        let mut buf = [0u8; 64];
+        let got = sys::recv_into_with_fds(s.bus.stream.as_raw_fd(), &mut buf, 1).map(|r| r.0);
+        assert_eq!(
+            got.ok(),
+            Some(0),
+            "the connection stayed held after its program went"
+        );
+    }
+
     #[test]
     fn the_programs_own_register_is_refused_after_ours() {
         let mut s = Served::start("theirs", Some("cellward.zone.nl"), |c| c);

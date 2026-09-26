@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -713,9 +714,90 @@ fn ask_menu(tools: &Tools, menu: &crate::window::Menu) -> Option<String> {
     crate::dialog::ask(&tools.kdialog, &argv)
 }
 
-/// When a restart says that the program is still closing. Only that: the
-/// restart waits for the program however long it takes.
+/// When a restart asks what to do about a program still closing. Only that:
+/// no clock decides — the program closing does, or the person.
 const SAY_CLOSING_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A program asked to close for a restart that has not closed yet: the
+/// person decides, while it goes on closing (it may be asking whether to
+/// save). "Wait" is the default — Enter changes nothing; "close now" kills
+/// it, and what is unsaved is lost — pressed sooner than
+/// [`crate::dialog::TOO_FAST`] after the question it is taken for a key
+/// meant for something else, and waits; Esc cancels the restart. The program
+/// closing meanwhile answers the question: the dialog goes. `true`: it
+/// closed, and the restart goes on — its launch window asks, and can be
+/// closed.
+fn closed_after_all(tools: &Tools, label: &str, program: &OwnedFd) -> bool {
+    let shown = label.replace('<', "‹").replace('>', "›").replace('&', "＆");
+    let text = format!(
+        "«{shown}» ещё не закрылась — может быть, спрашивает, сохранить ли. \
+         Перезапуск будет, когда она закроется."
+    );
+    let asked = std::time::Instant::now();
+    let dialog = Command::new(&tools.kdialog)
+        .args(["--title", crate::dialog::APP, "--warningyesnocancel"])
+        .arg(&text)
+        .args([
+            "--yes-label",
+            "Ждать",
+            "--no-label",
+            "Закрыть сразу",
+            "--cancel-label",
+            "Отменить перезапуск",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let (mut dialog, dialog_fd) = match dialog {
+        Ok(child) => match crate::sys::pidfd_open(child.id() as i32) {
+            Some(fd) => (child, fd),
+            None => {
+                let mut child = child;
+                let _ = child.kill();
+                let _ = child.wait();
+                crate::sys::pidfd_wait_end(program);
+                return true;
+            }
+        },
+        // Nowhere to ask: waited for, as the restart asked.
+        Err(_) => {
+            crate::sys::pidfd_wait_end(program);
+            return true;
+        }
+    };
+    let pollin = |fd: &OwnedFd| libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut fds = [pollin(program), pollin(&dialog_fd)];
+    loop {
+        // SAFETY: two valid pollfds for the duration of the call.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if rc < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
+    }
+    if fds[0].revents != 0 {
+        let _ = dialog.kill();
+        let _ = dialog.wait();
+        return true;
+    }
+    match dialog.wait().ok().and_then(|s| s.code()) {
+        Some(1) if crate::dialog::not_too_soon(asked).is_ok() => {
+            crate::sys::pidfd_signal(program, libc::SIGKILL);
+            crate::sys::pidfd_wait_end(program);
+            true
+        }
+        Some(0 | 1) => {
+            crate::sys::pidfd_wait_end(program);
+            true
+        }
+        _ => false,
+    }
+}
 
 /// `vpn-zone window-menu`: what can be done with the program of the focused
 /// window — for a key binding of the compositor.
@@ -824,16 +906,14 @@ pub fn menu(tools: &Tools) -> u8 {
             // Waited for as long as closing takes, no clock of ours: a program
             // asking whether to save, or slow on a loaded machine, is closing
             // all the same, and a deadline would cancel the restart exactly
-            // then. Said when it is not quick, so that the launch window
-            // coming up later is no surprise — it asks, and can be closed.
+            // then. When it is not quick, the person decides
+            // (`closed_after_all`).
             if let Some(fd) = &target {
                 crate::sys::pidfd_signal(fd, libc::SIGTERM);
-                if !crate::sys::pidfd_wait(fd, SAY_CLOSING_AFTER) {
-                    notify(
-                        &label,
-                        "Ещё закрывается — окно запуска появится, когда она закроется",
-                    );
-                    crate::sys::pidfd_wait_end(fd);
+                if !crate::sys::pidfd_wait(fd, SAY_CLOSING_AFTER)
+                    && !closed_after_all(tools, &label, fd)
+                {
+                    return 0;
                 }
             }
             // Through the picker, asked: the launch window with both questions.
