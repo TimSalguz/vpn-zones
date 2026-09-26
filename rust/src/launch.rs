@@ -969,8 +969,9 @@ pub fn run(tools: &Tools, argv: &[OsString]) -> u8 {
             // and a failure here is deliberately ignored, because the check
             // below says the same thing in words a user can act on.
             // Returns once the zone is ready or failed (`Type=notify`,
-            // `cli::started_up`): no clock of ours.
-            let _ = cli::systemctl(tools, "start", &zone);
+            // `cli::started_up`): no clock of ours — and says so while it
+            // waits (`cli::start_zone`).
+            let _ = cli::start_zone(tools, &zone, true);
             pid = cli::zone_up(&tools.state, &zone);
         }
         let Some(pid) = pid else {

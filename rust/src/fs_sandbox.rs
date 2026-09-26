@@ -1027,12 +1027,9 @@ fn socket_at(path: PathBuf) -> Option<PathBuf> {
 /// as that takes, or until the helper ends without it (`None`). No clock: on
 /// a loaded machine a helper comes up late, and a deadline would start the
 /// program without its bus exactly there.
-fn helper_socket(socket: &Path, child: &Child) -> Option<PathBuf> {
-    let pidfd = crate::sys::pidfd_open(child.id() as i32)?;
-    crate::sys::wait_for_entry(socket, Some(&pidfd), |p| {
-        socket_at(p.to_path_buf()).is_some()
-    })
-    .then(|| socket.to_path_buf())
+fn helper_socket(socket: &Path, child: &mut Child) -> Option<PathBuf> {
+    crate::sys::wait_for_child_entry(socket, child, |p| socket_at(p.to_path_buf()).is_some())
+        .then(|| socket.to_path_buf())
 }
 
 /// Where the scratch directories go: below our part of the runtime directory
@@ -1142,7 +1139,7 @@ fn start_bus_proxy(tool: &Path, socket: &Path, runtime: &Path) -> (Option<Child>
         });
     // The output goes to /dev/null: an open stdout of the proxy makes the call
     // look like it is hanging long after the program has finished.
-    let child = match Command::new(tool)
+    let mut child = match Command::new(tool)
         .arg(address)
         .arg(socket)
         .arg("--filter")
@@ -1164,7 +1161,7 @@ fn start_bus_proxy(tool: &Path, socket: &Path, runtime: &Path) -> (Option<Child>
 
     // As long as it takes, or until the proxy ends without it — on a
     // machine with no session bus at all (a CI runner, a tty login) at once.
-    if let Some(path) = helper_socket(socket, &child) {
+    if let Some(path) = helper_socket(socket, &mut child) {
         return (Some(child), Some(path));
     }
     eprintln!("fs-sandbox: the D-Bus proxy ended before its socket was there — the program gets no session bus");
@@ -1201,7 +1198,7 @@ fn start_bus_filter(
     if let Some(app) = portal_app {
         command.arg("--portal-app").arg(app);
     }
-    let child = match command.stdin(Stdio::null()).stdout(Stdio::null()).spawn() {
+    let mut child = match command.stdin(Stdio::null()).stdout(Stdio::null()).spawn() {
         Ok(child) => child,
         Err(e) => {
             eprintln!(
@@ -1211,7 +1208,7 @@ fn start_bus_filter(
         }
     };
     FILTER_PID.store(child.id() as i32, Ordering::SeqCst);
-    if let Some(path) = helper_socket(socket, &child) {
+    if let Some(path) = helper_socket(socket, &mut child) {
         return (Some(child), Some(path));
     }
     eprintln!("fs-sandbox: the bus filter ended before its socket was there — the program gets no session bus");
@@ -1649,7 +1646,7 @@ pub fn run_x11(args: X11Args) -> u8 {
         .stderr(Stdio::null())
         .spawn()
     {
-        Ok(satellite) => {
+        Ok(mut satellite) => {
             // Its socket first: started before it, the program dies with
             // "cannot open display". Waited for as long as it takes, or until
             // the satellite ends without it — no clock (this was one second:
@@ -1660,10 +1657,8 @@ pub fn run_x11(args: X11Args) -> u8 {
                 .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
                 .map(|n| Path::new(crate::x11::X11_DIR).join(format!("X{n}")));
             let up = socket.is_some_and(|socket| {
-                crate::sys::pidfd_open(satellite.id() as i32).is_some_and(|pidfd| {
-                    crate::sys::wait_for_entry(&socket, Some(&pidfd), |p| {
-                        fs::symlink_metadata(p).is_ok()
-                    })
+                crate::sys::wait_for_child_entry(&socket, &mut satellite, |p| {
+                    fs::symlink_metadata(p).is_ok()
                 })
             });
             if !up {

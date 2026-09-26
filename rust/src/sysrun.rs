@@ -1023,6 +1023,7 @@ fn spawn_uplink_pasta(
     netns: &OwnedFd,
     pid: i32,
     user: &User,
+    pid_file: Option<&Path>,
 ) -> Result<std::process::Child, String> {
     use std::os::unix::process::CommandExt;
     let sysnet_fd = sysnet.as_raw_fd();
@@ -1068,6 +1069,12 @@ fn spawn_uplink_pasta(
         ])
         .args(zone::PASTA_CLOSED)
         .stdin(std::process::Stdio::null());
+    // Its word that it is done (`serve_uplink`), made for the user it runs as.
+    if let Some(path) = pid_file {
+        crate::sys::pid_file_for(path, uid, gid)
+            .map_err(|e| format!("cannot make {}: {e}", path.display()))?;
+        cmd.arg("-P").arg(path);
+    }
     // SAFETY: only async-signal-safe syscalls between fork and exec.
     unsafe {
         cmd.pre_exec(move || {
@@ -1177,29 +1184,40 @@ fn serve_uplink(
     .map(|a| a.ip().to_string())
     .collect();
 
-    let mut pasta = spawn_uplink_pasta(&sysnet, &userns, &netns, pid, &user)?;
+    system::make_pasta_pid_dir()?;
+    let pid_file =
+        Path::new(system::PASTA_PID_DIR).join(format!("sysrun-{}.pid", std::process::id()));
+    let mut pasta = spawn_uplink_pasta(&sysnet, &userns, &netns, pid, &user, Some(&pid_file))?;
     // The namespace pasta was started in: the one to follow if it changes.
     let mut serving = file_ns_id(&sysnet);
     drop(sysnet);
-    // Attached once its interface is in the zone's namespace: as long as that
-    // takes, woken by the kernel's news of that namespace, or pasta ends
-    // without it — said as a refusal, not as an uplink that ends a moment
-    // later. No clock (this was 300 ms, and a slow pasta was taken for one
-    // that had attached).
-    let pidfd = sys::pidfd_open(pasta.id() as i32)
-        .ok_or_else(|| format!("cannot watch pasta: {}", io::Error::last_os_error()))?;
-    let interface = CString::new(zone::TUN_IFACE).map_err(|e| e.to_string())?;
-    // SAFETY: a NUL-terminated name; the lookup is in the calling thread's
-    // network namespace, the zone's there.
-    let attached = sys::wait_for_network_in(&netns, Some(&pidfd), || unsafe {
-        libc::if_nametoindex(interface.as_ptr()) != 0
-    })
-    .map_err(|e| format!("cannot wait for pasta: {e}"))?;
-    if !attached {
-        let status = pasta
-            .wait()
-            .map_or_else(|e| e.to_string(), |s| s.to_string());
-        return Err(format!("pasta could not attach ({status})"));
+    // Attached once pasta says it is done — its pid file written, the zone's
+    // namespace configured — as long as that takes, or until pasta ends
+    // without it (said as a refusal, not as an uplink that ends a moment
+    // later), or the client goes (nobody left to answer: pasta goes too). No
+    // clock (this was 300 ms, and a slow pasta was taken for one that had
+    // attached).
+    let attached = match sys::pidfd_open(pasta.id() as i32) {
+        Some(pidfd) => sys::wait_for_entry_or(&pid_file, Some(&pidfd), Some(sock), sys::written),
+        None if sys::wait_for_child_entry(&pid_file, &mut pasta, sys::written) => {
+            sys::Waited::There
+        }
+        None => sys::Waited::MakerGone,
+    };
+    let _ = fs::remove_file(&pid_file);
+    match attached {
+        sys::Waited::There => {}
+        sys::Waited::PeerGone => {
+            let _ = pasta.kill();
+            let _ = pasta.wait();
+            return Err("the zone went before pasta was done".to_owned());
+        }
+        sys::Waited::MakerGone => {
+            let status = pasta
+                .wait()
+                .map_or_else(|e| e.to_string(), |s| s.to_string());
+            return Err(format!("pasta could not attach ({status})"));
+        }
     }
     println!(
         "sysrun: a zone of {} goes out through the system zone {zone}",
@@ -1262,7 +1280,7 @@ fn serve_uplink(
                     );
                     return Ok(answer_exit(1));
                 }
-                match spawn_uplink_pasta(&file, &userns, &netns, pid, &user) {
+                match spawn_uplink_pasta(&file, &userns, &netns, pid, &user, None) {
                     Ok(child) => {
                         pasta = Some(child);
                         serving = Some(id);

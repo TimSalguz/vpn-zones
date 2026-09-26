@@ -161,6 +161,9 @@ const START: &str = "zone.start";
 /// stray pasta by the number in its command line.
 const UPLINK_PID: &str = "uplink.pid";
 const READY: &str = "ready";
+/// pasta's pid file, the holder's pasta's word that the namespace it
+/// configures is done (`wait_for_pasta_link`, `wait_for_default_route`).
+const PASTA_PID: &str = "pasta.pid";
 const STATUS: &str = "status";
 const STATUS_TMP: &str = "status.tmp";
 const RESOLV: &str = "resolv.conf";
@@ -729,6 +732,7 @@ pub fn run(args: Args) -> u8 {
     let _ = fs::remove_file(zone.path(STATUS));
     let _ = fs::remove_file(zone.path(UPLINK_PID));
     let _ = fs::remove_file(zone.path(READY));
+    let _ = fs::remove_file(zone.path(PASTA_PID));
     // What this run comes up with, before it is up: `status --json` names what
     // has changed since (`hermetic::APPLIED`). The last run's goes first — a
     // note that cannot be written leaves "not known", never a stale one.
@@ -1449,10 +1453,14 @@ fn supervise(zone: &Zone) -> Result<u8, String> {
             );
             vec!["-4"]
         };
+        // Its word that it is done: the pid file (`wait_for_pasta_link`).
+        let _ = fs::remove_file(zone.path(PASTA_PID));
         match Command::new(&zone.tools.pasta)
             .arg("--netns")
             .arg(&netns)
             .args(["--config-net", "-q", "-I", TUN_IFACE, "-f"])
+            .arg("-P")
+            .arg(zone.path(PASTA_PID))
             .args([
                 "-a",
                 HOSTIF_GUEST4,
@@ -1601,10 +1609,14 @@ fn supervise(zone: &Zone) -> Result<u8, String> {
         drop(ready);
 
         let netns = format!("/proc/{pid}/ns/net");
+        // Its word that it is done: the pid file (`wait_for_default_route`).
+        let _ = fs::remove_file(zone.path(PASTA_PID));
         match Command::new(&zone.tools.pasta)
             .arg("--netns")
             .arg(&netns)
             .args(["--config-net", "-q", "-I", PASTA_IFACE, "-f"])
+            .arg("-P")
+            .arg(zone.path(PASTA_PID))
             .args(PASTA_CLOSED)
             .spawn()
         {
@@ -1952,7 +1964,8 @@ fn uplink_setup(zone: &Zone, links: UplinkLinks<'_>) -> Result<Option<Child>, St
     drop(ready);
 
     // Wait for pasta to configure the way out: until it has, there is no route
-    // at all and the tunnel would have nothing to send through.
+    // at all and the tunnel would have nothing to send through. Then look,
+    // once.
     wait_for_default_route(zone);
     let out = default_route(zone, Family::V4);
     let Some(dev) = out.dev else {
@@ -2035,7 +2048,7 @@ fn uplink_setup(zone: &Zone, links: UplinkLinks<'_>) -> Result<Option<Child>, St
 
 /// Start `xdg-dbus-proxy` in front of the host's system bus, listening in the
 /// zone's directory, and wait for its socket. `None` when the host has no
-/// system bus, the proxy cannot start, or its socket never appears — the zone
+/// system bus, the proxy cannot start, or it ends before its socket is there — the zone
 /// then closes the system bus altogether ([`seal_system_bus`]).
 fn start_system_bus_proxy(zone: &Zone) -> Option<Child> {
     if fs::symlink_metadata(SYSTEM_BUS).is_err() {
@@ -2099,7 +2112,7 @@ fn start_proxy(
             return None;
         }
     };
-    if socket_up(&socket, &child) {
+    if socket_up(&socket, &mut child) {
         return Some(child);
     }
     eprintln!(
@@ -2163,7 +2176,7 @@ fn start_pulse_filter(zone: &Zone) -> Option<Child> {
             return None;
         }
     };
-    if socket_up(&socket, &child) {
+    if socket_up(&socket, &mut child) {
         return Some(child);
     }
     let _ = child.kill();
@@ -2220,7 +2233,7 @@ fn start_pipewire_context(zone: &Zone) -> Option<Child> {
             return None;
         }
     };
-    if socket_up(&socket, &child) {
+    if socket_up(&socket, &mut child) {
         return Some(child);
     }
     let _ = child.kill();
@@ -2317,7 +2330,7 @@ fn start_session_filter(zone: &Zone) {
             return;
         }
     };
-    if socket_up(&socket, &child) {
+    if socket_up(&socket, &mut child) {
         return;
     }
     let _ = child.kill();
@@ -2330,11 +2343,8 @@ fn start_session_filter(zone: &Zone) {
 /// or sound away exactly there. A helper that hangs before its socket holds
 /// the zone's start — `cellward up` waits for it, and says what it waits for
 /// only in the journal; stopping the zone ends it.
-fn socket_up(socket: &Path, child: &Child) -> bool {
-    let Some(pidfd) = sys::pidfd_open(child.id() as i32) else {
-        return false;
-    };
-    sys::wait_for_entry(socket, Some(&pidfd), |p| fs::symlink_metadata(p).is_ok())
+fn socket_up(socket: &Path, child: &mut Child) -> bool {
+    sys::wait_for_child_entry(socket, child, |p| fs::symlink_metadata(p).is_ok())
 }
 
 /// The host's runtime directory of the zone's user.
@@ -3824,25 +3834,36 @@ fn wait_for_app_namespace(zone_up_r: OwnedFd) -> Result<(), String> {
     Ok(())
 }
 
-/// Wait for pasta to create and configure its interface in this namespace: the
-/// link up and a default route through it. pasta does this over netlink from
-/// outside; the kernel's news of it here wakes the look (`wait_for_network`).
-/// As long as it takes, no clock: pasta that ends instead takes the zone down
-/// (`supervise`), this process with it — pasta refusing an interface that is
-/// down says so itself, in the journal.
-fn wait_for_pasta_link(zone: &Zone) {
-    sys::wait_for_network(None, || {
-        let route =
-            tool_output(&zone.tools.ip, &["-4", "route", "show", "default"]).unwrap_or_default();
-        let route6 =
-            tool_output(&zone.tools.ip, &["-6", "route", "show", "default"]).unwrap_or_default();
-        let through = |text: &str| {
-            text.lines()
-                .map(parse_default_route)
-                .any(|r| r.dev.as_deref() == Some(TUN_IFACE))
-        };
-        through(&route) || through(&route6)
-    });
+/// Wait for pasta to create and configure its interface in this namespace,
+/// then see that it did: the link up and a default route through it.
+///
+/// Waited for is pasta's own word that it is done — its pid file written
+/// ([`PASTA_PID`], `sys::written`), "once initialisation is done" — as long
+/// as it takes, no clock: pasta that ends instead takes the zone down
+/// (`supervise`), this process with it, and says why in the journal. Then
+/// the route is looked at once: pasta done without one is a failure now, not
+/// a wait for ever. `ours`: pasta is the holder's; a system zone's
+/// (`TOOL_SYSZONE`) was done before the service answered.
+fn wait_for_pasta_link(zone: &Zone, ours: bool) -> Result<(), String> {
+    if ours {
+        sys::wait_for_entry(&zone.path(PASTA_PID), None, sys::written);
+    }
+    let route =
+        tool_output(&zone.tools.ip, &["-4", "route", "show", "default"]).unwrap_or_default();
+    let route6 =
+        tool_output(&zone.tools.ip, &["-6", "route", "show", "default"]).unwrap_or_default();
+    let through = |text: &str| {
+        text.lines()
+            .map(parse_default_route)
+            .any(|r| r.dev.as_deref() == Some(TUN_IFACE))
+    };
+    if through(&route) || through(&route6) {
+        return Ok(());
+    }
+    Err(format!(
+        "pasta brought up {TUN_IFACE} with no default route through it — is the host's interface \
+         up, with a route?"
+    ))
 }
 
 /// Ask the system-zone service for the way out through `system`
@@ -4043,9 +4064,7 @@ fn spawn_openconnect(zone: &Zone, oc: &OcZone, zone_pid: libc::pid_t) -> Result<
 /// stopping the zone.
 fn wait_for_plan(zone: &Zone, client: &mut Child) -> Result<(), String> {
     let plan = zone.path(openconnect::PLAN_FILE);
-    let pidfd = sys::pidfd_open(client.id() as i32)
-        .ok_or_else(|| format!("cannot watch openconnect: {}", io::Error::last_os_error()))?;
-    if sys::wait_for_entry(&plan, Some(&pidfd), Path::exists) {
+    if sys::wait_for_child_entry(&plan, client, Path::exists) {
         return Ok(());
     }
     match client.wait() {
@@ -4292,7 +4311,7 @@ fn zone_setup(zone: &Zone, links: Option<ZoneLinks<'_>>) -> Result<(), String> {
             let Backend::HostIf(host) = backend else {
                 return Err("pasta was attached to a zone that is not a host-interface one".into());
             };
-            wait_for_pasta_link(zone);
+            wait_for_pasta_link(zone, true)?;
             let dns: Vec<String> = host.dns.iter().map(ToString::to_string).collect();
             (dns, None, Mirror::HostIf(host.interface.clone()))
         }
@@ -4304,7 +4323,7 @@ fn zone_setup(zone: &Zone, links: Option<ZoneLinks<'_>>) -> Result<(), String> {
                         .into(),
                 );
             };
-            wait_for_pasta_link(zone);
+            wait_for_pasta_link(zone, false)?;
             // Addresses only: they go into resolv.conf as they are.
             let dns: Vec<String> = fs::read_to_string(zone.path(SYS_RESOLVERS))
                 .unwrap_or_default()
@@ -5208,13 +5227,14 @@ fn feed_nft(nft: &Path, ruleset: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Wait for pasta's default route in the uplink namespace — as long as it
-/// takes, woken by the kernel's news (`wait_for_network`): pasta that ends
-/// instead takes the zone down (`supervise`), this process with it.
+/// Wait for pasta to be done with the uplink namespace — its pid file
+/// written ([`PASTA_PID`]), as long as it takes: pasta that ends instead
+/// takes the zone down (`supervise`), this process with it. What it did is
+/// looked at after, once (`uplink_setup`): no route then is a failure, not a
+/// wait for ever (a host with no IPv4 default route, or one outside the main
+/// table, when pasta took its copy).
 fn wait_for_default_route(zone: &Zone) {
-    sys::wait_for_network(None, || {
-        !zone.ip_line(&["-4", "route", "show", "default"]).is_empty()
-    });
+    sys::wait_for_entry(&zone.path(PASTA_PID), None, sys::written);
 }
 
 fn default_route(zone: &Zone, family: Family) -> DefaultRoute {

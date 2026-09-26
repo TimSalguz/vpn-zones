@@ -234,6 +234,51 @@ pub fn started_up(state: &Path, name: &OsStr) -> bool {
     zone_up(state, name).is_some()
 }
 
+/// `systemctl start` of a zone, which returns when it is ready or its start
+/// failed — however long that takes (`started_up`). A zone that is not up
+/// yet is said to be starting, with the way to stop it, first on standard
+/// error and — `notify`, for a launch nobody watches in a terminal — on the
+/// desktop once it is taking a while: the wait has no clock of its own, and
+/// a stuck start is the person's to end.
+pub fn start_zone(tools: &Tools, name: &OsStr, notify: bool) -> u8 {
+    if zone_up(&tools.state, name).is_some() {
+        return systemctl(tools, "start", name);
+    }
+    let text = name.to_string_lossy().into_owned();
+    eprintln!("поднимаю зону {text}… (прервать: cellward down {text})");
+    let (done_w, done_r) = std::sync::mpsc::channel::<()>();
+    let notice = notify.then(|| {
+        let notify_send = tools.notify_send.clone();
+        let text = text.clone();
+        std::thread::spawn(move || {
+            if done_r.recv_timeout(SAY_STARTING_AFTER)
+                == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                crate::dialog::notify(
+                    &notify_send,
+                    None,
+                    "10000",
+                    crate::dialog::APP,
+                    &format!(
+                        "Зона {text} ещё поднимается — программа запустится, когда она \
+                         будет готова. Прервать: cellward down {text}"
+                    ),
+                );
+            }
+        })
+    });
+    let code = systemctl(tools, "start", name);
+    drop(done_w);
+    if let Some(notice) = notice {
+        let _ = notice.join();
+    }
+    code
+}
+
+/// When a launch into a zone that is starting says so on the desktop. Only
+/// that: it waits for the zone either way.
+const SAY_STARTING_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The pid of a zone that is up AND ready: its namespaces exist and its setup
 /// is over. `zone.pid` appears as soon as the namespaces do — before the host's
 /// resolvers are hidden, the system bus filtered, the runtime directory sealed,
@@ -600,7 +645,7 @@ fn up(tools: &Tools, args: &[OsString]) -> u8 {
         return 1;
     };
     // Returns when the zone is ready or its start failed (`started_up`).
-    let code = systemctl(tools, "start", name);
+    let code = start_zone(tools, name, false);
     let name_text = name.to_string_lossy();
     if code == 0 && started_up(&tools.state, name) {
         println!("зона {name_text} поднята");

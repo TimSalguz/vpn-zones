@@ -130,7 +130,8 @@ pointed elsewhere while the window is open; a shell or an interpreter is flagged
 any command, a program outside the store as replaceable. A question not answered in two
 minutes is closed. A zone that keeps asking is asked at most four times a minute and not at
 all for 15 s after a "no"; a request is refused whole past 64 KiB or an app-id past 255
-bytes and must arrive whole within 5 s; one zone holds at most four requests at once (64 in
+bytes; there is no time limit for it to arrive (2026-09-26, was 5 s), and a connection that says
+nothing holds a slot of its own zone: one zone holds at most four requests at once (64 in
 all), and puts at most 30 lines a minute into the journal, the record of crossings. (Review 2026-09-25, which also found the socket systemd passes the broker
 inherited by every program it started: it is close-on-exec now.) A container of the host's network (`unconfined` in
 `VPN_ZONE_CURRENT`) is no zone to the broker and keeps its own picker, as does a zone
