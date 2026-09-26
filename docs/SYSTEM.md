@@ -109,7 +109,9 @@ member of the group who means it: the count is per uid, and `newuidmap` gives a 
   namespace must survive switches, because every consumer bound to it would otherwise be cut
   off or restarted by every update of this package. `ExecStop` = `ns-down`.
 - `vpn-zone-system@<name>.service` — `vpn-zone-core system-zone up <name>`, the holder.
-  `Type=notify`, `BindsTo=` and `After=` the namespace unit, `After=network-online.target`.
+  `Type=notify`, `BindsTo=` and `After=` the namespace unit, `After=network-online.target`;
+  its start is bounded by systemd's `TimeoutStartSec` alone (`services.cellward.system.
+  startTimeout`, systemd's default unless set; `infinity` — as long as it takes).
   Sets the zone up (§4), says `READY=1` — so whatever is ordered after it starts with the
   tunnel and the zone's resolv.conf in place — then mirrors the status until stopped. `ExecStopPost` = `down`: the tunnel
   interface is deleted, the namespace stays with `lo` alone. `Restart=on-failure` after
@@ -276,7 +278,8 @@ A system zone's namespace belongs to the host's user namespace; entering it take
   command gets the slave as its controlling terminal, so Ctrl-C, job control and the window
   size work without a signal passing through root. Without a terminal, the client's 0, 1 and
   2 are passed. The client gone — the end of the stream or a reset, not a wait that timed
-  out — the command gets SIGHUP and SIGTERM. No other descriptor of the service reaches it.
+  out — the command gets SIGHUP and SIGTERM, and SIGKILL after `services.cellward.system.stopGrace`
+  (5s unless set, 1s…1h). No other descriptor of the service reaches it.
 - **What the command does not see**, beyond the zone's resolver and the session's sockets:
   `/run/vpn-zones` (this service's socket — a command in one zone asking for another, and
   the `vpn-zones` group is not among its groups either), the host's `/tmp`, `/var/tmp` and

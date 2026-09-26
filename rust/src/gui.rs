@@ -262,7 +262,9 @@ fn add(tools: &Tools) -> u8 {
     // (`docs/GOTCHAS.md` §4) The seconds decide only which notice is shown —
     // "not yet" is never told from "never" without some — and nothing else:
     // the zone stays up either way, so the late one is said as "not yet".
-    std::thread::sleep(std::time::Duration::from_secs(6));
+    // How many is the person's (`cellward handshake-check`, 6 s unless set).
+    let (after, _) = crate::timings::HANDSHAKE_CHECK.read(&tools.config);
+    std::thread::sleep(after.duration().unwrap_or_default());
     if cli_quiet(tools, &["check", &name]) {
         dialog::notify(
             &tools.notify_send,

@@ -809,7 +809,7 @@ fn ask(
                 "--warningcontinuecancel",
                 question.as_str(),
             ],
-            WINDOW_TIMEOUT,
+            question_timeout(tools),
         ) == Some(0)
         {
             crate::dialog::not_too_soon(asked)
@@ -832,7 +832,7 @@ fn ask(
             "--warningyesnocancel",
             question.as_str(),
         ],
-        WINDOW_TIMEOUT,
+        question_timeout(tools),
     ) {
         Some(0) => crate::dialog::not_too_soon(asked),
         Some(1) => {
@@ -848,8 +848,13 @@ fn ask(
 }
 
 /// How long a question waits for its answer: past it the window or dialog
-/// is closed, and the request refused.
-const WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// is closed, and the request refused. The person's setting
+/// (`cellward question-timeout`, `crate::timings::QUESTION`; 2 minutes
+/// unless set); `None`, never: the question waits for its answer, and the
+/// next ones are refused meanwhile ([`ASKING`]).
+fn question_timeout(tools: &Tools) -> Option<std::time::Duration> {
+    crate::timings::QUESTION.read(&tools.config).0.duration()
+}
 
 /// One question at a time, a window or a dialog: a stream of them is how a
 /// "yes" is got by accident. The next request while one is open is refused,
@@ -985,7 +990,14 @@ fn handle_pick(tools: &Tools, origin: &Origin, app_id: &OsString, cmd: &[OsStrin
                 .to_owned()
         }
     };
-    let result = pick_and_check(&zone, locked, app_id, cmd, &origin.name());
+    let result = pick_and_check(
+        &zone,
+        locked,
+        app_id,
+        cmd,
+        &origin.name(),
+        question_timeout(tools),
+    );
     let (answer, target) = match result {
         Ok(argv) => {
             let target = argv
@@ -1023,13 +1035,14 @@ fn pick_and_check(
     app_id: &OsString,
     cmd: &[OsString],
     origin: &str,
+    timeout: Option<std::time::Duration>,
 ) -> Result<Vec<OsString>, String> {
     let cmd = host_command(cmd)?;
     let Ok(_asking) = ASKING.try_lock() else {
         return Err("уже открыт другой вопрос о запуске".to_owned());
     };
     begin_asking(origin)?;
-    ask_window(zone, locked, app_id, &cmd, origin, None).map(|(argv, _)| argv)
+    ask_window(zone, locked, app_id, &cmd, origin, None, timeout).map(|(argv, _)| argv)
 }
 
 /// The command a zone asks for as the host runs it: shown whole, someone to
@@ -1072,6 +1085,7 @@ fn ask_window(
     cmd: &[OsString],
     origin: &str,
     offer_rule: Option<&str>,
+    timeout: Option<std::time::Duration>,
 ) -> Result<(Vec<OsString>, bool), String> {
     let exe = own_binary()?;
     let picker = exe.with_file_name("vpn-zone-pick");
@@ -1102,12 +1116,13 @@ fn ask_window(
     let mut child = command
         .spawn()
         .map_err(|e| format!("не открыть окно запуска ({}): {e}", picker.display()))?;
-    // An answer by a deadline: a window left open would keep every other
-    // zone's question out.
+    // An answer by the person's deadline (`question_timeout`): a window left
+    // open keeps every other zone's question out. None set: as long as it
+    // takes.
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if asked.elapsed() < WINDOW_TIMEOUT => {
+            Ok(None) if timeout.is_none_or(|t| asked.elapsed() < t) => {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             _ => {
@@ -1384,6 +1399,7 @@ fn link_answer(
             &cmd,
             &origin.name(),
             offer.as_deref(),
+            question_timeout(tools),
         )
     });
     let (argv, keep) = match chosen {

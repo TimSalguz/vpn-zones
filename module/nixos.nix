@@ -42,6 +42,8 @@ let
   renamedOptions = [
     "enable"
     "switchGroup"
+    "stopGrace"
+    "startTimeout"
     "users"
     "zones"
     "services"
@@ -348,6 +350,46 @@ in
         cellward off entirely — zones, the egress policy, services back on the
         host's network — with no rebuild and no network, until turned on again.
         This turns polkit on. `null`: root only.
+      '';
+    };
+
+    stopGrace = lib.mkOption {
+      type = lib.types.nullOr (
+        lib.types.addCheck (lib.types.strMatching "[1-9][0-9]{0,4}[smh]") (
+          t:
+          let
+            m = builtins.match "([0-9]+)([smh])" t;
+            secs =
+              lib.toInt (builtins.elemAt m 0)
+              * {
+                s = 1;
+                m = 60;
+                h = 3600;
+              }.${builtins.elemAt m 1};
+          in
+          secs >= 1 && secs <= 3600
+        )
+      );
+      default = null;
+      example = "30s";
+      description = ''
+        How long a command run with `vpn-zone-sys` gets to end after its client
+        has gone (the terminal closed): it is sent SIGHUP and SIGTERM, and
+        SIGKILL after this — nothing it started outlives the client. 1s…1h.
+        `null`: 5s.
+      '';
+    };
+
+    startTimeout = lib.mkOption {
+      type = lib.types.nullOr (lib.types.strMatching "infinity|[1-9][0-9]{0,5}(s|min|h)");
+      default = null;
+      example = "infinity";
+      description = ''
+        `TimeoutStartSec` of a system zone's unit: how long its start (the
+        tunnel, pasta, the zone's resolv.conf) may take before systemd gives
+        up on it — cellward adds no clock of its own there. `infinity`: as
+        long as it takes; a stuck start is then ended by stopping the unit.
+        `null`: systemd's default.
       '';
     };
 
@@ -802,6 +844,11 @@ in
             # При загрузке endpoint может ещё не разрешаться.
             Restart = "on-failure";
             RestartSec = "10s";
+          }
+          # Свой срок старта, если задан (startTimeout): своих часов cellward
+          # здесь не добавляет, срок — systemd.
+          // lib.optionalAttrs (cfg.startTimeout != null) {
+            TimeoutStartSec = cfg.startTimeout;
           };
         };
         systemd.targets.multi-user.wants = map (name: "${holderUnit name}.service") (
@@ -871,6 +918,11 @@ in
               # Выход пользовательской зоны через системную (SYSTEM.md §7b):
               # pasta в сети системной зоны, от имени пользователя.
               "VPN_ZONE_PASTA=${passtPatched}/bin/pasta"
+            ]
+            # Сколько команда, чей клиент ушёл, получает на то, чтобы
+            # закончиться (stopGrace; без него 5s).
+            ++ lib.optionals (cfg.stopGrace != null) [
+              "VPN_ZONE_STOP_GRACE=${cfg.stopGrace}"
             ];
             # Войти в пространство и смонтировать своё (SYS_ADMIN), стать
             # пользователем (SETUID, SETGID), погасить его программу или pasta,

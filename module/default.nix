@@ -497,6 +497,14 @@ let
   askAgainTerm = lib.types.addCheck (lib.types.strMatching "[1-9][0-9]{0,5}[smhd]") (
     t: termSeconds t >= 30 && termSeconds t <= 86400
   );
+  # The waits that end by a clock on purpose (rust/src/timings.rs): the same
+  # bounds as there.
+  questionTerm = lib.types.addCheck (lib.types.strMatching "never|[1-9][0-9]{0,5}[smhd]") (
+    t: t == "never" || (termSeconds t >= 30 && termSeconds t <= 86400)
+  );
+  handshakeTerm = lib.types.addCheck (lib.types.strMatching "[1-9][0-9]{0,5}[smhd]") (
+    t: termSeconds t >= 1 && termSeconds t <= 600
+  );
 
   # Имя контейнера попадает в путь, в имя файла и в имя деривации.
   # Не `__…` и не слова, которые меню используют как свои метки: контейнер с
@@ -712,6 +720,8 @@ let
     "microphone"
     "screencast"
     "askAgainAfter"
+    "questionTimeout"
+    "handshakeCheckAfter"
     "hermetic.default"
     "hermetic.exceptions"
     "pathShims.enable"
@@ -934,6 +944,20 @@ in
       default = null;
       example = "10m";
       description = "Через сколько после отказа снова спросить о разрешении (сейчас — микрофон): до того запросы программ зоны отказаны без вопроса, чтобы программа, которая переподключается после каждого «нет», не держала диалог открытым в ожидании случайного Enter. Срок — число и единица: 30s…1d (45s, 3m, 1h). null — не задавать из Nix (тогда cellward ask-again <срок>, иначе 3m). Действует сразу, без перезапуска зон.";
+    };
+
+    questionTimeout = lib.mkOption {
+      type = lib.types.nullOr questionTerm;
+      default = null;
+      example = "never";
+      description = "Сколько вопрос брокера (окно запуска из зоны, «открыть в другой сети?») ждёт ответа, прежде чем закрыться отказом: 30s…1d или never — без срока. Вопрос открыт один: пока он ждёт, следующие получают отказ, а не встают в очередь. null — не задавать из Nix (тогда cellward question-timeout <срок>, иначе 2m). Действует со следующего вопроса.";
+    };
+
+    handshakeCheckAfter = lib.mkOption {
+      type = lib.types.nullOr handshakeTerm;
+      default = null;
+      example = "15s";
+      description = "Сколько окно добавления зоны ждёт первого рукопожатия, прежде чем сказать, жив ли туннель: 1s…10m. Решает только, какое уведомление показать: зона остаётся поднятой в любом случае. null — не задавать из Nix (тогда cellward handshake-check <срок>, иначе 6s).";
     };
 
     hermetic.default = lib.mkOption {
@@ -1238,6 +1262,12 @@ in
     })
     (lib.mkIf (cfg.askAgainAfter != null) {
       ".config/vpn-zones/declared/ask-again".text = cfg.askAgainAfter;
+    })
+    (lib.mkIf (cfg.questionTimeout != null) {
+      ".config/vpn-zones/declared/question-timeout".text = cfg.questionTimeout;
+    })
+    (lib.mkIf (cfg.handshakeCheckAfter != null) {
+      ".config/vpn-zones/declared/handshake-check".text = cfg.handshakeCheckAfter;
     })
     (lib.mkIf (cfg.frame.width != null) {
       ".config/vpn-zones/declared/frame-width".text = toString cfg.frame.width;

@@ -128,6 +128,7 @@ pub mod sys;
 pub mod sysrun;
 pub mod system;
 pub mod sysuplink;
+pub mod timings;
 pub mod tools;
 pub mod trust;
 pub mod watch;

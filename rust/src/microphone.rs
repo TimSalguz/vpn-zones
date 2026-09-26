@@ -619,7 +619,7 @@ impl Policy {
                     "--warningyesnocancel",
                     text.as_str(),
                 ],
-                self.timeout,
+                Some(self.timeout),
             )
         } else {
             crate::dialog::choose_within(
@@ -634,7 +634,7 @@ impl Policy {
                     "--warningyesno",
                     text.as_str(),
                 ],
-                self.timeout,
+                Some(self.timeout),
             )
         };
         let answer = considered(answer_of(code, remember), asked.elapsed(), self.too_fast);

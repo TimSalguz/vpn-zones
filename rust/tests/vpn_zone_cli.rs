@@ -1694,6 +1694,32 @@ fn a_container_with_x11_gets_its_own_x_server_in_zones_only() {
     fs::remove_file(home.root.join("config/declared/ask-again")).unwrap();
     assert!(home.run(&["ask-again", "default"]).status.success());
     assert!(!home.root.join("config/ask-again").exists());
+    // The waits that end by a clock on purpose: the person's, never where
+    // that is a value, Nix's before the local one.
+    let out = home.run(&["question-timeout", "never"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("без срока"), "{}", stdout(&out));
+    assert!(!home.run(&["question-timeout", "5s"]).status.success());
+    assert!(!home.run(&["handshake-check", "never"]).status.success());
+    assert!(home.run(&["handshake-check", "20s"]).status.success());
+    let json = stdout(&home.run(&["status", "--json"]));
+    assert!(
+        json.contains(
+            "\"question_timeout\":{\"value\":\"never\",\"source\":\"local\"},\
+             \"handshake_check\":{\"value\":\"20s\",\"source\":\"local\"}"
+        ),
+        "{json}"
+    );
+    fs::write(home.root.join("config/declared/question-timeout"), "10m").unwrap();
+    assert!(!home.run(&["question-timeout", "default"]).status.success());
+    let json = stdout(&home.run(&["status", "--json"]));
+    assert!(
+        json.contains("\"question_timeout\":{\"value\":\"10m\",\"source\":\"nix\"}"),
+        "{json}"
+    );
+    fs::remove_file(home.root.join("config/declared/question-timeout")).unwrap();
+    assert!(home.run(&["question-timeout", "default"]).status.success());
+    assert!(home.run(&["handshake-check", "default"]).status.success());
     let out = home.run(&["hermetic", "nl", "off"]);
     assert!(out.status.success(), "{}", stderr(&out));
     let json = stdout(&home.run(&["status", "--json"]));
@@ -1704,7 +1730,9 @@ fn a_container_with_x11_gets_its_own_x_server_in_zones_only() {
     assert!(
         json.contains(
             "\"hermetic\":{\"value\":true,\"source\":\"default\"},\
-             \"ask_again\":{\"value\":\"3m\",\"source\":\"default\"}}"
+             \"ask_again\":{\"value\":\"3m\",\"source\":\"default\"},\
+             \"question_timeout\":{\"value\":\"2m\",\"source\":\"default\"},\
+             \"handshake_check\":{\"value\":\"6s\",\"source\":\"default\"}}"
         ),
         "{json}"
     );

@@ -114,10 +114,15 @@ where
 /// A question with a deadline: kdialog's exit code, as [`choose3`] reads it,
 /// or `None` when it could not be started, was killed, or had no answer by
 /// `timeout` — then it is killed, so that an answer given later cannot count.
+/// No `timeout`: it waits for the answer.
 /// For a question a program keeps waiting on (the microphone, which holds
 /// its request until the person answers): a dialog nobody sees must not keep
 /// the request, nor a "yes" after the program stopped waiting mean anything.
-pub fn choose_within<I, S>(kdialog: &Path, args: I, timeout: std::time::Duration) -> Option<i32>
+pub fn choose_within<I, S>(
+    kdialog: &Path,
+    args: I,
+    timeout: Option<std::time::Duration>,
+) -> Option<i32>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -133,7 +138,7 @@ where
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return status.code(),
-            Ok(None) if started.elapsed() < timeout => {
+            Ok(None) if timeout.is_none_or(|t| started.elapsed() < t) => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             _ => {

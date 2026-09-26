@@ -100,10 +100,14 @@ pub fn defaults(tools: &Tools) -> String {
     let (frame_title, frame_title_source) = crate::frame::title_mode(&tools.config);
     // How long a refused permission is not asked about again.
     let (ask_again, ask_again_source) = crate::grants::ask_again(&tools.config);
+    // The waits that end by a clock on purpose (`crate::timings`).
+    let (question, question_source) = crate::timings::QUESTION.read(&tools.config);
+    let (handshake, handshake_source) = crate::timings::HANDSHAKE_CHECK.read(&tools.config);
     format!(
         "{{\"network\":{},\"container\":{},\"launcher_mode\":{},\"compositor_restriction\":{},\
          \"wayland_proxy\":{},\"frames\":{},\"frame_width\":{},\"frame_title\":{},\
-         \"autostart_unassigned\":{},\"user_entries\":{},\"hermetic\":{},\"ask_again\":{}}}",
+         \"autostart_unassigned\":{},\"user_entries\":{},\"hermetic\":{},\"ask_again\":{},\
+         \"question_timeout\":{},\"handshake_check\":{}}}",
         sourced_str(&network, network_source),
         sourced_str(&container, container_source),
         sourced_str(&mode, mode_source),
@@ -115,7 +119,9 @@ pub fn defaults(tools: &Tools) -> String {
         sourced_str(&autostart, autostart_source),
         sourced_str(&user_entries, user_entries_source),
         sourced(hermetic.to_string(), hermetic_source),
-        sourced_str(&crate::grants::term_text(ask_again), ask_again_source)
+        sourced_str(&crate::grants::term_text(ask_again), ask_again_source),
+        sourced_str(&question.text(), question_source),
+        sourced_str(&handshake.text(), handshake_source)
     )
 }
 

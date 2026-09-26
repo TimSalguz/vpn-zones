@@ -127,8 +127,8 @@ could read the window, and starts it. The window is the question: no second one.
 is found once, by the broker, before the window: the window shows that absolute path, and it
 is what runs — `run` looks nothing up again by PATH, where a link in the home could be
 pointed elsewhere while the window is open; a shell or an interpreter is flagged as running
-any command, a program outside the store as replaceable. A question not answered in two
-minutes is closed. A zone that keeps asking is asked at most four times a minute and not at
+any command, a program outside the store as replaceable. A question not answered in two minutes is closed (`cellward question-timeout <term>|never`, Nix
+`questionTimeout`; never: no limit). A zone that keeps asking is asked at most four times a minute and not at
 all for 15 s after a "no"; a request is refused whole past 64 KiB or an app-id past 255
 bytes; there is no time limit for it to arrive (2026-09-26, was 5 s), and a connection that says
 nothing holds a slot of its own zone: one zone holds at most four requests at once (64 in

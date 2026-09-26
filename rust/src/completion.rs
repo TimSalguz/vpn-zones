@@ -112,6 +112,8 @@ const VERBS: &[&str] = &[
     "microphone",
     "screencast",
     "ask-again",
+    "question-timeout",
+    "handshake-check",
     "audio-manager",
     "doctor",
     "watch",
@@ -207,6 +209,10 @@ pub fn candidates(words: &[String], cursor: usize, snap: &Snapshot) -> Vec<Strin
             "camera" | "audio-manager" if pos == 3 => strs(&mut out, &["off", "on"]),
             "microphone" | "screencast" if pos == 3 => strs(&mut out, &["ask", "yes", "no"]),
             "ask-again" if pos == 2 => strs(&mut out, &["3m", "1m", "10m", "1h"]),
+            "question-timeout" if pos == 2 => {
+                strs(&mut out, &["2m", "5m", "30m", "never", "default"])
+            }
+            "handshake-check" if pos == 2 => strs(&mut out, &["6s", "15s", "30s", "default"]),
             "hermetic" if pos == 3 => match word(2) {
                 "--default" => strs(&mut out, &["on", "off"]),
                 _ => strs(&mut out, &["default", "on", "off"]),

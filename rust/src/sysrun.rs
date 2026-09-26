@@ -809,6 +809,8 @@ const UPLINK_MAGIC: &[u8] = b"VZP1\0";
 const KEY_MAGIC: &[u8] = b"VZK1\0";
 /// How the module names pasta for the service.
 pub const ENV_PASTA: &str = "VPN_ZONE_PASTA";
+/// The grace a command gets after its client went (`stop_grace`).
+pub const ENV_STOP_GRACE: &str = "VPN_ZONE_STOP_GRACE";
 /// The group user zones' pasta runs with in a system zone (`BRIDGE_GROUP`
 /// rule in `system::ns_up`).
 pub const BRIDGE_GROUP: &str = "vpn-zones-bridge";
@@ -1563,11 +1565,12 @@ fn serve(sock: RawFd, uid: u32, data: &[u8], fds: Vec<OwnedFd>) -> Result<u8, St
             libc::kill(-pid, libc::SIGHUP);
             libc::kill(-pid, libc::SIGTERM);
         }
-        // A command that ignores both would outlive its client for good. The
-        // group is ours while its leader lives — held by a pidfd, so a number
-        // reused is never signalled.
+        // A command that ignores both would outlive its client for good: it
+        // gets the grace the host's configuration gives it (`stopGrace`), then
+        // SIGKILL. The group is ours while its leader lives — held by a pidfd,
+        // so a number reused is never signalled.
         if let Some(leader) = sys::pidfd_open(pid) {
-            if !sys::pidfd_wait(&leader, Duration::from_secs(5)) {
+            if !sys::pidfd_wait(&leader, stop_grace()) {
                 // SAFETY: as above; the leader still runs, so the group is ours.
                 unsafe { libc::kill(-pid, libc::SIGKILL) };
             }
@@ -1634,6 +1637,16 @@ fn end_leftovers() {
             sys::pidfd_wait_end(&fd);
         }
     }
+}
+
+/// How long a command whose client went gets to end before SIGKILL:
+/// `services.cellward.system.stopGrace` ([`ENV_STOP_GRACE`]), 1s…1h, or 5 s.
+fn stop_grace() -> Duration {
+    std::env::var(ENV_STOP_GRACE)
+        .ok()
+        .and_then(|t| crate::grants::parse_term(t.trim()))
+        .filter(|secs| (1..=3_600).contains(secs))
+        .map_or(Duration::from_secs(5), Duration::from_secs)
 }
 
 /// In the child: the caller's terminal, the zone, the mounts, the user, exec.

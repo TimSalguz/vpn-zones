@@ -6,6 +6,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
 ## [Unreleased]
 
 ### Added
+- **The waits kept on purpose are settings** (the owner, 2026-09-27:
+  adjustable in stillconf; `rust/src/timings.rs`). How long a question of
+  the broker's waits for its answer — `cellward question-timeout
+  <term>|never`, `programs.cellward.questionTimeout`, 2m unless set; never:
+  as long as it takes, the next questions refused meanwhile — and how long
+  the zone-adding dialog waits for the first handshake before it says
+  whether the tunnel is alive — `cellward handshake-check <term>`,
+  `programs.cellward.handshakeCheckAfter`, 6s unless set. Both in
+  `status --json` (`settings.question_timeout`, `settings.handshake_check`,
+  with their source). On the system side: the grace a `vpn-zone-sys`
+  command gets after its client went, before SIGKILL
+  (`services.cellward.system.stopGrace`, 5s unless set), and a system
+  zone's start timeout (`services.cellward.system.startTimeout`, systemd's
+  own unless set; `infinity`). The microphone question keeps its 25 s:
+  libpulse gives up on a stream after 30, and a later "yes" would open the
+  microphone for a request nobody waits on.
 - **A container's windows have a frame colour of its own**
   (`programs.cellward.containers.<name>.frameColor`, `cellward container
   set <c> color default|<#rrggbb>`, `containers[].frame_color` in
