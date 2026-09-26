@@ -223,6 +223,37 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   told by its launch, not taken for the zone's own programs.
 
 ### Fixed
+- **A loaded machine no longer changes what happens: seven fixed waits
+  are gone** (the owner, 2026-09-26: "a slower or busy computer and it all
+  breaks"). Each one decided an outcome when it ran out; now the thing
+  itself says when it is done:
+  - the Wayland proxy is waited for until it says it is ready or its
+    channel closes (was 5 s, then the launch failed);
+  - the session bus filter holds a connection's calls until the portal
+    answers the zone's `Register` — or the bus answers for it: an error
+    when the portal cannot be started, `NoReply` when it goes without
+    answering (was 2 s, then the connection went on without the zone's id:
+    a portal started cold on a busy machine made the zone's remembered
+    screen cast ask again). The filter's own calls (the portal's owner, a
+    notice) wait for the bus the same way, a notice in a thread of its own;
+  - the doctor's walk of the reachable sockets is bounded by what it reads,
+    not by 2 s a place (which reported "not seen whole" on a slow disk), and
+    the doctor waits for its probe to the end (was 30 s, then a failed
+    check). What a program of the zone can do to hold the probe — stop it —
+    is seen as it happens (`waitid(WSTOPPED)` on its pidfd): the probe is
+    killed and the check fails, as before. The probe ignores the terminal's
+    own stops (Ctrl-Z), and a pipe someone else holds open does not keep
+    the doctor reading once the probe is gone;
+  - `vpn-zone-sys` relays a command's output to the end (was 2 s after its
+    exit, and the tail was cut);
+  - the window menu's "restart" waits for the program to close however
+    long it takes — a program asking whether to save is closing too (was
+    10 s, then the restart was cancelled). Past 2 s it says it is still
+    waiting; the launch window then comes up when it closes, and asks;
+  - the TTY console no longer sleeps 300 ms for a terminal's late answers
+    after a shell: a key is a byte outside an escape sequence, so an answer
+    (`ESC [ 0 n` holds the admin tool's `n`) is never taken for a choice,
+    however late it lands.
 - **A zone no longer reaches the devices the session's ACL opens** (audit
   2026-09-26, from inside a zone; LEAK-MODEL §19): `/dev/uinput` — a
   program of a zone made a virtual keyboard and typed into any window of

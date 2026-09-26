@@ -87,12 +87,6 @@ const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 pub const REGISTER_SERIAL: u32 = 0xFFFE_FF00;
 /// xdg-dbus-proxy's `MAX_CLIENT_SERIAL` (flatpak-proxy.c): 2^32 − 1 − 65 536.
 pub const MAX_CLIENT_SERIAL: u32 = u32::MAX - 65_536;
-/// How long a connection's first calls are held for the bus's answer to its
-/// Hello, and then for the portal's answer to our `Register`. Past that the
-/// connection goes on without an id of the zone's — the way it went before
-/// the registry, and on a portal older than it.
-const HELLO_WAIT: Duration = Duration::from_secs(2);
-const REGISTER_WAIT: Duration = Duration::from_secs(2);
 /// `Response` codes: done, and "the interaction ended some other way".
 const RESPONSE_OK: u32 = 0;
 const RESPONSE_OTHER: u32 = 2;
@@ -549,9 +543,6 @@ struct Ctx {
     via_broker: Option<String>,
     /// `--portal-app`.
     portal_app: Option<String>,
-    /// [`HELLO_WAIT`] and [`REGISTER_WAIT`]; shorter in tests.
-    hello_wait: Duration,
-    register_wait: Duration,
     /// Why a connection has no id of the zone's has been said: once per
     /// filter, not once per connection — an old portal would say it for
     /// every program.
@@ -573,8 +564,6 @@ impl Ctx {
             opener: args.opener.clone(),
             via_broker: args.via_broker.clone(),
             portal_app: args.portal_app.clone(),
-            hello_wait: HELLO_WAIT,
-            register_wait: REGISTER_WAIT,
             told_register: AtomicBool::new(false),
             screencast,
             told_unremembered: AtomicBool::new(false),
@@ -659,18 +648,22 @@ impl Conn {
         self.registry.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Wait at most `wait` while `waiting` says so of the stage.
-    fn wait_while(&self, wait: Duration, waiting: impl Fn(&Stage) -> bool) {
-        let deadline = Instant::now() + wait;
+    /// Wait while the registration is at `waiting` — as long as it takes,
+    /// no clock of ours: a portal activated cold on a loaded machine answers
+    /// late, and a guess at "too late" would make the connection nameless
+    /// on exactly such a machine. The bus answers the Hello itself; for the
+    /// `Register` it answers in the portal's stead when the portal cannot:
+    /// an error when the activation fails (on systemd's clock, not ours),
+    /// `NoReply` when the portal goes without answering. The bus side going
+    /// settles it too ([`Conn::bus_gone`]). A portal alive and stuck holds
+    /// the connection until it is restarted — as GTK's own wait for the
+    /// portal's settings at start does.
+    fn wait_while(&self, waiting: impl Fn(&Stage) -> bool) {
         let mut reg = self.registration();
         while waiting(&reg.stage) {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return;
-            }
-            reg = match self.settled.wait_timeout(reg, left) {
-                Ok((guard, _)) => guard,
-                Err(e) => e.into_inner().0,
+            reg = match self.settled.wait(reg) {
+                Ok(guard) => guard,
+                Err(e) => e.into_inner(),
             };
         }
     }
@@ -689,9 +682,8 @@ impl Conn {
         let mut reg = self.registration();
         if reg.outstanding == Some(serial) {
             reg.outstanding = None;
-            // In time only while ours is the one waited for: after the wait
-            // gave up, the program's calls went on as a nameless host
-            // application's, and a late "yes" does not make it the zone.
+            // Only while ours is the one waited for: once the bus side went
+            // (`bus_gone`), nothing is the zone's any more.
             if reg.stage != Stage::Register(serial) {
                 return true;
             }
@@ -807,8 +799,9 @@ fn is_hello(h: &Header) -> bool {
 /// either: its own `Register` is refused (`refused`), and the answer to ours
 /// never reaches it (`Conn::answered`).
 ///
-/// No answer in time, an error (an older portal, no entry for the id): the
-/// connection goes on without an id of the zone's — what it had before —
+/// An error for an answer (an older portal, no entry for the id, the bus's
+/// `NoReply` for a portal that never answers): the connection goes on
+/// without an id of the zone's — what it had before —
 /// said once. Refusing its portal calls instead would break every program on
 /// an older portal, and the id only ever narrows what the portal does
 /// (`screencast yes` needs it; nothing is let because of it).
@@ -816,7 +809,7 @@ fn register(conn: &Conn, ctx: &Ctx, up: RawFd, hello: &Header) -> io::Result<()>
     let Some(app) = ctx.portal_app.as_deref() else {
         return Ok(());
     };
-    conn.wait_while(ctx.hello_wait, |s| matches!(s, Stage::Hello(_)));
+    conn.wait_while(|s| matches!(s, Stage::Hello(_)));
     let welcomed = {
         let mut reg = conn.registration();
         let stage = reg.stage.clone();
@@ -858,23 +851,7 @@ fn register(conn: &Conn, ctx: &Ctx, up: RawFd, hello: &Header) -> io::Result<()>
         &body::register(app),
     );
     send_all(up, &call, &[])?;
-    conn.wait_while(ctx.register_wait, |s| *s == Stage::Register(serial));
-    // Settled here or by the answer, under the one lock: an answer after
-    // this is late, and changes nothing.
-    let timed_out = {
-        let mut reg = conn.registration();
-        let waiting = reg.stage == Stage::Register(serial);
-        if waiting {
-            reg.stage = Stage::Done;
-        }
-        waiting
-    };
-    if timed_out {
-        ctx.unregistered(&format!(
-            "no answer in {} ms",
-            ctx.register_wait.as_millis()
-        ));
-    }
+    conn.wait_while(|s| *s == Stage::Register(serial));
     Ok(())
 }
 
@@ -1478,11 +1455,9 @@ struct OwnConn {
 
 impl OwnConn {
     fn open(upstream: &Path) -> Option<Self> {
+        // No clock of ours: the bus answers every call, with an error of its
+        // own for a callee that never does, or the connection ends.
         let mut stream = UnixStream::connect(upstream).ok()?;
-        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .ok()?;
         // SAFETY: getuid(2) cannot fail and takes no pointers.
         let uid = unsafe { libc::getuid() }.to_string();
         let hex: String = uid.bytes().map(|b| format!("{b:02x}")).collect();
@@ -1589,17 +1564,22 @@ fn notify(ctx: &Ctx, summary: &str, text: &str) {
         }
         *last = Some(Instant::now());
     }
-    let Some(mut conn) = OwnConn::open(&ctx.upstream) else {
-        return;
-    };
-    let _ = conn.call(
-        "org.freedesktop.Notifications",
-        "/org/freedesktop/Notifications",
-        "org.freedesktop.Notifications",
-        "Notify",
-        Some(body::NOTIFY_SIGNATURE),
-        &body::notification(crate::dialog::APP, summary, text),
-    );
+    // In a thread of its own: a notification daemon slow to answer holds
+    // nothing of the program's.
+    let (upstream, summary, text) = (ctx.upstream.clone(), summary.to_owned(), text.to_owned());
+    thread::spawn(move || {
+        let Some(mut conn) = OwnConn::open(&upstream) else {
+            return;
+        };
+        let _ = conn.call(
+            "org.freedesktop.Notifications",
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications",
+            "Notify",
+            Some(body::NOTIFY_SIGNATURE),
+            &body::notification(crate::dialog::APP, &summary, &text),
+        );
+    });
 }
 
 #[cfg(test)]
@@ -1849,13 +1829,7 @@ mod tests {
                 portal_app: portal_app.map(str::to_owned),
                 zone: None,
             };
-            Self {
-                // Generous: a busy runner must not make a test of the
-                // answered case a test of the timeout.
-                hello_wait: Duration::from_secs(10),
-                register_wait: Duration::from_secs(10),
-                ..Self::new(upstream, &args, None)
-            }
+            Self::new(upstream, &args, None)
         }
     }
 
@@ -2217,15 +2191,12 @@ mod tests {
         assert_eq!((h.kind, h.reply_serial), (wire::METHOD_RETURN, Some(2)));
     }
 
-    /// No answer in time: the held calls go on without an id, and the late
-    /// answer — a "yes" among them — neither reaches the program nor makes
-    /// the connection the zone's.
+    /// A portal that never answers: the calls are held until the bus says
+    /// so itself (`NoReply`), then go on without an id — the bus's error is
+    /// the filter's, never the program's.
     #[test]
-    fn a_late_answer_is_swallowed_and_changes_nothing() {
-        let mut s = Served::start("late", Some("cellward.zone.nl"), |c| Ctx {
-            register_wait: Duration::from_millis(200),
-            ..c
-        });
+    fn a_portal_that_never_answers_is_the_buss_to_say() {
+        let mut s = Served::start("late", Some("cellward.zone.nl"), |c| c);
         let mut first = AUTH.to_vec();
         first.extend(hello(1));
         first.extend(method(2, PORTAL, SETTINGS, "Read", 0));
@@ -2235,11 +2206,20 @@ mod tests {
         s.bus.send(&reply_to(1, "org.freedesktop.DBus"), &[]);
         let (msg, h, _) = s.bus.message();
         assert_register(&msg, &h, REGISTER_SERIAL);
-        // Nothing from the portal: the call goes on after the wait.
+        // Nothing from the portal: the program's call waits — no clock.
+        assert!(s.bus.quiet(HELD));
+        // The bus says it will not come: the call goes on, without an id.
+        s.bus.send(
+            &error_to(
+                REGISTER_SERIAL,
+                "org.freedesktop.DBus.Error.NoReply",
+                "no reply",
+            ),
+            &[],
+        );
         let (_, h, _) = s.bus.message();
         assert_eq!(h.serial, 2);
         assert!(s.ctx.told_register.load(Ordering::SeqCst));
-        s.bus.send(&reply_to(REGISTER_SERIAL, ":1.7"), &[]);
         s.bus.send(&reply_to(2, ":1.7"), &[]);
         let (_, h, _) = s.program.message();
         assert_eq!(h.reply_serial, Some(1));

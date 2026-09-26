@@ -326,11 +326,12 @@ fn wait_alive(zone: &str) -> Net {
 /// the menu when it ends. A process of its own and not `sysrun::client` in
 /// this one: the client's relay leaves a thread blocked on the terminal, which
 /// would take the next key meant for the menu.
+///
+/// A terminal answers what a program printed last (a query) a moment after
+/// it is gone — sooner or later, as loaded as the machine is: the answer is
+/// never a key, however late it lands ([`next_key`]).
 fn shell_in(zone: &str) {
     shell_in_zone(zone);
-    // A terminal answers what a program printed last a moment after it is
-    // gone: the answer lands here, and the menu's own drop comes after it.
-    thread::sleep(Duration::from_millis(300));
 }
 
 fn shell_in_zone(zone: &str) {
@@ -365,15 +366,69 @@ fn read_key() -> Option<u8> {
         // SAFETY: descriptor 0 and a filled termios.
         unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) };
     }
-    let mut byte = [0u8; 1];
-    let got = io::stdin().read(&mut byte);
+    let key = next_key(&mut io::stdin().lock());
     if is_tty {
         // SAFETY: descriptor 0 and the termios read from it.
         unsafe { libc::tcsetattr(0, libc::TCSANOW, &saved) };
     }
-    match got {
-        Ok(1) => Some(byte[0]),
-        _ => None,
+    key
+}
+
+/// The next key in `input`: a byte of its own, never one of an escape
+/// sequence. What a terminal answers to a query a program printed — the
+/// console's `ESC [ ? 6 c` for its kind, `ESC [ 0 n` for its status (an `n`
+/// in it: the admin tool's key), `ESC [ <row> ; <col> R` for the cursor — is
+/// such a sequence, and so it is not a choice, whenever it arrives: no clock
+/// decides what was typed. Keys that send a sequence (arrows, F-keys — the
+/// console's F1 is `ESC [ [ A`) choose nothing either, and a lone Esc takes
+/// the key after it. `None` at the end of input.
+fn next_key(input: &mut impl Read) -> Option<u8> {
+    let mut byte = || {
+        let mut b = [0u8; 1];
+        match input.read(&mut b) {
+            Ok(1) => Some(b[0]),
+            _ => None,
+        }
+    };
+    loop {
+        let b = byte()?;
+        if b != 0x1b {
+            return Some(b);
+        }
+        match byte()? {
+            // CSI: parameters and intermediates, up to a final byte — the
+            // console's F-keys put one more `[` first.
+            b'[' => {
+                let mut first = true;
+                loop {
+                    let c = byte()?;
+                    if std::mem::take(&mut first) && c == b'[' {
+                        byte()?;
+                        break;
+                    }
+                    if (0x40..=0x7e).contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC, DCS, SOS, PM, APC: up to BEL or ST (`ESC \`).
+            b']' | b'P' | b'X' | b'^' | b'_' => {
+                let mut esc = false;
+                loop {
+                    let c = byte()?;
+                    if c == 0x07 || (esc && c == b'\\') {
+                        break;
+                    }
+                    esc = c == 0x1b;
+                }
+            }
+            // SS3: one byte more (F1–F4, keypad).
+            b'O' => {
+                byte()?;
+            }
+            // ESC and one byte.
+            _ => {}
+        }
     }
 }
 
@@ -395,6 +450,23 @@ mod tests {
         assert!(parse_config("").is_none());
         assert!(parse_config("zone=Bad_Zone\n").is_none());
         assert!(parse_config("zone=sz\nfallback=../x\n").is_none());
+    }
+
+    #[test]
+    fn a_terminals_answer_is_never_a_key() {
+        let key = |input: &[u8]| next_key(&mut io::Cursor::new(input.to_vec()));
+        assert_eq!(key(b"q"), Some(b'q'));
+        assert_eq!(key(b"\x1b[?6c\x1b[0nq"), Some(b'q'));
+        assert_eq!(key(b"\x1b[12;40Rk"), Some(b'k'));
+        assert_eq!(key(b"\x1b[[An"), Some(b'n'));
+        assert_eq!(key(b"\x1b]52;c;eA==\x07\r"), Some(b'\r'));
+        assert_eq!(key(b"\x1bP1$r0m\x1b\\x"), Some(b'x'));
+        assert_eq!(key(b"\x1bOPp"), Some(b'p'));
+        // A lone Esc takes the key after it.
+        assert_eq!(key(b"\x1bkq"), Some(b'q'));
+        // Cut short: the end of input, not a key.
+        assert_eq!(key(b"\x1b[0"), None);
+        assert_eq!(key(b""), None);
     }
 
     #[test]

@@ -713,6 +713,10 @@ fn ask_menu(tools: &Tools, menu: &crate::window::Menu) -> Option<String> {
     crate::dialog::ask(&tools.kdialog, &argv)
 }
 
+/// When a restart says that the program is still closing. Only that: the
+/// restart waits for the program however long it takes.
+const SAY_CLOSING_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// `vpn-zone window-menu`: what can be done with the program of the focused
 /// window — for a key binding of the compositor.
 pub fn menu(tools: &Tools) -> u8 {
@@ -817,16 +821,20 @@ pub fn menu(tools: &Tools) -> u8 {
                 return 0;
             }
             // No descriptor: the process was gone before the menu came up.
-            let closed = target.as_ref().is_none_or(|fd| {
+            // Waited for as long as closing takes, no clock of ours: a program
+            // asking whether to save, or slow on a loaded machine, is closing
+            // all the same, and a deadline would cancel the restart exactly
+            // then. Said when it is not quick, so that the launch window
+            // coming up later is no surprise — it asks, and can be closed.
+            if let Some(fd) = &target {
                 crate::sys::pidfd_signal(fd, libc::SIGTERM);
-                crate::sys::pidfd_wait(fd, std::time::Duration::from_secs(10))
-            });
-            if !closed {
-                notify(
-                    &label,
-                    "Программа не закрылась за 10 секунд — запуск отменён",
-                );
-                return 1;
+                if !crate::sys::pidfd_wait(fd, SAY_CLOSING_AFTER) {
+                    notify(
+                        &label,
+                        "Ещё закрывается — окно запуска появится, когда она закроется",
+                    );
+                    crate::sys::pidfd_wait_end(fd);
+                }
             }
             // Through the picker, asked: the launch window with both questions.
             let started = Command::new(&tools.runner)

@@ -623,8 +623,11 @@ fn pty_session(sock: &OwnedFd, request: &[u8]) -> Result<u8, String> {
 
     let answer = wait_answer(sock.as_raw_fd());
     // The command's last output is still on its way through the pty: the master
-    // reads until every slave is closed, which is when the unit is gone.
-    let _ = done_r.recv_timeout(Duration::from_secs(2));
+    // reads until every slave is closed, which is when the unit is gone —
+    // systemd ends whatever the command left behind with it. Waited for as
+    // long as that takes, no clock of ours: on a loaded machine a guess would
+    // cut the tail of the output off.
+    let _ = done_r.recv();
     stop.store(true, Ordering::Relaxed);
     drop(raw);
     drop(master);

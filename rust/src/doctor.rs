@@ -38,7 +38,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::cli::{visible_entries, zone_pid};
 use crate::status::string as json_string;
@@ -626,6 +627,14 @@ pub fn probe_main(args: &[OsString]) -> u8 {
         eprintln!("vpn-zone-core doctor-probe: need <uid>");
         return 2;
     };
+    // A stop is taken for a program of the zone holding the probe
+    // (`run_bounded`): the terminal's own stops (Ctrl-Z stops the doctor's
+    // whole group) do not stop it — only `SIGSTOP`, which nobody sends by
+    // accident.
+    for signal in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+        // SAFETY: setting a standard signal's disposition to "ignore".
+        unsafe { libc::signal(signal, libc::SIG_IGN) };
+    }
     let groups_shed = match as_a_program() {
         Ok(shed) => shed,
         Err(e) => {
@@ -816,12 +825,6 @@ fn closed_identities(uid: u32, hermetic: bool, nix_daemon: bool, audio_manager: 
         .join(",")
 }
 
-/// How long the doctor waits for the probe: the walk takes at most
-/// `sockets::LIMITS.deadline` per place, and the rest is quick. A program of
-/// the zone can stop the probe (`kill -STOP`: same user; signals are open,
-/// LEAK-MODEL §16) — then the doctor stops waiting and says so, rather than
-/// hang or take silence for "nothing".
-pub const PROBE_DEADLINE: Duration = Duration::from_secs(30);
 /// How much of the probe's answer the doctor reads. A report of the zone's
 /// sockets is a few kilobytes; a program that makes sockets by the hundred
 /// thousand must not make the doctor hold a gigabyte.
@@ -833,46 +836,76 @@ const PROBE_STDERR_MAX: usize = 64 * 1024;
 #[derive(Debug, Default)]
 pub struct Bounded {
     pub success: bool,
-    /// Killed at the deadline.
-    pub timed_out: bool,
+    /// Killed for having been stopped.
+    pub stopped: bool,
     /// Killed for answering more than it may.
     pub overflow: bool,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
 
-/// Run `command` for at most `deadline`, reading at most `max` bytes of its
-/// standard output; past either it is killed, and says so.
-pub fn run_bounded(command: &mut Command, deadline: Duration, max: usize) -> io::Result<Bounded> {
+/// Run `command` to its end, reading at most `max` bytes of its standard
+/// output; past that it is killed, and says so.
+///
+/// Waited for as long as it takes — no clock: the walk is bounded by what it
+/// may read (`sockets::LIMITS`), a loaded machine only makes it later, and a
+/// guess at "too long" would fail the check on exactly such a machine. What a
+/// program of the zone can do to hold the probe is stop it (`kill -STOP`: the
+/// same user; signals are open, LEAK-MODEL §16 — a tracer it cannot be: the
+/// probe is not dumpable, [`as_a_program`]). A stop is seen as it happens,
+/// and the probe is killed and the check failed, rather than the doctor
+/// hanging or taking silence for "nothing". The end is the process's own
+/// (its pidfd), not its pipes': a pipe held open by someone else ends the
+/// reading once the probe is gone and what it wrote is read.
+pub fn run_bounded(command: &mut Command, max: usize) -> io::Result<Bounded> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let started = Instant::now();
+    let pidfd = match crate::sys::pidfd_open(child.id() as i32) {
+        Some(fd) => fd,
+        None => {
+            let e = io::Error::last_os_error();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
+    let stopped = Arc::new(AtomicBool::new(false));
+    {
+        let watch = pidfd.try_clone()?;
+        let stopped = Arc::clone(&stopped);
+        std::thread::spawn(move || {
+            if crate::sys::pidfd_stopped_or_gone(&watch) == crate::sys::ChildState::Stopped {
+                stopped.store(true, Ordering::SeqCst);
+                crate::sys::pidfd_signal(&watch, libc::SIGKILL);
+            }
+        });
+    }
     let mut out = Bounded::default();
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     let mut buf = vec![0u8; 64 * 1024];
+    let mut ended = false;
     'read: while stdout.is_some() || stderr.is_some() {
-        let left = deadline.saturating_sub(started.elapsed());
-        if left.is_zero() {
-            out.timed_out = true;
-            break;
-        }
-        let mut fds: Vec<libc::pollfd> = [
-            stdout.as_ref().map(AsRawFd::as_raw_fd),
-            stderr.as_ref().map(AsRawFd::as_raw_fd),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|fd| libc::pollfd {
+        let pollin = |fd| libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
-        })
+        };
+        let mut fds: Vec<libc::pollfd> = [
+            stdout.as_ref().map(AsRawFd::as_raw_fd),
+            stderr.as_ref().map(AsRawFd::as_raw_fd),
+            (!ended).then(|| pidfd.as_raw_fd()),
+        ]
+        .into_iter()
+        .flatten()
+        .map(pollin)
         .collect();
-        let ms = libc::c_int::try_from(left.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
+        // Once it has ended, only what is in the pipes already: everything it
+        // wrote is there by then.
+        let ms = if ended { 0 } else { -1 };
         // SAFETY: a valid array of pollfd and its length.
         let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
         if ready < 0 {
@@ -884,7 +917,14 @@ pub fn run_bounded(command: &mut Command, deadline: Duration, max: usize) -> io:
             let _ = child.wait();
             return Err(e);
         }
+        if ready == 0 {
+            break;
+        }
         for pfd in fds.iter().filter(|p| p.revents != 0) {
+            if pfd.fd == pidfd.as_raw_fd() {
+                ended = true;
+                continue;
+            }
             let is_out = stdout.as_ref().map(AsRawFd::as_raw_fd) == Some(pfd.fd);
             let n = if is_out {
                 stdout.as_mut().map(|s| s.read(&mut buf))
@@ -915,22 +955,14 @@ pub fn run_bounded(command: &mut Command, deadline: Duration, max: usize) -> io:
             }
         }
     }
-    if !out.timed_out && !out.overflow {
-        // Both pipes closed: the child is done, or about to be.
-        loop {
-            if let Some(status) = child.try_wait()? {
-                out.success = status.success();
-                return Ok(out);
-            }
-            if started.elapsed() >= deadline {
-                out.timed_out = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+    if out.overflow {
+        let _ = child.kill();
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    // Both pipes closed or the child gone: it is done, or about to be — and a
+    // stop on the way is still seen, and ends it.
+    let status = child.wait()?;
+    out.stopped = stopped.load(Ordering::SeqCst);
+    out.success = status.success() && !out.stopped && !out.overflow;
     Ok(out)
 }
 
@@ -1266,15 +1298,12 @@ pub fn zone_checks(tools: &Tools, name: &str, uid: u32) -> (bool, Vec<Check>) {
         .arg(&tools.core)
         .arg("doctor-probe")
         .args(&probe_args);
-    match run_bounded(&mut command, PROBE_DEADLINE, PROBE_OUTPUT_MAX) {
-        Ok(out) if out.timed_out => checks.push(Check::new(
+    match run_bounded(&mut command, PROBE_OUTPUT_MAX) {
+        Ok(out) if out.stopped => checks.push(Check::new(
             "probe",
             Level::Fail,
-            format!(
-                "проба в зоне не ответила за {} с — остановлена (программа зоны может \
-                 остановить её сигналом; проверка не пройдена)",
-                PROBE_DEADLINE.as_secs()
-            ),
+            "пробу в зоне остановили сигналом — она снята (программа зоны может так \
+             сделать; проверка не пройдена)",
         )),
         Ok(out) if out.overflow => checks.push(Check::new(
             "probe",
@@ -1489,6 +1518,7 @@ pub fn run(tools: &Tools, args: &[OsString]) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn a_zone_has_loopback_and_its_tunnel_and_nothing_else() {
@@ -1678,28 +1708,33 @@ mod tests {
     }
 
     #[test]
-    fn the_doctor_does_not_wait_for_ever_nor_read_without_end() {
+    fn the_doctor_sees_a_stopped_probe_and_reads_no_more_than_it_may() {
         let quick = run_bounded(
             Command::new("sh").args(["-c", "echo out; echo err >&2"]),
-            Duration::from_secs(10),
             1024,
         )
         .unwrap();
-        assert!(quick.success && !quick.timed_out && !quick.overflow);
+        assert!(quick.success && !quick.stopped && !quick.overflow);
         assert_eq!(quick.stdout, b"out\n");
         assert_eq!(quick.stderr, b"err\n");
-        let started = Instant::now();
+        // Stopped — as a program of the zone would stop it: seen, not waited
+        // out.
         let stopped = run_bounded(
-            Command::new("sleep").arg("30"),
-            Duration::from_millis(200),
+            Command::new("sh").args(["-c", "kill -STOP $$; echo never"]),
             1024,
         )
         .unwrap();
-        assert!(stopped.timed_out && !stopped.success);
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(stopped.stopped && !stopped.success, "{stopped:?}");
+        assert!(stopped.stdout.is_empty());
+        // Its pipe held by someone else: the probe's end is the end.
+        let started = Instant::now();
+        let held =
+            run_bounded(Command::new("sh").args(["-c", "sleep 60 & echo out"]), 1024).unwrap();
+        assert!(held.success && !held.stopped, "{held:?}");
+        assert_eq!(held.stdout, b"out\n");
+        assert!(started.elapsed() < Duration::from_secs(30));
         let flood = run_bounded(
             Command::new("sh").args(["-c", "while :; do echo xxxxxxxxxxxxxxxx; done"]),
-            Duration::from_secs(10),
             4096,
         )
         .unwrap();

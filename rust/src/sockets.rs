@@ -32,8 +32,8 @@
 //!   9p). A directory is told by its device, asked with `AT_STATX_DONT_SYNC |
 //!   AT_NO_AUTOMOUNT` BEFORE it is opened, whatever it is called; what was not
 //!   entered is named;
-//! * bounded, each place on its own: a depth, a number of entries, a
-//!   deadline, and a number of entries per directory — a program that fills
+//! * bounded, each place on its own: a depth, a number of entries, and a
+//!   number of entries per directory — a program that fills
 //!   a directory it may write spends that directory's budget, never another
 //!   place's. What was not seen is said (`warn`), never taken for "nothing
 //!   there".
@@ -48,7 +48,6 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use crate::doctor::{Check, Level};
 
@@ -109,19 +108,19 @@ pub const KNOWN: [&str; 16] = [
 /// program of the zone can fill the places it may write: every place has a
 /// budget of its own, so that filling `/tmp` costs `/tmp` and nothing else,
 /// and a directory has one inside it, so that one full directory does not
-/// cost its siblings. At worst the walk takes `deadline` per place; the doctor
-/// waits for the whole probe longer than that (`crate::doctor::PROBE_DEADLINE`).
+/// cost its siblings. What is read is bounded, not how long it takes: no
+/// clock, so a loaded machine reads as much as an idle one (slow filesystems
+/// are not entered at all, see above); the doctor waits for the probe
+/// however long it takes (`crate::doctor::run_bounded`).
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     pub place_entries: usize,
     pub dir_entries: usize,
-    pub deadline: Duration,
 }
 
 pub const LIMITS: Limits = Limits {
     place_entries: 100_000,
     dir_entries: 20_000,
-    deadline: Duration::from_secs(2),
 };
 
 /// At most this many foreign sockets are named line by line; the rest are
@@ -754,7 +753,6 @@ fn walk_place(place: &Place, slow: &Slow, limits: Limits, seen: &mut Seen, out: 
     if !seen.dirs.insert((dev_of(&st), st.st_ino)) {
         return;
     }
-    let started = Instant::now();
     let mut entries = 0usize;
     let mut queue: VecDeque<(Vec<CString>, usize)> = VecDeque::new();
     queue.push_back((Vec::new(), 0));
@@ -793,15 +791,11 @@ fn walk_place(place: &Place, slow: &Slow, limits: Limits, seen: &mut Seen, out: 
             entries += 1;
             in_dir += 1;
             out.entries += 1;
-            if entries > limits.place_entries || started.elapsed() > limits.deadline {
-                let why = if entries > limits.place_entries {
-                    format!("после {} записей", limits.place_entries)
-                } else {
-                    format!("через {} с", limits.deadline.as_secs())
-                };
+            if entries > limits.place_entries {
                 out.incomplete.push(format!(
-                    "{} просмотрен не весь: остановлено {why}, на {}",
+                    "{} просмотрен не весь: остановлено после {} записей, на {}",
                     shown(&base),
+                    limits.place_entries,
                     shown(&dir_path)
                 ));
                 break 'dirs;
@@ -1594,7 +1588,6 @@ mod tests {
         let per_dir = Limits {
             place_entries: 1000,
             dir_entries: 5,
-            deadline: LIMITS.deadline,
         };
         let walk = super::walk(
             &[place(&dir.join("filled"), 2)],
@@ -1614,7 +1607,6 @@ mod tests {
         let per_place = Limits {
             place_entries: 10,
             dir_entries: 1000,
-            deadline: LIMITS.deadline,
         };
         let walk = super::walk(
             &[place(&dir.join("filled"), 2), place(&dir.join("other"), 1)],

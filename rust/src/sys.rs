@@ -790,6 +790,45 @@ pub fn pidfd_signal(fd: &OwnedFd, signal: i32) -> bool {
     }
 }
 
+/// How a child of ours stands when [`pidfd_stopped_or_gone`] returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildState {
+    /// Held by a signal (`SIGSTOP`) or a tracer.
+    Stopped,
+    /// Ended — or reaped already, or not ours.
+    Gone,
+}
+
+/// Wait, as long as it takes, until the child of a pidfd stops or ends. It
+/// is not reaped (`WNOWAIT`): whoever holds its `Child` still does that.
+pub fn pidfd_stopped_or_gone(fd: &OwnedFd) -> ChildState {
+    use std::os::fd::AsRawFd;
+    const P_PIDFD: libc::idtype_t = 3;
+    loop {
+        // SAFETY: an all-zero siginfo_t is a valid one to be filled.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid pidfd and a siginfo_t to fill.
+        let rc = unsafe {
+            libc::waitid(
+                P_PIDFD,
+                fd.as_raw_fd() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WSTOPPED | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return ChildState::Gone;
+        }
+        return match info.si_code {
+            libc::CLD_STOPPED | libc::CLD_TRAPPED => ChildState::Stopped,
+            _ => ChildState::Gone,
+        };
+    }
+}
+
 /// Wait up to `timeout` for the process of a pidfd to exit. True when it has.
 pub fn pidfd_wait(fd: &OwnedFd, timeout: std::time::Duration) -> bool {
     use std::os::fd::AsRawFd;
@@ -802,6 +841,23 @@ pub fn pidfd_wait(fd: &OwnedFd, timeout: std::time::Duration) -> bool {
     // SAFETY: one valid pollfd for the duration of the call. A pidfd polls
     // readable when its process has exited.
     unsafe { libc::poll(&mut pfd, 1, ms) == 1 }
+}
+
+/// Wait, as long as it takes, for the process of a pidfd to exit.
+pub fn pidfd_wait_end(fd: &OwnedFd) {
+    use std::os::fd::AsRawFd;
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one valid pollfd for the duration of the call.
+        let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if rc >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return;
+        }
+    }
 }
 
 /// The pid of the process on the other end of a Unix socket (`SO_PEERCRED`):

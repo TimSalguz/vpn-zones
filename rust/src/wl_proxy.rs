@@ -217,8 +217,6 @@ const RECHECK_MS: libc::c_int = 50;
 /// The process limits.
 const MAX_FDS: libc::rlim_t = 1024;
 const MAX_DATA: libc::rlim_t = 512 << 20;
-/// How long the supervisor waits for the proxy to say it is ready.
-const READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long accepting rests after the process ran out of descriptors.
 const ACCEPT_PAUSE: Duration = Duration::from_secs(1);
 /// The longest compositor error text passed on to the program.
@@ -437,14 +435,19 @@ pub fn start(
 }
 
 impl Proxy {
+    /// Waited for as long as it takes — no clock: the proxy says it is
+    /// ready, or its end of the channel closes when it dies. A loaded machine
+    /// only makes it later, never a launch without the proxy.
     fn await_ready(&self) -> Result<(), String> {
         let channel = self.channel.as_ref().ok_or("no channel")?;
         let mut pfd = [pollfd(channel.as_raw_fd())];
-        let ms = READY_TIMEOUT.as_millis() as libc::c_int;
-        match poll(&mut pfd, ms) {
-            Ok(0) => return Err("it did not report ready".to_owned()),
-            Ok(_) => {}
-            Err(e) => return Err(format!("poll: {e}")),
+        loop {
+            match poll(&mut pfd, -1) {
+                Ok(0) => continue,
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("poll: {e}")),
+            }
         }
         let mut byte = [0u8; 1];
         match sys::recv_into_with_fds(channel.as_raw_fd(), &mut byte, 0) {
