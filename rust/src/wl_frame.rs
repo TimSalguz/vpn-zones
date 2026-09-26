@@ -1758,6 +1758,7 @@ impl XdgSurfaceHandler for XdgSurfaceH {
 
     fn handle_get_toplevel(&mut self, slf: &Rc<XdgSurface>, id: &Rc<XdgToplevel>) {
         slf.send_get_toplevel(id);
+        crate::wl_proxy::window_opened();
         if let Ok(mut window) = self.window.try_borrow_mut() {
             window.toplevel = Some(Rc::downgrade(id));
         }

@@ -239,6 +239,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   told by its launch, not taken for the zone's own programs.
 
 ### Fixed
+- **A hand-over is told by the program's windows, not by five seconds**
+  (the owner, 2026-09-26/27: no fixed waits a slow or busy machine
+  breaks). A launch into the network a running program is in used to count
+  as handed over to the running copy if it ended with success within 5 s;
+  on a loaded machine a browser's hand-over took longer and was never
+  learned. Now the picker hands the launch a pipe; `wl-sandbox` takes it
+  (the program never inherits it) and the Wayland proxy says when the
+  program opens its first window, framed or not. Ended with success
+  without a window, however long that took: a hand-over, remembered. A
+  window: the picker leaves. Nothing on the way to say it (no proxy, a
+  launch outside `wl-sandbox`): said so, and nothing is learned.
 - **The network of a zone is waited for until pasta says it is done**
   (the owner, 2026-09-26: no fixed waits a slow or busy machine breaks).
   Every pasta that configures a namespace — a zone through a host

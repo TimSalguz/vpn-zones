@@ -1162,7 +1162,14 @@ pub fn run(tools: &Tools, argv: &[OsString]) -> u8 {
             wrapped.extend(exec);
             wrapped
         }
-        None => exec,
+        None => {
+            // No `wl-sandbox` to take the picker's pipe (`wl_sandbox::
+            // take_opened`): taken here, so that the program never has it,
+            // and told that no word will come — the picker learns nothing.
+            crate::wl_sandbox::take_opened();
+            crate::wl_sandbox::no_word();
+            exec
+        }
     };
 
     // A zone is a network namespace of its own, and ours is the host's here: a

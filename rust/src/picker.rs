@@ -42,7 +42,9 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 
@@ -375,16 +377,10 @@ pub fn net_step(memory: &Memory) -> NetStep {
     }
 }
 
-/// How long a launch into the network the program already runs in is
-/// watched: a program that hands the launch over to the running copy
-/// (browsers, messengers, Electron) exits within it, with success; one that
-/// opens a window of its own (terminals) is still there.
-pub const HANDOVER_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// Where [`Memory::hands_over`] is kept, one empty file per program.
 pub const HANDOVER: &str = ".handover";
 
-/// Whether a launch is watched for a hand-over ([`HANDOVER_WINDOW`]): the
+/// Whether a launch is watched for a hand-over ([`launch_asked`]): the
 /// program runs, it is not known to hand over yet, and it is started into
 /// the network it runs in — the one case where the new process exiting at
 /// once can mean nothing else. Another network is not watched: there `run`
@@ -2385,11 +2381,13 @@ fn launch(
 
 /// [`launch`] of an answer the person gave, watched for a hand-over when
 /// [`watch_handover`] says so: the program is then started as a child
-/// instead of in place. Gone within [`HANDOVER_WINDOW`], with success: it
+/// instead of in place. Gone with success without ever opening a window (the
+/// Wayland proxy's word, [`opened_or_ended`]) — however long that took: it
 /// handed the launch to the copy that runs, and [`HANDOVER`] remembers that —
 /// the next click on it while it runs raises that copy with no question, as
-/// every click on a running program did before. Still there: the picker
-/// leaves, and the program goes on without it.
+/// every click on a running program did before. A window of its own: the
+/// picker leaves, and the program goes on without it. No proxy on the way
+/// (no word to come): the picker leaves, and learns nothing.
 fn launch_asked(
     tools: &Tools,
     key: &str,
@@ -2403,27 +2401,118 @@ fn launch_asked(
         return launch(tools, key, zone_choice, container, cmd);
     }
     let argv = launch_argv(tools, key, zone_choice, container, cmd);
-    let mut child = match Command::new(&argv[0]).args(&argv[1..]).spawn() {
+    // The program's first window, told by the Wayland proxy through a pipe of
+    // ours (`wl_proxy::window_opened`, taken by `wl-sandbox`). No pipe: the
+    // launch goes on as any other, and nothing is learned.
+    let Ok((heard, told)) = crate::sys::pipe() else {
+        return launch(tools, key, zone_choice, container, cmd);
+    };
+    let told_raw = told.as_raw_fd();
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]).env(
+        crate::wl_sandbox::ENV_OPENED_FD,
+        crate::wl_sandbox::OPENED_FD.to_string(),
+    );
+    // SAFETY: between fork and exec: dup2/fcntl on descriptors of ours.
+    unsafe {
+        command.pre_exec(move || {
+            let fd = crate::wl_sandbox::OPENED_FD;
+            let done = if told_raw == fd {
+                libc::fcntl(fd, libc::F_SETFD, 0)
+            } else {
+                libc::dup2(told_raw, fd)
+            };
+            if done < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let spawned = command.spawn();
+    drop(told);
+    let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
             eprintln!("не удалось запустить {}: {e}", tools.runner.display());
             return ExitCode::from(EXIT_NOT_STARTED);
         }
     };
-    let started = std::time::Instant::now();
+    let status = match opened_or_ended(&heard, &mut child) {
+        // A window of its own: no hand-over. The picker leaves, the program
+        // goes on without it.
+        Heard::Opened | Heard::Nothing => return ExitCode::SUCCESS,
+        Heard::Ended(status) => status,
+    };
+    // Gone without ever opening a window, with success: it handed the launch
+    // over to the copy that runs — remembered, however long that took.
+    if status.success() {
+        let dir = tools.state.join(HANDOVER);
+        let _ = fs::create_dir_all(&dir).and_then(|()| fs::write(dir.join(key), ""));
+    }
+    ExitCode::from(status.code().map_or(1, |c| c as u8))
+}
+
+/// What [`opened_or_ended`] heard first.
+enum Heard {
+    /// The program opened a window.
+    Opened,
+    /// Nobody will say: the launch went without the Wayland proxy
+    /// ([`crate::wl_sandbox::WORD_NONE`]).
+    Nothing,
+    /// The launch ended, no window opened.
+    Ended(std::process::ExitStatus),
+}
+
+/// Whichever comes first, as long as it takes: the word that the program
+/// opened a window, or the launch's end. No clock: a hand-over that takes
+/// long on a loaded machine is a hand-over all the same, and a window that
+/// comes late is a window.
+fn opened_or_ended(heard: &OwnedFd, child: &mut std::process::Child) -> Heard {
+    let pidfd = crate::sys::pidfd_open(child.id() as i32);
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if status.success() {
-                    let dir = tools.state.join(HANDOVER);
-                    let _ = fs::create_dir_all(&dir).and_then(|()| fs::write(dir.join(key), ""));
-                }
-                return ExitCode::from(status.code().map_or(1, |c| c as u8));
+        let mut fds = vec![libc::pollfd {
+            fd: heard.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        if let Some(fd) = &pidfd {
+            fds.push(libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        // SAFETY: a valid array of pollfd and its length.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if rc < 0 {
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                std::thread::sleep(crate::sys::LOOK_AGAIN);
             }
-            Ok(None) if started.elapsed() < HANDOVER_WINDOW => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            _ => return ExitCode::SUCCESS,
+            continue;
+        }
+        if fds[0].revents != 0 {
+            let mut byte = [0u8; 1];
+            // SAFETY: a valid descriptor and a buffer of one byte.
+            let n = unsafe { libc::read(heard.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
+            return match (n, byte[0]) {
+                (1, crate::wl_sandbox::WORD_OPENED) => Heard::Opened,
+                (1, _) => Heard::Nothing,
+                // The end of the pipe with no word: nobody holds it any more
+                // — the launch is ending (its descriptors close a moment
+                // before it can be waited for; waited for, then).
+                _ => match child.wait() {
+                    Ok(status) => Heard::Ended(status),
+                    Err(_) => Heard::Nothing,
+                },
+            };
+        }
+        // Ended, and nothing in the pipe (a word said on the way would have
+        // been heard above, first).
+        if fds.get(1).is_some_and(|f| f.revents != 0) {
+            return match child.wait() {
+                Ok(status) => Heard::Ended(status),
+                Err(_) => Heard::Nothing,
+            };
         }
     }
 }

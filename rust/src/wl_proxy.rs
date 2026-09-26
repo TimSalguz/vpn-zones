@@ -105,18 +105,23 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use libseccomp::{ScmpAction, ScmpArgCompare, ScmpCompareOp, ScmpFilterContext, ScmpSyscall};
 use wl_proxy::baseline::Baseline;
 use wl_proxy::client::{Client, ClientHandler};
-use wl_proxy::object::{Object, ObjectCoreApi};
+use wl_proxy::object::{Object, ObjectCoreApi, ObjectRcUtils};
 use wl_proxy::protocols::wayland::wl_display::{WlDisplay, WlDisplayHandler};
 use wl_proxy::protocols::wayland::wl_registry::{WlRegistry, WlRegistryHandler};
+use wl_proxy::protocols::wayland::wl_surface::WlSurface;
+use wl_proxy::protocols::xdg_shell::xdg_surface::{XdgSurface, XdgSurfaceHandler};
+use wl_proxy::protocols::xdg_shell::xdg_toplevel::XdgToplevel;
+use wl_proxy::protocols::xdg_shell::xdg_wm_base::{XdgWmBase, XdgWmBaseHandler};
 use wl_proxy::protocols::ObjectInterface;
 use wl_proxy::state::{State, StateHandler};
 
@@ -382,6 +387,7 @@ pub fn start(
     zone_listener: &UnixListener,
     upstream: &Path,
     frame: Option<Setup>,
+    opened: Option<OwnedFd>,
 ) -> Result<Proxy, String> {
     let (ours, theirs) = UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
     let listener = zone_listener.try_clone().map_err(|e| format!("dup: {e}"))?;
@@ -407,7 +413,7 @@ pub fn start(
         // A panic ends the proxy here: unwinding further would run the
         // supervisor's code (`wl_sandbox::run`) in this child.
         let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            child(listener, theirs, supervisor, drawing)
+            child(listener, theirs, supervisor, drawing, opened)
         }))
         .unwrap_or(101);
         // _exit: the parent's atexit handlers and buffers are not ours.
@@ -788,14 +794,61 @@ fn read_font() -> Option<Vec<u8>> {
         .ok()
 }
 
+/// Whoever asked to hear of the program's first window (the picker, through
+/// `wl-sandbox`: `crate::picker`'s hand-over): the write end of its pipe, or
+/// -1. One word, once, from whichever connection opens a window first.
+static OPENED: AtomicI32 = AtomicI32::new(-1);
+
+/// The program opened a window — an `xdg_toplevel`, framed or not: said,
+/// once, to whoever asked (`OPENED`). A program that hands its launch over to
+/// the copy that runs never does; one that opens its own always does — told
+/// apart by the event, not by how long it took.
+pub(crate) fn window_opened() {
+    let fd = OPENED.swap(-1, Ordering::SeqCst);
+    if fd >= 0 {
+        // SAFETY: our own descriptor, one byte from a constant; closed after.
+        unsafe {
+            libc::write(fd, [crate::wl_sandbox::WORD_OPENED].as_ptr().cast(), 1);
+            libc::close(fd);
+        }
+    }
+}
+
+/// A connection without a frame has no `crate::wl_frame` watching its
+/// windows: this much does, for [`window_opened`].
+struct OpeningWmBase;
+
+impl XdgWmBaseHandler for OpeningWmBase {
+    fn handle_get_xdg_surface(
+        &mut self,
+        slf: &Rc<XdgWmBase>,
+        id: &Rc<XdgSurface>,
+        surface: &Rc<WlSurface>,
+    ) {
+        slf.send_get_xdg_surface(id, surface);
+        id.set_handler(OpeningSurface);
+    }
+}
+
+struct OpeningSurface;
+
+impl XdgSurfaceHandler for OpeningSurface {
+    fn handle_get_toplevel(&mut self, slf: &Rc<XdgSurface>, id: &Rc<XdgToplevel>) {
+        slf.send_get_toplevel(id);
+        window_opened();
+    }
+}
+
 /// The forked proxy: confine, report ready, serve.
 fn child(
     listener: UnixListener,
     channel: UnixStream,
     supervisor: libc::pid_t,
     drawing: Option<Drawing>,
+    opened: Option<OwnedFd>,
 ) -> libc::c_int {
-    let border = match confine(&listener, &channel, supervisor, drawing) {
+    let opened = opened.map(IntoRawFd::into_raw_fd);
+    let border = match confine(&listener, &channel, supervisor, drawing, opened) {
         Ok(border) => border,
         Err(e) => {
             eprintln!("wl-sandbox: the Wayland proxy cannot confine itself: {e}");
@@ -920,6 +973,7 @@ fn confine(
     channel: &UnixStream,
     supervisor: libc::pid_t,
     drawing: Option<Drawing>,
+    opened: Option<RawFd>,
 ) -> Result<Option<Border>, String> {
     let name = std::ffi::CString::new(PROCESS_NAME).map_err(|e| e.to_string())?;
     // SAFETY: PR_SET_NAME reads a NUL-terminated string that outlives the call.
@@ -944,7 +998,12 @@ fn confine(
     if unsafe { libc::getppid() } != supervisor {
         return Err("the supervisor is gone".to_owned());
     }
-    close_all_but(&mut [0, 1, 2, listener.as_raw_fd(), channel.as_raw_fd()])?;
+    let mut keep = vec![0, 1, 2, listener.as_raw_fd(), channel.as_raw_fd()];
+    keep.extend(opened);
+    close_all_but(&mut keep)?;
+    if let Some(fd) = opened {
+        OPENED.store(fd, Ordering::SeqCst);
+    }
     listener
         .set_nonblocking(true)
         .map_err(|e| format!("O_NONBLOCK: {e}"))?;
@@ -1536,6 +1595,10 @@ impl WlRegistryHandler for Registry {
         if fits {
             if let Some(frames) = &self.frames {
                 frames.watch(&id);
+            } else if OPENED.load(Ordering::Relaxed) >= 0 {
+                if let Some(o) = id.try_downcast::<XdgWmBase>() {
+                    o.set_handler(OpeningWmBase);
+                }
             }
             slf.send_bind(name, id);
             return;
@@ -2244,7 +2307,7 @@ mod tests {
         let zone_path = dir.join("zone-sock");
         let zone = UnixListener::bind(&zone_path).unwrap();
         // Before any thread: the fork in `start` has to be the only thing.
-        let mut proxy = start(&zone, &up.path, None).unwrap();
+        let mut proxy = start(&zone, &up.path, None, None).unwrap();
         drop(zone);
         if shared.is_some() {
             await_file(&dir, "connected");
@@ -2369,7 +2432,7 @@ mod tests {
         };
         let up = Upstream::bind(&dir, 43).unwrap();
         let zone = UnixListener::bind(dir.join("zone-sock")).unwrap();
-        let mut proxy = start(&zone, &up.path, None).unwrap();
+        let mut proxy = start(&zone, &up.path, None, None).unwrap();
         drop(zone);
         drop(up.listener);
         proxy.take_over();

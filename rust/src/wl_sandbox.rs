@@ -70,7 +70,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
@@ -96,6 +96,79 @@ const SANDBOX_ENGINE: &str = "vpn-zone";
 pub const SOCKET_DIR: &str = "vpn-zones/wayland";
 /// The directory for launches that enter no zone.
 pub const NO_ZONE: &str = "unconfined";
+
+/// The descriptor a launch may carry for whoever wants to hear of the
+/// program's first window (`crate::picker`'s hand-over): its number, in this
+/// variable, and [`OPENED_FD`] is the one the picker uses.
+pub const ENV_OPENED_FD: &str = "CELLWARD_WINDOW_FD";
+pub const OPENED_FD: RawFd = 9;
+
+/// The words on the picker's pipe: the program opened a window
+/// ([`crate::wl_proxy::window_opened`]), or no word will come — nothing on
+/// the way to say it. The end of the pipe with neither is the launch's end.
+pub const WORD_OPENED: u8 = b'w';
+pub const WORD_NONE: u8 = b'n';
+
+/// The pipe of [`ENV_OPENED_FD`], once taken ([`take_opened`]).
+static OPENED: std::sync::Mutex<Option<OwnedFd>> = std::sync::Mutex::new(None);
+
+/// Take the pipe of [`ENV_OPENED_FD`]: the variable gone, the descriptor
+/// close-on-exec — the program never inherits it — and kept here until the
+/// proxy has it ([`opened_for_proxy`], [`opened_handed`]) or no word will
+/// come ([`no_word`]). Only a pipe: a number that names anything else is
+/// left alone.
+pub fn take_opened() {
+    if let Some(fd) = pipe_of_env() {
+        *OPENED.lock().unwrap_or_else(|e| e.into_inner()) = Some(fd);
+    }
+}
+
+/// A copy of the pipe for the proxy, which says the word itself.
+fn opened_for_proxy() -> Option<OwnedFd> {
+    OPENED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|fd| fd.try_clone().ok())
+}
+
+/// The proxy has its copy: ours goes, without a word.
+fn opened_handed() {
+    OPENED.lock().unwrap_or_else(|e| e.into_inner()).take();
+}
+
+/// Nothing on the way will say the word: said so ([`WORD_NONE`]) — the
+/// picker leaves, and learns nothing — and the pipe gone.
+pub fn no_word() {
+    if let Some(fd) = OPENED.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        // SAFETY: our own descriptor, one byte from a constant.
+        unsafe {
+            libc::write(
+                std::os::fd::AsRawFd::as_raw_fd(&fd),
+                [WORD_NONE].as_ptr().cast(),
+                1,
+            )
+        };
+    }
+}
+
+fn pipe_of_env() -> Option<OwnedFd> {
+    let value = std::env::var(ENV_OPENED_FD).ok();
+    std::env::remove_var(ENV_OPENED_FD);
+    let fd: RawFd = value?.trim().parse().ok().filter(|fd| *fd > 2)?;
+    // SAFETY: an all-zero stat is a valid one to fill.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a descriptor number and a stat to fill; failing says it is not ours.
+    if unsafe { libc::fstat(fd, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        return None;
+    }
+    // SAFETY: as above; FD_CLOEXEC on a descriptor of ours.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        return None;
+    }
+    // SAFETY: the pipe the launch was given for this, and nobody else's here.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
 
 /// What `wl-sandbox` was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +335,7 @@ pub fn socket_display(zone: &str, pid: u32) -> String {
 /// did: there is nothing left to supervise or clean up, and the caller gets the
 /// program's own exit status without a middleman.
 fn run_plain(cmd: &[OsString]) -> u8 {
+    no_word();
     let e = exec_command(cmd);
     eprintln!("wl-sandbox: cannot start {}: {e}", cmd[0].to_string_lossy());
     EXIT_NOT_STARTED
@@ -364,6 +438,10 @@ impl Compositor {
 /// returns unless the program itself could not be started) at every step that
 /// did not work out.
 pub fn run(args: Args) -> u8 {
+    // Taken before anything is started: the program never inherits it. The
+    // proxy says the word; every way without a proxy says that none will
+    // come (`run_plain`, and below).
+    take_opened();
     let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) else {
         eprintln!("wl-sandbox: no XDG_RUNTIME_DIR — running unrestricted");
         return run_plain(&args.cmd);
@@ -471,8 +549,11 @@ pub fn run(args: Args) -> u8 {
     let mut proxy = None;
     if let Some(up) = upstream {
         drop(up.listener);
-        match wl_proxy::start(&listener, &up.path, args.frame.clone()) {
-            Ok(started) => proxy = Some((started, up.path)),
+        match wl_proxy::start(&listener, &up.path, args.frame.clone(), opened_for_proxy()) {
+            Ok(started) => {
+                opened_handed();
+                proxy = Some((started, up.path));
+            }
             Err(e) => {
                 // The second rung: the proxy did not start. The context made
                 // for it is switched off, and the zone's path is registered
@@ -488,6 +569,7 @@ pub fn run(args: Args) -> u8 {
                     "wl-sandbox: the Wayland proxy did not start ({e}) — the compositor listens \
                      for the program itself"
                 );
+                no_word();
                 drop(close_write);
                 let _ = fs::remove_file(&up.path);
                 let registered = sys::pipe()
