@@ -309,6 +309,139 @@ pub fn wait_for_entry(path: &Path, pidfd: Option<&OwnedFd>, ready: impl Fn(&Path
 /// How often [`wait_for_entry`] looks without a watch.
 pub const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Wait, as long as it takes, until `ready()` holds — looked at again
+/// whenever the kernel says a link, an address or a route changed in the
+/// network namespace this thread is in (an rtnetlink subscription, made
+/// before the first look, so nothing is missed) — or until the process of
+/// `pidfd` ends (`false`). No clock: on a loaded machine pasta configures a
+/// namespace later, never "not at all". Without a subscription (none to be
+/// had) it looks every [`LOOK_AGAIN`] instead.
+pub fn wait_for_network(pidfd: Option<&OwnedFd>, mut ready: impl FnMut() -> bool) -> bool {
+    use std::os::fd::AsRawFd;
+    let news = route_news().ok();
+    let pollin = |fd: RawFd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        if ready() {
+            return true;
+        }
+        let mut fds: Vec<libc::pollfd> = Vec::with_capacity(2);
+        if let Some(fd) = pidfd {
+            fds.push(pollin(fd.as_raw_fd()));
+        }
+        if let Some(news) = &news {
+            fds.push(pollin(news.as_raw_fd()));
+        }
+        let ms = if news.is_some() {
+            -1
+        } else {
+            LOOK_AGAIN.as_millis() as libc::c_int
+        };
+        // SAFETY: a valid array of pollfd and its length.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
+        if rc < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        for pfd in fds.iter().filter(|p| p.revents != 0) {
+            if pidfd.is_some_and(|fd| fd.as_raw_fd() == pfd.fd) {
+                return false;
+            }
+            if let Some(news) = &news {
+                drain(news);
+            }
+        }
+    }
+}
+
+/// [`wait_for_network`] in the network namespace of `netns` (a descriptor of
+/// one): in a thread of its own that enters it, `ready` looked at from there.
+pub fn wait_for_network_in(
+    netns: &impl std::os::fd::AsFd,
+    pidfd: Option<&OwnedFd>,
+    ready: impl FnMut() -> bool + Send,
+) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let ns = netns.as_fd().try_clone_to_owned()?;
+    let pidfd = pidfd.map(OwnedFd::try_clone).transpose()?;
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                // SAFETY: a valid descriptor of a network namespace; only this
+                // thread moves into it.
+                if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(wait_for_network(pidfd.as_ref(), ready))
+            })
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("the wait panicked")))
+    })
+}
+
+/// A subscription to the kernel's news of links, addresses and routes in this
+/// thread's network namespace.
+fn route_news() -> io::Result<OwnedFd> {
+    use std::os::fd::AsRawFd;
+    const GROUPS: u32 = 0x1 // RTMGRP_LINK
+        | 0x10 // RTMGRP_IPV4_IFADDR
+        | 0x40 // RTMGRP_IPV4_ROUTE
+        | 0x100 // RTMGRP_IPV6_IFADDR
+        | 0x400; // RTMGRP_IPV6_ROUTE
+                 // SAFETY: socket(2) takes no pointers.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor was just returned to us and nothing else owns it.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: an all-zero sockaddr_nl is a valid one to fill.
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    addr.nl_groups = GROUPS;
+    // SAFETY: a valid socket and an address of the size given.
+    let rc = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&raw const addr).cast(),
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// Read what the kernel said, all of it: only that it said something counts
+/// (an overflow — `ENOBUFS` — too).
+fn drain(news: &OwnedFd) {
+    use std::os::fd::AsRawFd;
+    let mut buf = [0u8; 8192];
+    loop {
+        // SAFETY: a valid descriptor and a buffer of the length given.
+        let n = unsafe { libc::recv(news.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if n <= 0 {
+            let e = io::Error::last_os_error().raw_os_error();
+            if n < 0 && matches!(e, Some(libc::EINTR | libc::ENOBUFS)) {
+                continue;
+            }
+            return;
+        }
+    }
+}
+
 /// What happened in a directory a [`DirWatch`] watches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirEvent {

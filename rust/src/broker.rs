@@ -299,10 +299,6 @@ fn may_always(label: &str) -> bool {
 /// it goes into the journal, which a flood of long ones would rotate away.
 const MAX_APP_ID: usize = 255;
 
-/// How long a peer may take to send its request: a request is written at
-/// once, and a connection that sends nothing holds a thread.
-const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// At most this many requests of one origin handled at once: a zone that
 /// holds connections open must not lock the others out of the door.
 const MAX_PER_ORIGIN: usize = 4;
@@ -334,20 +330,18 @@ impl Drop for OriginSlot {
     }
 }
 
-/// The request, read whole by a deadline — not per read: a peer that sends a
-/// byte now and then must not hold a thread for days. `None`: it did not
-/// come by then, or broke off. One byte past `MAX_REQUEST` is read, so that a
-/// request too long is told from one exactly as long.
+/// The request, read whole — as long as that takes, no clock: a peer writes
+/// its request as it connects, and on a loaded machine that is later, not
+/// never. One that sends nothing, or a byte now and then, holds a thread and
+/// one of its origin's few slots ([`MAX_PER_ORIGIN`], taken before this):
+/// its own zone's requests wait behind it, nobody else's — a count bounds
+/// it, where five seconds used to. `None`: it broke off. One byte past
+/// `MAX_REQUEST` is read, so that a request too long is told from one
+/// exactly as long.
 fn read_request(stream: &mut UnixStream) -> Option<Vec<u8>> {
-    let deadline = std::time::Instant::now() + READ_TIMEOUT;
     let mut bytes = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
-        let left = deadline.checked_duration_since(std::time::Instant::now())?;
-        if left.is_zero() {
-            return None;
-        }
-        stream.set_read_timeout(Some(left)).ok()?;
         match stream.read(&mut buf) {
             Ok(0) => return Some(bytes),
             Ok(n) => {

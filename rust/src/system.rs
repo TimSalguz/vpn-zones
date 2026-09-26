@@ -43,7 +43,7 @@
 //! refused for now.
 
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
@@ -51,7 +51,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{SocketAddr, UnixDatagram};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 
 use crate::config::{Family, WgConfig};
@@ -734,27 +734,46 @@ fn start_uplink(
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}", tools.pasta.display()))?;
     watch_uplink(name, interface, &mut child)?;
-    // Up once pasta has put its interface there with a default route.
-    for _ in 0..50 {
-        let routes =
-            zone::tool_output(&tools.ip, &["-n", uns.as_str(), "route", "show", "default"])
-                .unwrap_or_default();
-        if routes.contains(&format!("dev {UPLINK_IFACE}")) {
-            println!("system zone {name}: the uplink goes out through {interface} only");
-            return Ok(child);
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(format!(
-                "pasta exited ({status}) — the uplink through {interface} did not come up"
-            ));
-        }
-        thread::sleep(std::time::Duration::from_millis(100));
+    // Up once pasta has put its interface there with a default route: as
+    // long as that takes, woken by the kernel's news of the namespace — or
+    // pasta ends without it (refusing an interface that is down, it says so
+    // itself). No clock: on a loaded machine the route comes later.
+    let has_route = || {
+        zone::tool_output(&tools.ip, &["-n", uns.as_str(), "route", "show", "default"])
+            .unwrap_or_default()
+            .contains(&format!("dev {UPLINK_IFACE}"))
+    };
+    if pasta_configures(&Path::new("/run/netns").join(&uns), &mut child, has_route)? {
+        println!("system zone {name}: the uplink goes out through {interface} only");
+        return Ok(child);
     }
-    let _ = child.kill();
-    let _ = child.wait();
     Err(format!(
-        "pasta gave the uplink no route through {interface} — is it up, with a route?"
+        "pasta exited ({}) — the uplink through {interface} did not come up",
+        exit_of(&mut child)
     ))
+}
+
+/// Whether pasta, just started on the namespace at `netns`, has configured
+/// it (`ready`) — waited for as long as it takes, or until pasta ends
+/// (`false`).
+fn pasta_configures(
+    netns: &Path,
+    pasta: &mut Child,
+    ready: impl FnMut() -> bool + Send,
+) -> Result<bool, String> {
+    let ns = File::open(netns).map_err(|e| format!("cannot open {}: {e}", netns.display()))?;
+    let pidfd = crate::sys::pidfd_open(pasta.id() as i32)
+        .ok_or_else(|| format!("cannot watch pasta: {}", io::Error::last_os_error()))?;
+    crate::sys::wait_for_network_in(&ns, Some(&pidfd), ready)
+        .map_err(|e| format!("cannot wait in {}: {e}", netns.display()))
+}
+
+/// How a child that ended did: its status, collected.
+fn exit_of(child: &mut Child) -> String {
+    match child.wait() {
+        Ok(status) => status.to_string(),
+        Err(e) => e.to_string(),
+    }
 }
 
 /// pasta bound to `interface` is killed the moment the interface is deleted or
@@ -866,21 +885,13 @@ fn up_plain(args: &Args, runas: &str) -> Result<(), String> {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         zone::tool_output(&tools.ip, &args).unwrap_or_default()
     };
-    let mut there = false;
-    for _ in 0..50 {
-        if !link().trim().is_empty() {
-            there = true;
-            break;
-        }
-        if let Ok(Some(status)) = pasta.try_wait() {
-            return Err(format!("pasta exited ({status}) — the zone has no way out"));
-        }
-        thread::sleep(std::time::Duration::from_millis(100));
-    }
-    if !there {
-        let _ = pasta.kill();
-        let _ = pasta.wait();
-        return Err("pasta gave the zone no interface".to_owned());
+    // As long as it takes, woken by the kernel's news of the zone's
+    // namespace, or until pasta ends without it — no clock.
+    if !pasta_configures(&netns_path(name), &mut pasta, || !link().trim().is_empty())? {
+        return Err(format!(
+            "pasta exited ({}) — the zone has no way out",
+            exit_of(&mut pasta)
+        ));
     }
     let own_dns = settings(name).map(|s| s.dns).unwrap_or_default();
     let (mut resolvers, whose) = plain_resolvers(&own_dns);
