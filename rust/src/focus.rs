@@ -738,23 +738,44 @@ fn closed_after_all(tools: &Tools, label: &str, program: &OwnedFd) -> bool {
         events: libc::POLLIN,
         revents: 0,
     };
+    // In the launch window first, guarded (`crate::window::question`): a
+    // press counts only after the person has been still with the question in
+    // view — the dangerous answer too. kdialog where there is no window, and
+    // there a press sooner than `dialog::TOO_FAST` after its start is taken
+    // for a stray key and asked again.
+    let menu = crate::window::Menu {
+        title: crate::dialog::APP.to_owned(),
+        notes: text.lines().map(str::to_owned).collect(),
+        actions: vec![
+            ("cancel".to_owned(), "Отменить перезапуск".to_owned(), false),
+            ("wait".to_owned(), "Ждать".to_owned(), false),
+            ("kill".to_owned(), "Закрыть сразу".to_owned(), true),
+        ],
+        guard_ms: crate::dialog::TOO_FAST.as_millis() as u64,
+    };
     loop {
         let asked = std::time::Instant::now();
-        let dialog = Command::new(&tools.kdialog)
-            .args(["--title", crate::dialog::APP, "--warningyesnocancel"])
-            .arg(&text)
-            .args([
-                "--yes-label",
-                "Отменить перезапуск",
-                "--no-label",
-                "Закрыть сразу",
-                "--cancel-label",
-                "Ждать",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        let (dialog, via_window) = match crate::window::spawn_menu(&tools.window, &menu) {
+            Some(child) => (Ok(child), true),
+            None => (
+                Command::new(&tools.kdialog)
+                    .args(["--title", crate::dialog::APP, "--warningyesnocancel"])
+                    .arg(&text)
+                    .args([
+                        "--yes-label",
+                        "Отменить перезапуск",
+                        "--no-label",
+                        "Закрыть сразу",
+                        "--cancel-label",
+                        "Ждать",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn(),
+                false,
+            ),
+        };
         let (mut dialog, dialog_fd) = match dialog {
             Ok(child) => match crate::sys::pidfd_open(child.id() as i32) {
                 Some(fd) => (child, fd),
@@ -786,17 +807,27 @@ fn closed_after_all(tools: &Tools, label: &str, program: &OwnedFd) -> bool {
             let _ = dialog.wait();
             return true;
         }
-        match dialog.wait().ok().and_then(|s| s.code()) {
+        // 0 cancel, 1 kill, anything else wait — as kdialog's buttons are.
+        let answer = if via_window {
+            match crate::window::menu_answer(dialog).as_deref() {
+                Some("cancel") => Some(0),
+                Some("kill") => Some(1),
+                _ => Some(2),
+            }
+        } else {
+            dialog.wait().ok().and_then(|s| s.code())
+        };
+        match answer {
             Some(0) => return false,
-            Some(1) if crate::dialog::not_too_soon(asked).is_ok() => {
+            Some(1) if via_window || crate::dialog::not_too_soon(asked).is_ok() => {
                 crate::sys::pidfd_signal(program, libc::SIGKILL);
                 crate::sys::pidfd_wait_end(program);
                 return true;
             }
             // Too soon: asked again.
             Some(1) => continue,
-            // "Wait", Esc, the question closed — or kdialog gone some other
-            // way: the restart waits for the program.
+            // "Wait", Esc, the question closed — or the dialog gone some
+            // other way: the restart waits for the program.
             _ => {
                 crate::sys::pidfd_wait_end(program);
                 return true;
@@ -834,6 +865,7 @@ pub fn menu(tools: &Tools) -> u8 {
         title: label.clone(),
         notes: vec![describe(&tools.state, &window, launch.as_ref())],
         actions: menu_entries(&label, launch.as_ref(), &pin),
+        guard_ms: 0,
     };
     let Some(choice) = ask_menu(tools, &menu) else {
         return 0;

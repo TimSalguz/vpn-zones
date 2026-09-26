@@ -416,6 +416,9 @@ pub struct Policy {
     files: Option<Files>,
     fixed: Setting,
     kdialog: PathBuf,
+    /// The launch window to ask in (guarded, `crate::window::question`);
+    /// empty: kdialog.
+    window: PathBuf,
     /// A graphical session to ask on, from the filter's environment.
     display: bool,
     timeout: Duration,
@@ -449,6 +452,7 @@ impl Policy {
         config: PathBuf,
         profiles: PathBuf,
         kdialog: PathBuf,
+        window: PathBuf,
     ) -> Self {
         let journal = zone_dir.parent().map(Path::to_path_buf);
         Self {
@@ -460,6 +464,7 @@ impl Policy {
             }),
             fixed: Setting::No,
             kdialog,
+            window,
             display: crate::launch::has_display(),
             timeout: TIMEOUT,
             too_fast: TOO_FAST,
@@ -478,6 +483,7 @@ impl Policy {
             files: None,
             fixed: setting,
             kdialog: PathBuf::from("/nonexistent/kdialog"),
+            window: PathBuf::new(),
             display,
             timeout: TIMEOUT,
             too_fast: TOO_FAST,
@@ -604,7 +610,33 @@ impl Policy {
         };
         let always = always_label(&self.zone, who);
         let asked = Instant::now();
-        let code = if remember {
+        // In the launch window first, guarded (`window::question`): counted
+        // from when the question can be seen, not from its start — a loaded
+        // machine shows it later. The safe answer first: Enter refuses.
+        let in_window = {
+            let mut answers: Vec<(&str, &str, bool)> = vec![
+                ("deny", "Отказать", false),
+                ("once", "Разрешить один раз", false),
+            ];
+            if remember {
+                answers.push(("always", always.as_str(), false));
+            }
+            match crate::window::question(&self.window, &title, &text, &answers, Some(self.timeout))
+            {
+                crate::window::Asked::NotShown => None,
+                crate::window::Asked::Chose(tag) => Some(match (tag.as_str(), remember) {
+                    ("once", _) => Some(0),
+                    ("always", true) => Some(1),
+                    (_, true) => Some(2),
+                    (_, false) => Some(1),
+                }),
+                crate::window::Asked::Closed => Some(Some(if remember { 2 } else { 1 })),
+                crate::window::Asked::NoAnswer => Some(None),
+            }
+        };
+        let code = if let Some(code) = in_window {
+            code
+        } else if remember {
             crate::dialog::choose_within(
                 &self.kdialog,
                 [
@@ -772,7 +804,7 @@ impl Policy {
             timeout,
             // The test's kdialog answers at once.
             too_fast: Duration::ZERO,
-            ..Self::new("nl", zone_dir, config, profiles, kdialog)
+            ..Self::new("nl", zone_dir, config, profiles, kdialog, PathBuf::new())
         }
     }
 

@@ -239,6 +239,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   told by its launch, not taken for the zone's own programs.
 
 ### Fixed
+- **A question counts from when it can be seen, not from when it was
+  started** (the owner, 2026-09-26/27: no fixed waits a slow or busy
+  machine breaks). The broker's questions (a launch from a zone), the
+  microphone's and the window menu's "close now" were kdialog dialogs,
+  whose answer sooner than 1.5 s after kdialog STARTED was taken for a
+  stray key — on a loaded machine the dialog shows later, and a stray Enter
+  a moment after it appeared counted. They are now the launch window's
+  guarded menu (`window::question`): nothing is taken until the person has
+  been still for 1.5 s with the question in view, and every key, press or
+  return of the focus starts that again. The safe answer is first — Enter
+  refuses. kdialog, with the old check, only where there is no window.
+  The sound filter gets the window with `--window` from the zone's unit.
 - **The network of a zone is waited for until pasta says it is done**
   (the owner, 2026-09-26: no fixed waits a slow or busy machine breaks).
   Every pasta that configures a namespace — a zone through a host

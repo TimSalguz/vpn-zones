@@ -799,6 +799,43 @@ fn ask(
     // something else: the dialog takes the focus, and its default allows
     // (`dialog::TOO_FAST`).
     let asked = std::time::Instant::now();
+    // In the launch window first, guarded (`window::question`): nothing is
+    // taken until the person has been still with the question in view,
+    // counted from when they can see it — not from when it was started,
+    // which a loaded machine shows later. The safe answer first: Enter
+    // refuses. kdialog below only where there is no window.
+    let answers: &[(&str, &str, bool)] = if line.is_some() {
+        &[
+            ("deny", "Отказать", false),
+            ("allow", "Разрешить", false),
+            ("always", "Всегда", false),
+        ]
+    } else {
+        &[("deny", "Отказать", false), ("allow", "Разрешить", false)]
+    };
+    match crate::window::question(
+        &tools.window,
+        "Запуск из зоны",
+        &question,
+        answers,
+        question_timeout(tools),
+    ) {
+        crate::window::Asked::Chose(tag) if tag == "allow" => {
+            return crate::dialog::not_too_soon(asked)
+        }
+        crate::window::Asked::Chose(tag) if tag == "always" => {
+            crate::dialog::not_too_soon(asked)?;
+            if let Some(line) = line.as_ref() {
+                remember(tools, line);
+            }
+            return Ok(());
+        }
+        crate::window::Asked::NotShown => {}
+        _ => {
+            answered_no(&origin.name());
+            return Err("человек отказал".to_owned());
+        }
+    }
     // "Always" only where it can be kept safely (`may_remember`).
     let Some(line) = line else {
         return if crate::dialog::choose_within(

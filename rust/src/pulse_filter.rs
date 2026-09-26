@@ -355,8 +355,10 @@ pub struct Args {
     /// `~/.local/state/vpn-profiles`: the containers' data, by which a
     /// container is known to be one (`crate::origin`).
     pub profiles: PathBuf,
-    /// What asks the person.
+    /// What asks the person: the launch window (`--window`, optional:
+    /// guarded, `crate::window::question`), else kdialog.
     pub kdialog: PathBuf,
+    pub window: PathBuf,
 }
 
 impl Args {
@@ -371,6 +373,7 @@ impl Args {
         let mut config = None;
         let mut profiles = None;
         let mut kdialog = None;
+        let mut window = PathBuf::new();
         let mut it = args.iter();
         while let Some(flag) = it.next() {
             let value = it
@@ -393,6 +396,7 @@ impl Args {
                 Some("--config") => config = Some(path),
                 Some("--profiles") => profiles = Some(path),
                 Some("--kdialog") => kdialog = Some(path),
+                Some("--window") => window = path,
                 _ => return Err(format!("unknown flag {}", flag.to_string_lossy())),
             }
         }
@@ -404,6 +408,7 @@ impl Args {
             config: config.ok_or("--config is required")?,
             profiles: profiles.ok_or("--profiles is required")?,
             kdialog: kdialog.ok_or("--kdialog is required")?,
+            window,
         })
     }
 }
@@ -1493,6 +1498,7 @@ pub fn run(args: &Args) -> u8 {
         args.config.clone(),
         args.profiles.clone(),
         args.kdialog.clone(),
+        args.window.clone(),
     ));
     if !mic.has_display() {
         eprintln!(

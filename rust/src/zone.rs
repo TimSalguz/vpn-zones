@@ -498,6 +498,9 @@ pub struct Tools {
     /// What the sound filter asks the person with when a program of the
     /// zone would record the microphone (`crate::microphone`).
     pub kdialog: PathBuf,
+    /// The launch window, for the sound filter's questions (guarded,
+    /// `crate::window::question`); empty: kdialog.
+    pub window: PathBuf,
     /// The command line's path in the profile (the manifest's `runner`): the
     /// `Exec` of the zone's entry for the portal (`desktop::render_zone_entry`),
     /// which GLib loads only when it finds the program it names.
@@ -518,6 +521,7 @@ impl Default for Tools {
             dbus_proxy: PathBuf::from("xdg-dbus-proxy"),
             opener: PathBuf::from("xdg-open"),
             kdialog: PathBuf::from("kdialog"),
+            window: PathBuf::new(),
             runner: PathBuf::from("cellward"),
         }
     }
@@ -589,6 +593,7 @@ impl Args {
                 "--dbus-proxy" => &mut tools.dbus_proxy,
                 "--opener" => &mut tools.opener,
                 "--kdialog" => &mut tools.kdialog,
+                "--window" => &mut tools.window,
                 "--runner" => &mut tools.runner,
                 _ => return Err(ArgError::UnknownFlag(flag)),
             };
@@ -2191,6 +2196,12 @@ fn start_pulse_filter(zone: &Zone) -> Option<Child> {
         .arg(zone.home.join(crate::container::PROFILES_SUBDIR))
         .arg("--kdialog")
         .arg(&zone.tools.kdialog)
+        .args(
+            (!zone.tools.window.as_os_str().is_empty())
+                .then(|| [OsStr::new("--window"), zone.tools.window.as_os_str()])
+                .into_iter()
+                .flatten(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .uid(uid)

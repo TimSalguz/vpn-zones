@@ -1379,6 +1379,10 @@ in
         # (rust/src/microphone.rs): спрашивает в окружении юнита — есть ли в
         # нём WAYLAND_DISPLAY/DISPLAY, есть ли кого спросить.
         + " --kdialog ${kdialog}"
+        # И окно запуска: вопрос о микрофоне в нём защищён (ничего не
+        # принимается, пока человек не побыл с вопросом перед глазами),
+        # kdialog — только если окна нет.
+        + " --window ${vpn-zone-window}/bin/vpn-zone-window"
         # Exec ярлыка зоны для портала (~/.local/share/applications/
         # cellward.zone.<зона>.desktop, rust/src/desktop.rs): GLib берёт ярлык,
         # только если найдёт его программу, а PATH портала может её не знать.

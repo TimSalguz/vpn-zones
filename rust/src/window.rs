@@ -47,6 +47,9 @@
 //! `action⇥<tag>⇥<label>⇥<flags>` per entry (`danger` for one that breaks
 //! something); the answer is `action⇥<tag>`.
 
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+
 /// One row of a column.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Item {
@@ -93,6 +96,9 @@ pub struct Menu {
     pub notes: Vec<String>,
     /// `(tag, label, danger)`.
     pub actions: Vec<(String, String, bool)>,
+    /// A guarded menu (`guard⇥<ms>`): nothing is taken until the person has
+    /// been still this long with the window focused — a question.
+    pub guard_ms: u64,
 }
 
 /// The menu as the window reads it.
@@ -109,7 +115,115 @@ pub fn render_menu(menu: &Menu) -> String {
             if *danger { "danger" } else { "" }
         ));
     }
+    if menu.guard_ms > 0 {
+        out.push_str(&format!("guard\t{}\n", menu.guard_ms));
+    }
     out
+}
+
+/// The window, started with `menu` on its standard input; `None` when there
+/// is no window to start.
+pub fn spawn_menu(window: &Path, menu: &Menu) -> Option<Child> {
+    if window.as_os_str().is_empty() {
+        return None;
+    }
+    let mut child = Command::new(window)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = std::io::Write::write_all(&mut stdin, render_menu(menu).as_bytes());
+    }
+    Some(child)
+}
+
+/// The tag a menu window that has ended chose; `None`: closed, Esc.
+pub fn menu_answer(child: Child) -> Option<String> {
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_menu_reply(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// How a [`question`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Asked {
+    /// The answer's tag.
+    Chose(String),
+    /// Closed, Esc, or an answer the window did not give.
+    Closed,
+    /// Not answered by the deadline: the window is gone, and a late answer
+    /// counts for nothing.
+    NoAnswer,
+    /// No window to ask in (the caller asks another way).
+    NotShown,
+}
+
+/// A question, in the launch window as a guarded menu: it takes nothing —
+/// no key, no click — until the person has been still for
+/// [`crate::dialog::TOO_FAST`] with it focused, counted from when they can
+/// see it, however long the machine took to show it; a key or a click, or
+/// the focus coming back, starts that again. `answers` are `(tag, label,
+/// danger)`, the safe one first: Enter gives it. `deadline`: past it the
+/// window goes, and the question is not answered.
+pub fn question(
+    window: &Path,
+    title: &str,
+    text: &str,
+    answers: &[(&str, &str, bool)],
+    deadline: Option<std::time::Duration>,
+) -> Asked {
+    let menu = Menu {
+        title: title.to_owned(),
+        notes: text.lines().map(str::to_owned).collect(),
+        actions: answers
+            .iter()
+            .map(|(tag, label, danger)| ((*tag).to_owned(), (*label).to_owned(), *danger))
+            .collect(),
+        guard_ms: crate::dialog::TOO_FAST.as_millis() as u64,
+    };
+    let Some(mut child) = spawn_menu(window, &menu) else {
+        return Asked::NotShown;
+    };
+    if let Some(deadline) = deadline {
+        let ended = match crate::sys::pidfd_open(child.id() as i32) {
+            Some(fd) => crate::sys::pidfd_wait(&fd, deadline),
+            None => {
+                let started = std::time::Instant::now();
+                loop {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break true;
+                    }
+                    if started.elapsed() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(crate::sys::LOOK_AGAIN);
+                }
+            }
+        };
+        if !ended {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Asked::NoAnswer;
+        }
+    }
+    let Ok(out) = child.wait_with_output() else {
+        return Asked::NoAnswer;
+    };
+    // Ended by a signal — killed, or it never got to show itself: no answer,
+    // as a question not answered in time.
+    if out.status.code().is_none() {
+        return Asked::NoAnswer;
+    }
+    match parse_menu_reply(&String::from_utf8_lossy(&out.stdout)) {
+        Some(tag) if out.status.success() && answers.iter().any(|(t, _, _)| *t == tag) => {
+            Asked::Chose(tag)
+        }
+        _ => Asked::Closed,
+    }
 }
 
 /// The chosen entry's tag.
@@ -290,6 +404,7 @@ mod tests {
                 ("close".to_owned(), "Закрыть".to_owned(), false),
                 ("kill-zone".to_owned(), "Оборвать сеть nl".to_owned(), true),
             ],
+            guard_ms: 0,
         };
         assert_eq!(
             render_menu(&menu),
@@ -302,6 +417,51 @@ mod tests {
         );
         assert_eq!(parse_menu_reply("action\t\n"), None);
         assert_eq!(parse_menu_reply(""), None);
+    }
+
+    /// A question is a guarded menu, the safe answer first; the answer is
+    /// one of those asked, or none — closed, not in time, or no window.
+    #[test]
+    fn a_question_is_a_guarded_menu_and_its_answer_one_of_those_asked() {
+        let dir = std::env::temp_dir().join(format!("vz-question-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let window = dir.join("window");
+        let answers = [("deny", "Отказать", false), ("allow", "Разрешить", false)];
+        let ask = |script: &str, deadline| {
+            crate::dialog::test_program(&window, &format!("#!/bin/sh\n{script}\n"));
+            question(&window, "Запуск", "строка\nещё", &answers, deadline)
+        };
+        let seen = dir.join("request");
+        let script = format!("cat > '{}'; printf 'action\\tallow\\n'", seen.display());
+        assert_eq!(ask(&script, None), Asked::Chose("allow".to_owned()));
+        let request = std::fs::read_to_string(&seen).unwrap();
+        assert!(request.starts_with("mode\tmenu\ntitle\tЗапуск\nnote\tстрока\nnote\tещё\n"));
+        assert!(
+            request.contains("action\tdeny\tОтказать\t\naction\tallow"),
+            "{request}"
+        );
+        assert!(request.ends_with("guard\t1500\n"), "{request}");
+        // An answer that was not asked for is none.
+        assert_eq!(
+            ask("cat >/dev/null; printf 'action\\tother\\n'", None),
+            Asked::Closed
+        );
+        assert_eq!(ask("cat >/dev/null; exit 1", None), Asked::Closed);
+        assert_eq!(
+            ask(
+                "cat >/dev/null; sleep 30",
+                Some(std::time::Duration::from_millis(300))
+            ),
+            Asked::NoAnswer
+        );
+        // Killed, or never shown: no answer either.
+        assert_eq!(ask("cat >/dev/null; kill -9 $$", None), Asked::NoAnswer);
+        assert_eq!(
+            question(Path::new(""), "t", "q", &answers, None),
+            Asked::NotShown
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

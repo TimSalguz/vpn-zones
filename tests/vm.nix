@@ -1585,7 +1585,8 @@ let
           alice(f"sh -c '! ls /proc/{fp}/root/'")
           in_zone(zp, f"sh -c '! echo yes > {marker}'")
           machine.fail(f"test -e {marker}")
-          # A question open: its kdialog is the filter's child, in the host's
+          # A question open: its window (the launch window, guarded —
+          # kdialog only without one) is the filter's child, in the host's
           # user namespace too. It is held open by an X server that never
           # answers — an abstract socket, where libxcb looks first — for as
           # long as the filter waits.
@@ -1606,10 +1607,10 @@ let
               f"-U -n -m -t {zp} -- ${pkgs.python3}/bin/python3 ${pulseMic}"
           )
           kd = machine.wait_until_succeeds(
-              "pgrep -u alice -f -- '--warningyesnocance[l]'", timeout=30
+              "pgrep -u alice -f -- 'bin/vpn-zone-windo[w]'", timeout=30
           ).split()[0]
           ns = machine.succeed(f"readlink /proc/{kd}/ns/user").strip()
-          assert ns == host_ns, f"the question's kdialog is in {ns}, not the host's {host_ns}"
+          assert ns == host_ns, f"the question's window is in {ns}, not the host's {host_ns}"
           alice(f"ls /proc/{kd}/root/ > /dev/null")
           in_zone(zp, f"sh -c '! ls /proc/{kd}/root/'")
           in_zone(zp, f"sh -c '! echo yes > /proc/{kd}/root{marker}'")
