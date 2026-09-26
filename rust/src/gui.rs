@@ -259,7 +259,9 @@ fn add(tools: &Tools) -> u8 {
     // Give the zone a few seconds for its handshake and say straight away
     // whether the config is alive: that answer is what a zone is usually
     // created for ("which of my .conf files still works?").
-    // (`docs/GOTCHAS.md` §4)
+    // (`docs/GOTCHAS.md` §4) The seconds decide only which notice is shown —
+    // "not yet" is never told from "never" without some — and nothing else:
+    // the zone stays up either way, so the late one is said as "not yet".
     std::thread::sleep(std::time::Duration::from_secs(6));
     if cli_quiet(tools, &["check", &name]) {
         dialog::notify(
@@ -274,8 +276,12 @@ fn add(tools: &Tools) -> u8 {
             &tools.notify_send,
             Some("critical"),
             "10000",
-            &format!("Зона «{name}» поднята, но туннель молчит"),
-            "Рукопожатия нет: конфиг устарел или сервер недоступен. Зону можно удалить ярлыком «Удалить VPN-зону».",
+            &format!("Зона «{name}» поднята, рукопожатия пока нет"),
+            &format!(
+                "Сервер пока не ответил: конфиг устарел, сервер недоступен — или сеть и машина \
+                 медленные. Проверить ещё раз: cellward check {name}. Зону можно удалить \
+                 ярлыком «Удалить VPN-зону»."
+            ),
         );
     }
     0
