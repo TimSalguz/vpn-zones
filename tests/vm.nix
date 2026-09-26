@@ -2463,7 +2463,12 @@ let
           assert shown["links"] == [{"scheme": "https", "program": "vmurl2", "source": "local"}], shown
           out = alice(f"cellward run vmherm --container vmlink -- {portal} ''' 'https://example.test/by-rule' '@a{{sv}} {{}}'")
           assert "/org/freedesktop/portal/desktop/request/" in out, out
-          machine.wait_until_succeeds("grep -q 'second https://example.test/by-rule' /home/alice/opened-urls", timeout=30)
+          # In the asking container: its layer has what the program wrote.
+          machine.wait_until_succeeds(
+              "grep -q 'second https://example.test/by-rule' "
+              "/home/alice/.local/state/vpn-profiles/vmlink/home/upper/opened-urls",
+              timeout=30,
+          )
           # The filter's word alone: a program of the zone that sends the same
           # request itself, naming the container, is the zone's own to the
           # broker — no rule of vmlink's, and here no window to choose in.
