@@ -519,7 +519,7 @@ mod tests {
         entry("vpn-zone-x", "Ours", "x-scheme-handler/https;", "");
         let home = dir.join("home");
         let found = programs_for(
-            &[apps.clone()],
+            std::slice::from_ref(&apps),
             &home,
             &dir.join("state"),
             "https",

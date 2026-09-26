@@ -307,7 +307,7 @@ mod tests {
     #[test]
     fn an_answer_needs_a_network_and_a_container() {
         let reply = parse_reply(
-            "net\tnl\ncontainer\t__newsb__\nname\tобщая\npin-net\t1\npin-container\t0\n",
+            "net\tnl\ncontainer\t__newsb__\nname\tобщая\npin-net\t1\npin-container\t0\nrule\t1\n",
         )
         .unwrap();
         assert_eq!(
@@ -318,6 +318,7 @@ mod tests {
                 name: Some("общая".to_owned()),
                 pin_net: true,
                 pin_container: false,
+                rule: true,
             }
         );
         // The main container is the empty tag — present, and empty.

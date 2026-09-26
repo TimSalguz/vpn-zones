@@ -148,6 +148,7 @@ exit "$code""#,
             // without it the picker asks with kdialog, as every other test
             // here expects.
             ("window", format!("{bin}/vpn-zone-window")),
+            ("busctl", format!("{bin}/busctl")),
         ] {
             json.push_str(&format!("  \"{key}\": \"{value}\",\n"));
         }
