@@ -223,22 +223,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   told by its launch, not taken for the zone's own programs.
 
 ### Fixed
-- **The network of a zone is waited for until it is there** (the owner,
-  2026-09-26: no fixed waits a slow or busy machine breaks). pasta's
-  interface and default route in a zone through a host interface or a
-  system zone, in a zone's uplink, in a system zone and in its uplink, and
-  pasta attaching a user zone through a system zone (`vpn-zone-sys`) are
-  waited for with an rtnetlink subscription in that namespace — woken by
-  the kernel's news of links, addresses and routes — until they are there
-  or pasta ends (was five seconds, then the zone did not come up; 300 ms
-  for the attach, and a slow pasta was taken for one that attached). An
-  OpenConnect client is waited for until its plan is written or it exits
-  (was two minutes). pasta that cannot be started for a zone's uplink now
-  takes the zone down at once, rather than leaving the uplink to wait.
-  The broker and the system-zone service read a request as long as it takes
-  (was five seconds): a peer that says nothing holds a slot of its own
-  origin (four per zone) or of its own user (16 of the service's 64
-  connections), which bounds it instead.
+- **The network of a zone is waited for until pasta says it is done**
+  (the owner, 2026-09-26: no fixed waits a slow or busy machine breaks).
+  Every pasta that configures a namespace — a zone through a host
+  interface, a zone's uplink, a system zone and its uplink, a user zone
+  through a system zone (`vpn-zone-sys`) — now writes a pid file (`-P`),
+  which pasta does once its initialisation is done; that is waited for, as
+  long as it takes, and what pasta did is then looked at once: no route or
+  no interface is a failure at once, with the reason, not a wait for ever
+  (was five seconds of looking, then the zone did not come up; 300 ms for
+  the attach, and a slow pasta was taken for one that had attached).
+  pasta ending first ends the wait; `vpn-zone-sys` also stops waiting (and
+  pasta) when the zone that asked goes. An OpenConnect client is waited for
+  until its plan is written or it exits (was two minutes). pasta that
+  cannot be started for a zone's uplink now takes the zone down at once. A
+  system zone's start is still bounded by its unit's start timeout,
+  systemd's; none is added. The broker and the system-zone service read a
+  request as long as it takes (was five seconds): a peer that says nothing
+  holds a slot of its own origin (four per zone) or of its own user (16 of
+  the service's 64 connections), which bounds it instead.
 - **A zone comes up however long its setup takes, and its helpers too**
   (the owner, 2026-09-26: no fixed waits that a slow or busy machine
   breaks). The user zone's unit is now `Type=notify` with no start timeout:
@@ -249,9 +252,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   the sound filter, the PipeWire context, a hermetic zone's session bus
   filter), `x11-run`'s satellite and a file sandbox's bus proxy, bus filter
   and X server are waited for until their socket is there — an inotify
-  watch on its directory — or until they end without it (their pidfd); was
-  five seconds, and one second for the sandbox's X server, then no bus, no
-  sound or no X. A start that hangs is ended by `cellward down`.
+  watch on its directory — or until they end without it (their pidfd, or
+  asked every 100 ms where none can be had; an error is never taken for
+  their end); was five seconds, and one second for the sandbox's X server,
+  then no bus, no sound or no X. `cellward up` and a launch into a zone that
+  is down say that the zone is starting and how to stop it — the launch on
+  the desktop too, once it takes a while —, and a start that hangs is ended
+  by `cellward down`.
 - **A loaded machine no longer changes what happens: seven fixed waits
   are gone** (the owner, 2026-09-26: "a slower or busy computer and it all
   breaks"). Each one decided an outcome when it ran out; now the thing

@@ -95,9 +95,9 @@ the same time, through one tunnel.
 zones. A declared zone that the host's own services go through (`host.*`, `services`,
 `containers` — marked `carries`) never has its config replaced by a request: whoever sets its
 tunnel answers for the host's names, clock and services. The socket takes at most 16
-connections per user (`MaxConnectionsPerSource`) and a request within 5 s
-(`SO_RCVTIMEO`, cleared once the request is in — the connection is then the command's life), so
-a client that says nothing does not hold the service from the others. Not a wall against a
+connections per user (`MaxConnectionsPerSource`), so a client that says nothing holds its own
+user's share and not the others' — a count bounds it, not a clock (2026-09-26; a request had
+to come within 5 s before, and a loaded machine could miss that). Not a wall against a
 member of the group who means it: the count is per uid, and `newuidmap` gives a user several
 (review 2026-09-24) — a way to keep the service busy, not a way into anything.
 

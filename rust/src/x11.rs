@@ -127,10 +127,8 @@ pub fn run(args: Args) -> u8 {
     // it: no clock — on a loaded machine the server comes up late, and a
     // deadline would start the program without X exactly there.
     let socket = dir.join(format!("X{number}"));
-    let up = crate::sys::pidfd_open(satellite.id() as i32).is_some_and(|pidfd| {
-        crate::sys::wait_for_entry(&socket, Some(&pidfd), |p| {
-            std::fs::symlink_metadata(p).is_ok()
-        })
+    let up = crate::sys::wait_for_child_entry(&socket, &mut satellite, |p| {
+        std::fs::symlink_metadata(p).is_ok()
     });
     if !up {
         eprintln!("x11-run: the X server ended before its socket was there — the program starts without it");
