@@ -105,6 +105,11 @@ esac"#,
             "vpn-zone",
             r#"{ printf '%s\n' "$@"; echo '--END--'; } >> "$RUNNER_LOG"
 code=${RUNNER_EXIT:-0}
+# The word on the picker's pipe a launch may say (`wl_sandbox`): the
+# program opened a window (w), or nothing on the way will say it (n).
+if [ -n "$RUNNER_WORD" ] && [ -n "$CELLWARD_WINDOW_FD" ]; then
+  printf '%s' "$RUNNER_WORD" >&"$CELLWARD_WINDOW_FD"
+fi
 if [ "$code" = 0 ]; then
   if [ "$1 $2" = "profile create" ]; then mkdir -p "$VPNZ_PROFILES/$3"; fi
   if [ "$1 $2" = "sandbox create" ]; then mkdir -p "$VPNZ_SANDBOXES/$3/home"; fi
@@ -675,6 +680,24 @@ fn a_running_program_is_asked_until_it_is_seen_handing_over() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(other.launched()[0], ["run", "de", "--", "firefox", "%u"]);
     assert!(!other.path("state/.handover/alacritty").exists());
+
+    // A launch whose program opened a window of its own is no hand-over,
+    // however it ends; nor one with nothing on the way to say (the Wayland
+    // proxy off): the picker learns nothing there.
+    for (tag, word) in [("running-window", "w"), ("running-noword", "n")] {
+        let home = Home::new(tag);
+        home.zone("nl");
+        home.write("state/.running/__main__/firefox", &format!("{me} nl\n"));
+        vpn_zone::registry::note_start(&home.path("state/.running"), me, false).unwrap();
+        home.answers(&["nl"]);
+        let out = home.run(&pick("firefox"), &[("RUNNER_WORD", word)]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(home.launched().len(), 1);
+        assert!(
+            !home.path("state/.handover/firefox").exists(),
+            "{word}: learned a hand-over"
+        );
+    }
 
     // A launch that fails is no hand-over.
     let failed = Home::new("running-failed");

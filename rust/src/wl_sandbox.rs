@@ -113,10 +113,11 @@ pub const WORD_NONE: u8 = b'n';
 static OPENED: std::sync::Mutex<Option<OwnedFd>> = std::sync::Mutex::new(None);
 
 /// Take the pipe of [`ENV_OPENED_FD`]: the variable gone, the descriptor
-/// close-on-exec — the program never inherits it — and kept here until the
-/// proxy has it ([`opened_for_proxy`], [`opened_handed`]) or no word will
-/// come ([`no_word`]). Only a pipe: a number that names anything else is
-/// left alone.
+/// close-on-exec — the program never inherits it — and kept here, for this
+/// process's life: the proxy gets a copy ([`opened_for_proxy`]) and says the
+/// word; this one says that none will come ([`no_word`]) — without a proxy
+/// that can, or when the proxy dies before it spoke. Only a pipe: a number
+/// that names anything else is left alone.
 pub fn take_opened() {
     if let Some(fd) = pipe_of_env() {
         *OPENED.lock().unwrap_or_else(|e| e.into_inner()) = Some(fd);
@@ -132,9 +133,17 @@ fn opened_for_proxy() -> Option<OwnedFd> {
         .and_then(|fd| fd.try_clone().ok())
 }
 
-/// The proxy has its copy: ours goes, without a word.
-fn opened_handed() {
-    OPENED.lock().unwrap_or_else(|e| e.into_inner()).take();
+/// Given on to the next program of the launch — `wl-sandbox`, which takes
+/// it again ([`take_opened`]): close-on-exec off, [`ENV_OPENED_FD`] set to
+/// its number, and no longer ours to speak on (`crate::launch`).
+pub fn pass_opened_on() {
+    if let Some(fd) = OPENED.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let fd = std::os::fd::IntoRawFd::into_raw_fd(fd);
+        // SAFETY: our own descriptor; FD_CLOEXEC cleared.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } == 0 {
+            std::env::set_var(ENV_OPENED_FD, fd.to_string());
+        }
+    }
 }
 
 /// Nothing on the way will say the word: said so ([`WORD_NONE`]) — the
@@ -547,13 +556,14 @@ pub fn run(args: Args) -> u8 {
 
     let mut close_write = close_write;
     let mut proxy = None;
+    // Whether the proxy has a copy of the picker's pipe to say the word on.
+    let mut proxy_speaks = false;
     if let Some(up) = upstream {
         drop(up.listener);
-        match wl_proxy::start(&listener, &up.path, args.frame.clone(), opened_for_proxy()) {
-            Ok(started) => {
-                opened_handed();
-                proxy = Some((started, up.path));
-            }
+        let word = opened_for_proxy();
+        proxy_speaks = word.is_some();
+        match wl_proxy::start(&listener, &up.path, args.frame.clone(), word) {
+            Ok(started) => proxy = Some((started, up.path)),
             Err(e) => {
                 // The second rung: the proxy did not start. The context made
                 // for it is switched off, and the zone's path is registered
@@ -609,6 +619,12 @@ pub fn run(args: Args) -> u8 {
 
     if let Some((proxy, _)) = &mut proxy {
         proxy.take_over();
+    }
+    // Nobody on the way to say the program opened a window (no proxy —
+    // `--no-proxy`, none started —, or no copy for it): said now. Our copy
+    // stays until we go: the end of the pipe is then the launch's end.
+    if proxy.is_none() || !proxy_speaks {
+        no_word();
     }
     // NOT exec: after the program exits somebody has to close the switch and
     // unlink the socket, so it is started as a child.

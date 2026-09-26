@@ -248,8 +248,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   (the program never inherits it) and the Wayland proxy says when the
   program opens its first window, framed or not. Ended with success
   without a window, however long that took: a hand-over, remembered. A
-  window: the picker leaves. Nothing on the way to say it (no proxy, a
-  launch outside `wl-sandbox`): said so, and nothing is learned.
+  window: the picker leaves. Nothing on the way to say it (the proxy off
+  or dead before it spoke, a launch outside `wl-sandbox`, a launch
+  cancelled or only shown): said so, and nothing is learned — programs
+  launched without the Wayland proxy are asked on every click, as a program
+  not seen handing over is.
 - **The network of a zone is waited for until pasta says it is done**
   (the owner, 2026-09-26: no fixed waits a slow or busy machine breaks).
   Every pasta that configures a namespace — a zone through a host

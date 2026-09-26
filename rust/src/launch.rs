@@ -525,6 +525,20 @@ pub fn has_display() -> bool {
 /// Run a program inside a zone. Returns only when something went wrong: the
 /// successful path ends in `execvp`.
 pub fn run(tools: &Tools, argv: &[OsString]) -> u8 {
+    // The picker's pipe, when it watches this launch for a hand-over
+    // (`crate::picker`): taken at once — nothing this starts on the way
+    // (a dialog, systemctl) inherits it —, given on to `wl-sandbox` just
+    // before its exec, and on every other way out told that no word will
+    // come: a launch cancelled or only shown (`--dry-run`) that ends with
+    // success is no hand-over.
+    struct NoWord;
+    impl Drop for NoWord {
+        fn drop(&mut self) {
+            crate::wl_sandbox::no_word();
+        }
+    }
+    crate::wl_sandbox::take_opened();
+    let _no_word = NoWord;
     // --- 1. FROM INSIDE A ZONE: DELEGATE OR STAY ---
     if let Some(current) = env_nonempty(ENV_CURRENT) {
         if env_nonempty(ENV_DELEGATED).is_none() {
@@ -1160,13 +1174,14 @@ pub fn run(tools: &Tools, argv: &[OsString]) -> u8 {
     let exec = match compositor_wrap {
         Some(mut wrapped) => {
             wrapped.extend(exec);
+            // The picker's pipe, given on to `wl-sandbox` alone, as the last
+            // thing before its exec (`wl_sandbox::pass_opened_on`).
+            crate::wl_sandbox::pass_opened_on();
             wrapped
         }
         None => {
-            // No `wl-sandbox` to take the picker's pipe (`wl_sandbox::
-            // take_opened`): taken here, so that the program never has it,
-            // and told that no word will come — the picker learns nothing.
-            crate::wl_sandbox::take_opened();
+            // No `wl-sandbox` on the way to say the program opened a window:
+            // told that no word will come — the picker learns nothing.
             crate::wl_sandbox::no_word();
             exec
         }

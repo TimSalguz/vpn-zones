@@ -382,8 +382,8 @@ pub const HANDOVER: &str = ".handover";
 
 /// Whether a launch is watched for a hand-over ([`launch_asked`]): the
 /// program runs, it is not known to hand over yet, and it is started into
-/// the network it runs in — the one case where the new process exiting at
-/// once can mean nothing else. Another network is not watched: there `run`
+/// the network it runs in — the one case where the new process ending with
+/// success without a window of its own can mean nothing else. Another network is not watched: there `run`
 /// warns first, and a cancel there exits with success too. Not from inside
 /// a zone either (`in_zone`): the launch is delegated to the host and the
 /// launcher returns at once.

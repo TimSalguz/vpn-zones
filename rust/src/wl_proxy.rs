@@ -658,7 +658,11 @@ impl Proxy {
                         // Fail-closed: the program's connections died with
                         // the proxy, and it is not given another way to the
                         // compositor. (After the program, its exit is the
-                        // ordinary end.)
+                        // ordinary end.) Gone before it said the program
+                        // opened a window: it will not now
+                        // (`crate::wl_sandbox::no_word`; after the word, a
+                        // second one is not read).
+                        crate::wl_sandbox::no_word();
                         if main_status.is_some() {
                             continue;
                         }
@@ -963,7 +967,8 @@ fn sealed_memfd(name: &std::ffi::CStr, bytes: &[u8], size: usize) -> io::Result<
 
 /// Everything that makes the process what [`filter`] assumes, in an order
 /// that leaves it no moment to be anything else: a name, not dumpable, dying
-/// with its supervisor, no descriptor but its own and the standard three, the
+/// with its supervisor, no descriptor but its own, the standard three and —
+/// when the picker watches the launch — its pipe for the word (`OPENED`), the
 /// limits, the frame's pixel and title ([`prepare_border`]), the filter.
 ///
 /// The frame is the only thing that may fail without failing the proxy: the
